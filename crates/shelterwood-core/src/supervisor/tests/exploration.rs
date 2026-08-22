@@ -131,7 +131,10 @@ fn fingerprint(state: &SupervisorState, keys: &[ChildKey]) -> u64 {
 /// Admission is deliberately not in the alphabet. Every admission mints a
 /// fresh key, so an explorable `Admit` would make the state space infinite;
 /// fixing the roster up front keeps it finite while still covering the
-/// initial/runtime distinction R1 is stated over.
+/// initial/runtime distinction R1 is stated over. Consequently this walk is
+/// also blind by design to the runtime facade's admit-during-drain rejection;
+/// the facade's targeted admission tests are the verification boundary for
+/// that policy.
 type Roster = &'static [bool];
 
 /// Every event the walk offers in every state, including the ones the state
@@ -172,6 +175,27 @@ fn alphabet(keys: &[ChildKey]) -> Vec<Event> {
         Event::Force,
         Event::Settle,
     ]);
+    for event in &events {
+        // Exhaustive over `Event` without restating its construction: a new
+        // variant does not compile until this guard is updated alongside the
+        // canonical list above, preventing silent pruning from the walk.
+        match event {
+            Event::Spawned { .. }
+            | Event::Ready { .. }
+            | Event::IncarnationComplete { .. }
+            | Event::RestartPending { .. }
+            | Event::StopStarted { .. }
+            | Event::DisposalStarted { .. }
+            | Event::Terminalized { .. }
+            | Event::RemovalSampled { .. }
+            | Event::RemovalLatched { .. }
+            | Event::Reclaim { .. }
+            | Event::FailStartup
+            | Event::BeginDrain { .. }
+            | Event::Force
+            | Event::Settle => {}
+        }
+    }
     events
 }
 

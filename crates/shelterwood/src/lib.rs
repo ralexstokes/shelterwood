@@ -123,7 +123,8 @@
 //! [`ScopeRef`] addresses an ordered scope; [`DynamicScopeRef`] adds
 //! runtime admission and removal, whose outcomes are [`Admission`],
 //! [`Removal`], [`RemoveOutcome`], [`ReserveError`], and
-//! [`NotAdmittingCause`]. Scope-level state is [`ScopeState`] and
+//! [`NotAdmittingCause`]. Pre-spawn declarations return
+//! [`StaticReserveError`]. Scope-level state is [`ScopeState`] and
 //! [`MembershipStatus`].
 //!
 //! ## Tasks
@@ -218,7 +219,8 @@ pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
 pub use cells::{
     CancellationToken, ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind,
     LifecycleEvents, LifecycleItem, LifecycleSeq, LifecycleTryRecvError, NotAdmittingCause,
-    RemoveOutcome, ReserveError, ScopeSnapshot, SnapshotClosed, SnapshotReceiver, WaitError,
+    RemoveOutcome, ReserveError, ScopeSnapshot, SnapshotClosed, SnapshotReceiver,
+    StaticReserveError, WaitError,
 };
 pub use deadline::DeadlineBudget;
 pub use engine::{MembershipStatus, ScopeState};

@@ -1,8 +1,25 @@
-//! Dynamic membership admission errors and removal outcomes.
+//! Static declaration and dynamic admission errors, plus removal outcomes.
 
 use std::fmt;
 
 use shelterwood_core::ChildId;
+
+/// A pre-spawn child declaration or reservation error.
+///
+/// Static builders cannot observe runtime admission state: only id validation,
+/// duplicate detection, and membership identity exhaustion are reachable.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum StaticReserveError {
+    /// The child id was empty.
+    #[error("child id must not be empty")]
+    EmptyId,
+    /// A declared membership already occupies the id.
+    #[error("child id `{0}` is already declared")]
+    DuplicateId(ChildId),
+    /// The scope can mint no further membership identities.
+    #[error("membership identity space is exhausted")]
+    IdentityExhausted,
+}
 
 /// A child reservation or dynamic admission error.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -62,15 +79,6 @@ pub enum RemoveOutcome {
     /// No matching membership remained to remove.
     AlreadyAbsent,
 }
-
-// The admission and removal response receivers drop these inline when a
-// caller abandons them (`DisposingReceiver::new_framework`); the marker is
-// the claim that no variant can ever own a user destructor. A variant that
-// grows one must lose the marker and move its receivers back to the
-// disposal-lane constructor.
-impl crate::runtime::FrameworkPlain for ReserveError {}
-
-impl crate::runtime::FrameworkPlain for RemoveOutcome {}
 
 #[cfg(test)]
 mod tests {

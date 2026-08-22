@@ -47,9 +47,9 @@ async fn wait_for_id_release(scope: &DynamicScopeRef, id: &str) {
     .await;
 }
 
-struct DropProbe(Arc<AtomicBool>);
+struct FlagDropProbe(Arc<AtomicBool>);
 
-impl Drop for DropProbe {
+impl Drop for FlagDropProbe {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
     }
@@ -700,7 +700,7 @@ async fn reserved_cell_removal_wins_a_queued_split_definition() {
     let task = slot.task_ref();
     let removed = scope.remove("reserved");
     let admission = slot.define(TaskDef::new({
-        let probe = DropProbe(Arc::clone(&factory_dropped));
+        let probe = FlagDropProbe(Arc::clone(&factory_dropped));
         move |context| {
             let _ = &probe;
             async move {
@@ -1067,7 +1067,7 @@ async fn removing_a_member_releases_its_factory_before_scope_shutdown() {
             "worker",
             TaskDef::new({
                 let started = Arc::clone(&started);
-                let probe = DropProbe(Arc::clone(&factory_dropped));
+                let probe = FlagDropProbe(Arc::clone(&factory_dropped));
                 move |context| {
                     let _ = &probe;
                     started.store(true, Ordering::SeqCst);
@@ -1656,7 +1656,7 @@ async fn removal_of_a_polled_split_definition_keeps_the_scope_admitting() {
     let slot = scope.reserve_task("worker").expect("reservation succeeds");
     let task = slot.task_ref();
     let mut admission = Box::pin(slot.define(TaskDef::new({
-        let probe = DropProbe(Arc::clone(&factory_dropped));
+        let probe = FlagDropProbe(Arc::clone(&factory_dropped));
         move |context| {
             let _ = &probe;
             async move {

@@ -19,6 +19,13 @@ use super::{PanicAccumulator, dispose_detached, waker_proxy::ProxiedPoll};
 /// draining only move wakers out; their vtables run after unlock, one behind
 /// each accumulator boundary. The opaque identity is retained by its waiter,
 /// so its `Arc` traffic under the lock cannot destroy even framework data.
+/// Cancellation destroys a removed caller-waker clone inline on the thread
+/// dropping `LatchWait` or `WatchWait`: unlike the external-primitive proxy
+/// family, the registry owns the waker directly and has no foreign drop seam
+/// that requires detached retirement. That inherits the reply receiver's
+/// ruling rather than the proxy wrapper's — a slow caller-waker destructor
+/// stalls the abandoning waiter alone, and a hostile one is contained by the
+/// accumulator above.
 #[derive(Default)]
 struct WaiterRegistry {
     waiters: Mutex<Vec<RegisteredWaker>>,
@@ -163,9 +170,14 @@ impl Signal {
         }
     }
 
+    /// The channel-wide waiter-registry length.
+    ///
+    /// This is deliberately not the endpoint count: `changed()` never clones
+    /// its receiver, so an endpoint probe cannot observe a registration a
+    /// cancelled wait failed to remove.
     #[cfg(test)]
-    fn watcher_count(&self) -> usize {
-        self.inner.receiver_count()
+    fn waiter_count(&self) -> usize {
+        self.inner.shared.waiters.len()
     }
 }
 
@@ -382,6 +394,9 @@ const ONESHOT_SENDING: u8 = 1;
 const ONESHOT_SENT: u8 = 2;
 const ONESHOT_SENDER_CLOSED: u8 = 3;
 const ONESHOT_RECEIVER_CLOSED: u8 = 4;
+#[cfg(test)]
+pub(crate) const ONESHOT_REPOLL_PANIC: &str =
+    "shelterwood one-shot receiver polled after completion";
 
 /// Sending half of a runtime-backed single-delivery channel.
 pub struct OneShotSender<T> {
@@ -393,6 +408,15 @@ pub struct OneShotSender<T> {
 pub struct OneShotReceiver<T> {
     channel: oneshot::Receiver<T>,
     state: Arc<AtomicU8>,
+    /// Whether a receive edge has already consumed Tokio's receiver.
+    ///
+    /// In the pinned Tokio 1.53.1, `Receiver::poll` clears its `Inner` once it
+    /// yields `Ready`, and `try_recv` clears it on every outcome but `Empty`;
+    /// a later `poll` then panics with a message naming neither Shelterwood
+    /// nor this seam. Every terminal edge here records that instead, so the
+    /// re-poll diagnostic is framework-owned. A bare [`Self::close`] is not
+    /// terminal — Tokio keeps the receiver pollable — so it does not set this.
+    completed: bool,
 }
 
 /// Outcome after atomically closing a single-delivery receive side.
@@ -418,6 +442,7 @@ pub fn oneshot<T>() -> (OneShotSender<T>, OneShotReceiver<T>) {
         OneShotReceiver {
             channel: channel_receiver,
             state,
+            completed: false,
         },
     )
 }
@@ -445,6 +470,7 @@ pub fn oneshot_sending_for_test<T>() -> (OneShotSending<T>, OneShotReceiver<T>) 
         OneShotReceiver {
             channel: receiver,
             state,
+            completed: false,
         },
     )
 }
@@ -542,11 +568,23 @@ impl<T> Drop for OneShotSender<T> {
 }
 
 impl<T> OneShotReceiver<T> {
+    fn assert_not_completed(&self) {
+        assert!(
+            !self.completed,
+            "shelterwood one-shot receiver polled after completion"
+        );
+    }
+
     pub fn poll_receive(
         &mut self,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<T>> {
-        Pin::new(&mut self.channel).poll(context).map(Result::ok)
+        self.assert_not_completed();
+        let result = Pin::new(&mut self.channel).poll(context).map(Result::ok);
+        if result.is_ready() {
+            self.completed = true;
+        }
+        result
     }
 
     /// Closes the receive side unless send or sender-drop won first.
@@ -555,11 +593,16 @@ impl<T> OneShotReceiver<T> {
     /// close, which Tokio's post-close `try_recv` result alone cannot do. A
     /// send that wins but is preempted before publishing returns `Pending`;
     /// the channel poll in that branch registers the wake for its completion.
+    ///
+    /// Every outcome but `Pending` is terminal for this receiver: the close
+    /// has been arbitrated, so a later receive edge is a caller bug and gets
+    /// the framework diagnostic rather than a fresh arbitration.
     pub fn close_and_poll_receive(
         &mut self,
         context: &mut std::task::Context<'_>,
     ) -> OneShotClose<T> {
-        match self.state.compare_exchange(
+        self.assert_not_completed();
+        let result = match self.state.compare_exchange(
             ONESHOT_OPEN,
             ONESHOT_RECEIVER_CLOSED,
             Ordering::AcqRel,
@@ -579,7 +622,11 @@ impl<T> OneShotReceiver<T> {
             }
             Err(ONESHOT_RECEIVER_CLOSED) => OneShotClose::Empty,
             Err(other) => unreachable!("unknown one-shot transition state {other}"),
+        };
+        if !matches!(&result, OneShotClose::Pending) {
+            self.completed = true;
         }
+        result
     }
 
     pub fn close(&mut self) {
@@ -599,17 +646,42 @@ impl<T> OneShotReceiver<T> {
     /// disposal instead of destroying it in their own drop glue.
     pub fn close_and_take(&mut self) -> Option<T> {
         self.close();
-        self.channel.try_recv().ok()
+        let value = self.channel.try_recv().ok();
+        // Closing makes every outcome terminal, including the staged-send
+        // window where publication has not yet observed the receiver close.
+        // Record that edge so an erased receiver cannot later re-enter
+        // Tokio's completed receiver poll.
+        self.completed = true;
+        value
     }
 
     pub async fn receive(self) -> Option<T> {
+        self.assert_not_completed();
         self.channel.await.ok()
     }
 
     #[cfg(any(test, feature = "test-util"))]
     pub fn try_receive(&mut self) -> Option<T> {
-        self.channel.try_recv().ok()
+        match self.channel.try_recv() {
+            Ok(value) => {
+                self.completed = true;
+                Some(value)
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.completed = true;
+                None
+            }
+            Err(oneshot::error::TryRecvError::Empty) => None,
+        }
     }
+}
+
+mod framework_plain {
+    pub trait Sealed {}
+
+    impl Sealed for () {}
+
+    impl<T: Sealed, E: Sealed> Sealed for Result<T, E> {}
 }
 
 /// Marker for framework-owned response values whose destructor runs no user
@@ -622,8 +694,18 @@ impl<T> OneShotReceiver<T> {
 /// only for plain framework enums and their compositions; a type that can
 /// own user data — an `Exit`, a message, a type-erased error — must go
 /// through [`DisposingReceiver::new`] instead.
+///
+/// This trait is sealed: response types owned by another crate must use
+/// [`DisposingReceiver::new`], even when that crate currently knows their
+/// variants are plain. That keeps the authority to select inline destruction
+/// in the same runtime crate that owns the disposal implementation.
+///
+/// ```compile_fail
+/// struct ForeignResponse;
+/// impl shelterwood_runtime::FrameworkPlain for ForeignResponse {}
+/// ```
 #[doc(hidden)]
-pub trait FrameworkPlain: Send + 'static {}
+pub trait FrameworkPlain: framework_plain::Sealed + Send + 'static {}
 
 impl FrameworkPlain for () {}
 
@@ -860,7 +942,10 @@ impl<T> WatchSender<T> {
     ///
     /// This is only for compound publication that must finish another
     /// synchronous state transition before receivers are notified. The caller
-    /// must follow a successful logical mutation with [`Self::pulse`].
+    /// must follow a successful logical mutation with [`Self::pulse`]. The
+    /// closure runs under the watch value mutex and therefore may only move
+    /// plain framework-owned data: it must not call user code, drop user
+    /// values, block, panic, or re-enter the framework.
     pub fn modify_silently(&self, update: impl FnOnce(&mut T)) {
         let mut value = self.shared.value();
         update(&mut value);
@@ -868,8 +953,9 @@ impl<T> WatchSender<T> {
 
     /// Reads a projection of the retained value without cloning it.
     ///
-    /// `project` runs under the watch's value guard, so it must stay cheap and
-    /// must not touch the same channel.
+    /// `project` runs under the watch's value guard, so it may only inspect
+    /// plain framework-owned data. It must not call user code, drop user
+    /// values, block, panic, re-enter the framework, or touch this channel.
     pub fn read_with<R>(&self, project: impl FnOnce(&T) -> R) -> R {
         let value = self.shared.value();
         project(&value)
@@ -1104,6 +1190,7 @@ impl<T> fmt::Debug for BroadcastReceiver<T> {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         future::Future,
         mem::ManuallyDrop,
         panic::{AssertUnwindSafe, catch_unwind},
@@ -1123,19 +1210,24 @@ mod tests {
         test_support::DISPOSAL_THREAD, timeout, yield_now,
     };
 
-    use super::{RegisteredWaker, WaiterRegistry};
+    use super::{ONESHOT_REPOLL_PANIC, RegisteredWaker, WaiterRegistry};
 
     struct CountWake(Arc<AtomicUsize>);
 
     struct DebugProbe(Arc<AtomicUsize>);
 
-    struct FrameworkDropProbe(mpsc::Sender<ThreadId>);
+    thread_local! {
+        static FRAMEWORK_DROP_OBSERVED: Cell<bool> = const { Cell::new(false) };
+    }
 
+    struct FrameworkDropProbe;
+
+    impl super::framework_plain::Sealed for FrameworkDropProbe {}
     impl super::FrameworkPlain for FrameworkDropProbe {}
 
     impl Drop for FrameworkDropProbe {
         fn drop(&mut self) {
-            let _ = self.0.send(std::thread::current().id());
+            FRAMEWORK_DROP_OBSERVED.set(true);
         }
     }
 
@@ -1378,6 +1470,93 @@ mod tests {
     }
 
     #[test]
+    fn oneshot_repoll_uses_a_framework_owned_diagnostic() {
+        let mut context = Context::from_waker(Waker::noop());
+        let (sender, mut receiver) = oneshot();
+        sender.send(1_u8).expect("receiver is live");
+        assert!(matches!(
+            receiver.poll_receive(&mut context),
+            Poll::Ready(Some(1))
+        ));
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receiver.poll_receive(&mut context);
+        }))
+        .expect_err("a completed one-shot cannot be polled twice");
+        assert_panic_message(&*payload, ONESHOT_REPOLL_PANIC);
+
+        let mut receive = Box::pin(receiver.receive());
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receive.as_mut().poll(&mut context);
+        }))
+        .expect_err("receive cannot re-poll an already delivered receiver");
+        assert_panic_message(&*payload, ONESHOT_REPOLL_PANIC);
+
+        let (sender, receiver) = oneshot();
+        sender.send(2_u8).expect("receiver is live");
+        let mut receiver = DisposingReceiver::new(receiver);
+        assert!(matches!(
+            receiver.poll_receive(&mut context),
+            Poll::Ready(Some(2))
+        ));
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receiver.poll_receive(&mut context);
+        }))
+        .expect_err("a completed disposing receiver cannot be polled twice");
+        assert_panic_message(&*payload, ONESHOT_REPOLL_PANIC);
+
+        let (sender, mut receiver) = oneshot();
+        sender.send(3_u8).expect("receiver is live");
+        assert!(matches!(
+            receiver.close_and_poll_receive(&mut context),
+            OneShotClose::Value(3)
+        ));
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receiver.close_and_poll_receive(&mut context);
+        }))
+        .expect_err("a completed close poll cannot be repeated");
+        assert_panic_message(&*payload, ONESHOT_REPOLL_PANIC);
+
+        let (sender, mut receiver) = oneshot();
+        sender.send(4_u8).expect("receiver is live");
+        assert_eq!(receiver.close_and_take(), Some(4));
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receiver.poll_receive(&mut context);
+        }))
+        .expect_err("close-and-take terminality prevents a later poll");
+        assert_panic_message(&*payload, ONESHOT_REPOLL_PANIC);
+
+        let (sender, mut receiver) = oneshot();
+        sender.send(5_u8).expect("receiver is live");
+        assert_eq!(receiver.try_receive(), Some(5));
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receiver.close_and_poll_receive(&mut context);
+        }))
+        .expect_err("try-receive terminality prevents a later close poll");
+        assert_panic_message(&*payload, ONESHOT_REPOLL_PANIC);
+
+        // Tokio's `try_recv` consumes its receiver on every outcome but
+        // `Empty`, so an empty sender-closed take is terminal too.
+        let (sender, mut receiver) = oneshot::<u8>();
+        drop(sender);
+        assert_eq!(receiver.try_receive(), None);
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receiver.poll_receive(&mut context);
+        }))
+        .expect_err("an exhausted try-receive prevents a later poll");
+        assert_panic_message(&*payload, ONESHOT_REPOLL_PANIC);
+
+        // A bare close is not a receive edge: the receiver stays pollable and
+        // reports the sender-closed result.
+        let (sender, mut receiver) = oneshot::<u8>();
+        receiver.close();
+        drop(sender);
+        assert!(matches!(
+            receiver.poll_receive(&mut context),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[test]
     fn closing_oneshot_waits_for_a_send_that_won_before_publication() {
         let wakes = Arc::new(AtomicUsize::new(0));
         let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
@@ -1408,19 +1587,15 @@ mod tests {
 
     #[test]
     fn framework_disposing_receiver_drops_abandoned_values_inline() {
-        let dropping_thread = std::thread::current().id();
-        let (dropped, observed_drop) = mpsc::channel();
+        FRAMEWORK_DROP_OBSERVED.set(false);
         let (sender, receiver) = oneshot();
-        assert!(sender.send(FrameworkDropProbe(dropped)).is_ok());
+        assert!(sender.send(FrameworkDropProbe).is_ok());
 
         drop(DisposingReceiver::new_framework(receiver));
 
-        assert_eq!(
-            observed_drop
-                .recv_timeout(Duration::from_secs(1))
-                .expect("the abandoned framework value is destroyed"),
-            dropping_thread,
-            "plain framework responses do not use the blocking disposal lane"
+        assert!(
+            FRAMEWORK_DROP_OBSERVED.replace(false),
+            "the plain framework response is destroyed synchronously on this thread"
         );
     }
 
@@ -1488,6 +1663,11 @@ mod tests {
 
         assert_eq!(sending.publish(7_u8), Err(7));
         assert_eq!(receiver.try_receive(), None);
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receiver.poll_receive(&mut Context::from_waker(Waker::noop()));
+        }))
+        .expect_err("close-and-take completes the staged-send receiver");
+        assert_panic_message(&*payload, ONESHOT_REPOLL_PANIC);
     }
 
     #[test]
@@ -1579,17 +1759,26 @@ mod tests {
     }
 
     #[test]
-    fn quiet_signal_wait_cancellation_keeps_one_watch_registration() {
+    fn quiet_signal_wait_cancellation_removes_waiter_registration() {
         let signal = Signal::default();
         let mut watcher = signal.watcher();
-        assert_eq!(signal.watcher_count(), 1);
+        assert_eq!(signal.waiter_count(), 0);
 
         for _ in 0..10_000 {
             let mut changed = Box::pin(watcher.changed());
             let mut context = Context::from_waker(Waker::noop());
             assert!(changed.as_mut().poll(&mut context).is_pending());
+            assert_eq!(
+                signal.waiter_count(),
+                1,
+                "a parked wait holds exactly one registration"
+            );
             drop(changed);
-            assert_eq!(signal.watcher_count(), 1);
+            assert_eq!(
+                signal.waiter_count(),
+                0,
+                "cancelling the wait removes its registration"
+            );
         }
     }
 
@@ -2045,14 +2234,34 @@ mod tests {
             let first_poll =
                 std::future::poll_fn(|context| Poll::Ready(fired.as_mut().poll(context))).await;
             assert!(first_poll.is_pending());
+            assert_eq!(
+                latch.state.waiters.len(),
+                1,
+                "a parked wait holds exactly one registration"
+            );
             drop(fired);
+            assert_eq!(
+                latch.state.waiters.len(),
+                0,
+                "cancelling the wait removes its registration"
+            );
         }
 
         let mut live_waiter = Box::pin(latch.fired());
         let first_poll =
             std::future::poll_fn(|context| Poll::Ready(live_waiter.as_mut().poll(context))).await;
         assert!(first_poll.is_pending());
+        assert_eq!(
+            latch.state.waiters.len(),
+            1,
+            "the surviving wait is still registered"
+        );
         assert!(latch.fire());
+        assert_eq!(
+            latch.state.waiters.len(),
+            0,
+            "the fire drains every registration before waking"
+        );
         assert!(matches!(
             timeout(Duration::from_secs(1), live_waiter).await,
             Timeout::Completed(())

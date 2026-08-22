@@ -244,13 +244,14 @@ impl<F> Drop for Deadlined<F> {
 mod tests {
     use std::{
         future::Future,
-        mem::ManuallyDrop,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
+        task::{Context, Poll, Wake, Waker},
     };
+
+    use crate::mailbox::test_support::probe_waker;
 
     /// Stays pending on its first elapsed poll, modelling an atomic
     /// completion transition that won without publishing its payload yet.
@@ -327,39 +328,14 @@ mod tests {
     #[derive(Default)]
     struct CloneCounter(AtomicUsize);
 
-    unsafe fn clone_counting_waker(data: *const ()) -> RawWaker {
-        // SAFETY: every pointer using this vtable came from an Arc of the
-        // matching type. ManuallyDrop preserves the reference represented by
-        // `data`; the returned raw waker owns only the new clone.
-        let probe = ManuallyDrop::new(unsafe { Arc::<CloneCounter>::from_raw(data.cast()) });
-        probe.0.fetch_add(1, Ordering::SeqCst);
-        RawWaker::new(Arc::into_raw(Arc::clone(&probe)).cast(), &COUNTING_VTABLE)
-    }
-
-    unsafe fn wake_counting_waker(data: *const ()) {
-        // SAFETY: wake consumes the Arc reference represented by this waker.
-        drop(unsafe { Arc::<CloneCounter>::from_raw(data.cast()) });
-    }
-
-    unsafe fn wake_by_ref_counting_waker(_data: *const ()) {}
-
-    unsafe fn drop_counting_waker(data: *const ()) {
-        // SAFETY: drop consumes the Arc reference represented by this waker.
-        drop(unsafe { Arc::<CloneCounter>::from_raw(data.cast()) });
-    }
-
-    static COUNTING_VTABLE: RawWakerVTable = RawWakerVTable::new(
-        clone_counting_waker,
-        wake_counting_waker,
-        wake_by_ref_counting_waker,
-        drop_counting_waker,
-    );
-
     fn counting_waker(counter: &Arc<CloneCounter>) -> Waker {
-        let raw = RawWaker::new(Arc::into_raw(Arc::clone(counter)).cast(), &COUNTING_VTABLE);
-        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-        // ownership across clone, wake, and drop.
-        unsafe { Waker::from_raw(raw) }
+        let counter = Arc::clone(counter);
+        probe_waker(
+            move || {
+                counter.0.fetch_add(1, Ordering::SeqCst);
+            },
+            || {},
+        )
     }
 
     impl super::DeadlineOperation for PendingOnFirstExpiry {

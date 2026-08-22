@@ -5,8 +5,8 @@ use std::time::Duration;
 use crate::common::{LiveFlag, assert_eventually};
 use shelterwood::{
     BuildError, Cancellation, DynamicTree, Exit, ExitError, ExitKind, GracePhase, PolicyError,
-    Readiness, ReadinessDeadline, RemoveOutcome, ReserveError, Shutdown, StopReason, TaskDef,
-    TaskOnceDef, Tree,
+    Readiness, ReadinessDeadline, RemoveOutcome, ReserveError, Shutdown, StaticReserveError,
+    StopReason, TaskDef, TaskOnceDef, Tree,
 };
 
 #[test]
@@ -51,12 +51,12 @@ fn declaration_errors_are_eager_and_root_lowering_is_the_only_other_build_error(
     let mut tree = Tree::new();
     assert!(matches!(
         tree.reserve_task(""),
-        Err(shelterwood::ReserveError::EmptyId)
+        Err(StaticReserveError::EmptyId)
     ));
     let slot = tree.reserve_task("duplicate").expect("first id is free");
     assert!(matches!(
         tree.reserve_task("duplicate"),
-        Err(shelterwood::ReserveError::DuplicateId(ref id)) if id.as_str() == "duplicate"
+        Err(StaticReserveError::DuplicateId(ref id)) if id.as_str() == "duplicate"
     ));
     let task = slot.task_ref();
     drop(slot);

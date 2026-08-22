@@ -199,6 +199,7 @@ mod tests {
     struct WakerCounts {
         clones: AtomicUsize,
         drops: AtomicUsize,
+        wakes: AtomicUsize,
     }
 
     unsafe fn clone_counting(data: *const ()) -> RawWaker {
@@ -212,10 +213,16 @@ mod tests {
 
     unsafe fn wake_counting(data: *const ()) {
         // SAFETY: wake consumes the Arc reference represented by this waker.
-        drop(unsafe { Arc::<WakerCounts>::from_raw(data.cast()) });
+        let state = unsafe { Arc::<WakerCounts>::from_raw(data.cast()) };
+        state.wakes.fetch_add(1, Ordering::SeqCst);
     }
 
-    unsafe fn wake_by_ref_counting(_data: *const ()) {}
+    unsafe fn wake_by_ref_counting(data: *const ()) {
+        // SAFETY: wake_by_ref borrows the Arc reference represented by this
+        // waker, which ManuallyDrop preserves.
+        let state = ManuallyDrop::new(unsafe { Arc::<WakerCounts>::from_raw(data.cast()) });
+        state.wakes.fetch_add(1, Ordering::SeqCst);
+    }
 
     unsafe fn drop_counting(data: *const ()) {
         // SAFETY: drop consumes the Arc reference represented by this waker.
@@ -252,6 +259,28 @@ mod tests {
                 Poll::Pending
             } else {
                 Poll::Ready(())
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct WakeOnDropTimer {
+        registered: Option<Waker>,
+    }
+
+    impl Future for WakeOnDropTimer {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+            self.registered = Some(context.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    impl Drop for WakeOnDropTimer {
+        fn drop(&mut self) {
+            if let Some(registered) = &self.registered {
+                registered.wake_by_ref();
             }
         }
     }
@@ -349,5 +378,28 @@ mod tests {
             1,
             "repolling a cancelled timer never reaches the caller vtable"
         );
+    }
+
+    #[test]
+    fn retirement_empties_the_caller_slot_before_the_timer_is_cancelled() {
+        let state = Arc::new(WakerCounts::default());
+        let waker = ManuallyDrop::new(counting_waker(&state));
+        let mut context = Context::from_waker(&waker);
+        let raw: BoxedSleep = Box::pin(WakeOnDropTimer::default());
+        let mut timer = ProxiedSleep::new(raw, runtime());
+
+        assert!(Pin::new(&mut timer).poll(&mut context).is_pending());
+        assert_eq!(state.clones.load(Ordering::SeqCst), 1);
+
+        timer.cancel_inline();
+
+        assert_eq!(
+            state.wakes.load(Ordering::SeqCst),
+            0,
+            "the timer's drop-time proxy wake cannot reach a retired caller"
+        );
+        assert_eq!(state.drops.load(Ordering::SeqCst), 1);
+        assert!(timer.timer.is_none());
+        assert!(!timer.timer_poll.is_parked());
     }
 }

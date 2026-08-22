@@ -16,3 +16,6 @@ result
 
 # mdbook build output
 /book/book/
+
+# Retired local review sketch; the durable conclusions live in tracked issues.
+/pi-sketch.md

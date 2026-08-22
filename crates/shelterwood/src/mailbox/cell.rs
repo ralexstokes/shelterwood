@@ -1,8 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
-    num::NonZeroUsize,
-    ops::Deref,
+    ops::{Deref, DerefMut},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
@@ -75,12 +74,6 @@ impl ReceiveMode {
             Self::LiveThrough(limit) => sequence <= limit,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MailboxKind {
-    Queue(NonZeroUsize),
-    Latest,
 }
 
 pub(super) struct Envelope<M> {
@@ -264,7 +257,7 @@ impl<M> SendOperation<M> {
 }
 
 pub(super) struct MailboxState<M> {
-    kind: Option<MailboxKind>,
+    kind: Option<ResolvedMailbox>,
     bind_permit: Arc<AtomicBool>,
     binding: MailboxBinding<M>,
     last_bound: Option<Incarnation>,
@@ -326,16 +319,23 @@ impl<M> MailboxState<M> {
                 return waiters.park(operation);
             }
             MailboxBinding::Bound(BoundState::Available(incarnation)) => {
-                let Some(MailboxKind::Queue(capacity)) = self.kind else {
-                    unreachable!("only a capacity-bound queue can park while bound")
-                };
                 // Diagnostic-only under the mailbox mutex: `Available` parks
                 // only after the accepting transition filled this configured
-                // queue, or after that transition's own incarnation-mismatch
-                // fallback, which has already recorded its invariant panic on
-                // the effects sink. The Full transition remains total without
-                // this check, and no test expects the diagnostic panic.
-                debug_assert_eq!(self.queue.len(), capacity.get());
+                // queue, so a latest mailbox never arrives here -- its
+                // incarnation mismatch now leaves through its own non-parking
+                // transition instead. Releasing the guard to raise the verdict
+                // is impossible mid-transition and an always-on panic would
+                // poison the mailbox for every later caller, so record it and
+                // keep the transition total: parking preserves the operation's
+                // user message under either mailbox kind. No test expects this
+                // diagnostic.
+                debug_assert!(
+                    matches!(
+                        self.kind,
+                        Some(ResolvedMailbox::Queue(capacity)) if self.queue.len() == capacity.get()
+                    ),
+                    "only a filled capacity-bound queue can park while bound"
+                );
                 let incarnation = *incarnation;
                 let mut waiters = WaiterQueue::default();
                 if !waiters.park(operation) {
@@ -380,13 +380,13 @@ impl<M> MailboxState<M> {
     /// Dequeues the next envelope this receive mode is willing to observe.
     fn take_next(&mut self, mode: ReceiveMode) -> Option<Envelope<M>> {
         match self.kind {
-            Some(MailboxKind::Queue(_)) => self
+            Some(ResolvedMailbox::Queue(_)) => self
                 .queue
                 .front()
                 .is_some_and(|item| mode.accepts(item.accepted_sequence))
                 .then(|| self.queue.pop_front())
                 .flatten(),
-            Some(MailboxKind::Latest) => self
+            Some(ResolvedMailbox::Latest) => self
                 .latest
                 .as_ref()
                 .is_some_and(|item| mode.accepts(item.accepted_sequence))
@@ -442,6 +442,7 @@ pub(super) enum Submission<M> {
 
 enum SubmitTransition<M> {
     Complete(Submission<M>),
+    IncarnationMismatch(M),
     WaiterIdentityExhausted(Arc<SendOperation<M>>),
     AcceptedSequenceExhausted(M),
 }
@@ -449,11 +450,13 @@ enum SubmitTransition<M> {
 enum AcceptTransition<M> {
     Accepted(Incarnation),
     Full(M),
+    IncarnationMismatch(M),
     Exhausted(M),
 }
 
 enum TrySendTransition<M> {
     Complete(Result<Incarnation, SendError<M>>),
+    IncarnationMismatch(M),
     AcceptedSequenceExhausted(M),
 }
 
@@ -551,6 +554,63 @@ impl<M> WaiterQueue<M> {
     }
 }
 
+/// The complete movable effect state for one mailbox transition.
+///
+/// `MailboxEffects` owns this value and moves it wholesale into the eventual
+/// batch, so adding an effect cannot require restating its field at that seam.
+struct MailboxEffectPayload<M> {
+    pulse: bool,
+    displaced: Vec<Envelope<M>>,
+    isolate_displaced: bool,
+    wakers: WakerEffects,
+    returned: Option<M>,
+    accepted_sequence_exhausted: bool,
+    rejected_bindings: Vec<MailboxBinding<M>>,
+    invariant_panic: Option<&'static str>,
+}
+
+impl<M> Default for MailboxEffectPayload<M> {
+    fn default() -> Self {
+        Self {
+            pulse: false,
+            displaced: Vec::new(),
+            isolate_displaced: false,
+            wakers: WakerEffects::default(),
+            returned: None,
+            accepted_sequence_exhausted: false,
+            rejected_bindings: Vec::new(),
+            invariant_panic: None,
+        }
+    }
+}
+
+impl<M> MailboxEffectPayload<M> {
+    fn is_empty(&self) -> bool {
+        // Destructured rather than field-accessed: a new effect field is then
+        // a compile error here instead of an effect silently discarded
+        // whenever it is the only one this transition set.
+        let Self {
+            pulse,
+            displaced,
+            // `isolate_displaced` only selects how a nonempty displaced set is
+            // flushed; by itself it represents no work.
+            isolate_displaced: _,
+            wakers,
+            returned,
+            accepted_sequence_exhausted,
+            rejected_bindings,
+            invariant_panic,
+        } = self;
+        !pulse
+            && displaced.is_empty()
+            && wakers.is_empty()
+            && returned.is_none()
+            && !accepted_sequence_exhausted
+            && rejected_bindings.is_empty()
+            && invariant_panic.is_none()
+    }
+}
+
 /// User-controlled effects produced while reducing one mailbox transition.
 ///
 /// `MailboxTxn` owns this sink beside the guard and drops the guard first.
@@ -563,14 +623,7 @@ impl<M> WaiterQueue<M> {
 struct MailboxEffects<'a, 's, M: Send + 'static> {
     cell: &'a MailboxCell<M>,
     external: Option<&'s mut dyn MailboxEffectSink>,
-    pulse: bool,
-    displaced: Vec<Envelope<M>>,
-    isolate_displaced: bool,
-    wakers: WakerEffects,
-    returned: Option<M>,
-    accepted_sequence_exhausted: bool,
-    rejected_bindings: Vec<MailboxBinding<M>>,
-    invariant_panic: Option<&'static str>,
+    payload: MailboxEffectPayload<M>,
 }
 
 impl<'a, 's, M: Send + 'static> MailboxEffects<'a, 's, M> {
@@ -589,49 +642,42 @@ impl<'a, 's, M: Send + 'static> MailboxEffects<'a, 's, M> {
         Self {
             cell,
             external,
-            pulse: false,
-            displaced: Vec::new(),
-            isolate_displaced: false,
-            wakers: WakerEffects::default(),
-            returned: None,
-            accepted_sequence_exhausted: false,
-            rejected_bindings: Vec::new(),
-            invariant_panic: None,
+            payload: MailboxEffectPayload::default(),
         }
     }
 
     fn pulse(&mut self) {
-        self.pulse = true;
+        self.payload.pulse = true;
     }
 
     fn isolate_displaced(&mut self) {
-        self.isolate_displaced = true;
+        self.payload.isolate_displaced = true;
+    }
+}
+
+impl<M: Send + 'static> Deref for MailboxEffects<'_, '_, M> {
+    type Target = MailboxEffectPayload<M>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.payload
+    }
+}
+
+impl<M: Send + 'static> DerefMut for MailboxEffects<'_, '_, M> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.payload
     }
 }
 
 impl<M: Send + 'static> Drop for MailboxEffects<'_, '_, M> {
     fn drop(&mut self) {
-        if !self.pulse
-            && self.displaced.is_empty()
-            && self.wakers.is_empty()
-            && self.returned.is_none()
-            && !self.accepted_sequence_exhausted
-            && self.rejected_bindings.is_empty()
-            && self.invariant_panic.is_none()
-        {
+        if self.payload.is_empty() {
             return;
         }
         let batch = MailboxEffectBatch {
             changed: Arc::clone(&self.cell.changed),
             runtime: Arc::clone(&self.cell.runtime),
-            pulse: self.pulse,
-            displaced: std::mem::take(&mut self.displaced),
-            isolate_displaced: self.isolate_displaced,
-            wakers: std::mem::take(&mut self.wakers),
-            returned: self.returned.take(),
-            accepted_sequence_exhausted: self.accepted_sequence_exhausted,
-            rejected_bindings: std::mem::take(&mut self.rejected_bindings),
-            invariant_panic: self.invariant_panic.take(),
+            payload: std::mem::take(&mut self.payload),
         };
         if let Some(external) = self.external.take() {
             external.defer_mailbox_effect(Box::new(move || {
@@ -646,14 +692,7 @@ impl<M: Send + 'static> Drop for MailboxEffects<'_, '_, M> {
 struct MailboxEffectBatch<M> {
     changed: Arc<dyn MailboxSignal>,
     runtime: Arc<dyn MailboxRuntime>,
-    pulse: bool,
-    displaced: Vec<Envelope<M>>,
-    isolate_displaced: bool,
-    wakers: WakerEffects,
-    returned: Option<M>,
-    accepted_sequence_exhausted: bool,
-    rejected_bindings: Vec<MailboxBinding<M>>,
-    invariant_panic: Option<&'static str>,
+    payload: MailboxEffectPayload<M>,
 }
 
 /// A received message remains isolated until every post-unlock effect has
@@ -684,42 +723,52 @@ impl<M: Send + 'static> Drop for ReturnedMessage<M> {
 }
 
 impl<M: Send + 'static> MailboxEffectBatch<M> {
-    fn flush(mut self) {
+    fn flush(self) {
+        let Self {
+            changed,
+            runtime,
+            mut payload,
+        } = self;
         let mut panics = PanicAccumulator::default();
-        if let Some(message) = self.invariant_panic {
+        if let Some(message) = payload.invariant_panic {
             panics.run(|| panic!("{message}"));
         }
-        for rejected in self.rejected_bindings.drain(..) {
+        for rejected in payload.rejected_bindings.drain(..) {
             // A rejected binding can own parked user messages. Submit every
             // binding separately so neither this caller nor a sibling job's
             // unwind destroys it inline.
-            panics.run(|| dispose_value(self.runtime.as_ref(), rejected));
+            panics.run(|| dispose_value(runtime.as_ref(), rejected));
         }
-        if self.pulse {
-            panics.run(|| self.changed.pulse());
+        if payload.pulse {
+            panics.run(|| changed.pulse());
         }
         // Submit displaced latest-value payloads to isolated disposal before
         // waking accepted senders: a woken sender may run immediately and must
         // not race ahead of disposal submission.
-        if self.isolate_displaced && !self.displaced.is_empty() {
-            let isolated = std::mem::take(&mut self.displaced);
+        if payload.isolate_displaced && !payload.displaced.is_empty() {
+            let isolated = std::mem::take(&mut payload.displaced);
             panics.run(|| {
                 dispose_value(
-                    self.runtime.as_ref(),
+                    runtime.as_ref(),
                     MailboxPayload::unread(isolated.into(), None),
                 );
             });
         }
-        self.wakers.flush(&mut panics);
-        if !self.isolate_displaced {
-            for envelope in self.displaced.drain(..) {
+        payload.wakers.flush(&mut panics);
+        if !payload.isolate_displaced {
+            // A live latest transition displaces at most the one value it
+            // replaced, so per-element containment here is totality for a
+            // future multi-displacement caller rather than a tested behavior;
+            // `bind`, the only caller that can accumulate several, isolates
+            // them into a `MailboxPayload` above instead.
+            for envelope in payload.displaced.drain(..) {
                 panics.run(|| drop(envelope));
             }
         }
-        if let Some(returned) = self.returned.take() {
+        if let Some(returned) = payload.returned.take() {
             panics.run(|| drop(returned));
         }
-        if self.accepted_sequence_exhausted {
+        if payload.accepted_sequence_exhausted {
             panics.run(|| panic!("mailbox accepted-sequence space exhausted"));
         }
     }
@@ -772,7 +821,7 @@ impl<'a, 's, M: Send + 'static> MailboxTxn<'a, 's, M> {
         self.parts().0
     }
 
-    fn configure_kind(&mut self, kind: MailboxKind) -> Option<MailboxKind> {
+    fn configure_kind(&mut self, kind: ResolvedMailbox) -> Option<ResolvedMailbox> {
         let state = self.state_mut();
         match state.kind {
             Some(existing) => (existing != kind).then_some(existing),
@@ -1087,6 +1136,9 @@ impl<M: Send + 'static> MailboxCell<M> {
                             SubmitTransition::WaiterIdentityExhausted(operation)
                         }
                     }
+                    AcceptTransition::IncarnationMismatch(message) => {
+                        SubmitTransition::IncarnationMismatch(message)
+                    }
                     AcceptTransition::Exhausted(message) => {
                         SubmitTransition::AcceptedSequenceExhausted(message)
                     }
@@ -1106,6 +1158,9 @@ impl<M: Send + 'static> MailboxCell<M> {
         };
         match transaction.finish(transition) {
             SubmitTransition::Complete(submission) => submission,
+            SubmitTransition::IncarnationMismatch(message) => {
+                reject_incarnation_mismatch(&self.runtime, message)
+            }
             SubmitTransition::WaiterIdentityExhausted(operation) => {
                 dispose(&self.runtime, operation);
                 panic!("mailbox waiter identity space exhausted");
@@ -1157,6 +1212,9 @@ impl<M: Send + 'static> MailboxCell<M> {
                             kind: SendErrorKind::Full,
                         }))
                     }
+                    AcceptTransition::IncarnationMismatch(message) => {
+                        TrySendTransition::IncarnationMismatch(message)
+                    }
                     AcceptTransition::Exhausted(message) => {
                         TrySendTransition::AcceptedSequenceExhausted(message)
                     }
@@ -1165,6 +1223,9 @@ impl<M: Send + 'static> MailboxCell<M> {
         };
         match transaction.finish(transition) {
             TrySendTransition::Complete(result) => result,
+            TrySendTransition::IncarnationMismatch(message) => {
+                reject_incarnation_mismatch(&self.runtime, message)
+            }
             TrySendTransition::AcceptedSequenceExhausted(message) => {
                 dispose(&self.runtime, message);
                 panic!("mailbox accepted-sequence space exhausted");
@@ -1265,15 +1326,9 @@ impl<M: Send + 'static> MailboxCell<M> {
                         // (including zero-duration) deadline poll.
                         let observed = (*newest_observed).or(current_observation);
                         state.outcome = OperationOutcome::Withdrawn;
-                        state.waker.take(
-                            match disposition {
-                                WithdrawalDisposition::Inline => WakerAction::DropInline,
-                                WithdrawalDisposition::Isolated => {
-                                    WakerAction::Dispose(Arc::clone(&self.runtime))
-                                }
-                            },
-                            &mut waker_effects,
-                        );
+                        state
+                            .waker
+                            .take(disposition.action(&self.runtime), &mut waker_effects);
                         Ok((
                             WithdrawalOutcome::Withdrawn { message, observed },
                             state.registration.take(),
@@ -1287,15 +1342,9 @@ impl<M: Send + 'static> MailboxCell<M> {
                     // that published this outcome. Keep a future regression
                     // total by transferring any leftover waker to the same
                     // post-unlock effect set as an ordinary withdrawal.
-                    state.waker.take(
-                        match disposition {
-                            WithdrawalDisposition::Inline => WakerAction::DropInline,
-                            WithdrawalDisposition::Isolated => {
-                                WakerAction::Dispose(Arc::clone(&self.runtime))
-                            }
-                        },
-                        &mut waker_effects,
-                    );
+                    state
+                        .waker
+                        .take(disposition.action(&self.runtime), &mut waker_effects);
                     Ok((
                         WithdrawalOutcome::Accepted(incarnation),
                         state.registration.take(),
@@ -1311,15 +1360,9 @@ impl<M: Send + 'static> MailboxCell<M> {
                         // publishing. Transfer a leftover instead of letting a
                         // diagnostic unwind this by-value message under the
                         // operation mutex.
-                        state.waker.take(
-                            match disposition {
-                                WithdrawalDisposition::Inline => WakerAction::DropInline,
-                                WithdrawalDisposition::Isolated => {
-                                    WakerAction::Dispose(Arc::clone(&self.runtime))
-                                }
-                            },
-                            &mut waker_effects,
-                        );
+                        state
+                            .waker
+                            .take(disposition.action(&self.runtime), &mut waker_effects);
                         Ok((
                             WithdrawalOutcome::Terminated { message, observed },
                             state.registration.take(),
@@ -1405,17 +1448,13 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         mailbox: ResolvedMailbox,
         effects: &mut dyn MailboxEffectSink,
     ) -> MailboxBindToken {
-        let kind = match mailbox {
-            ResolvedMailbox::Queue(capacity) => MailboxKind::Queue(capacity),
-            ResolvedMailbox::Latest => MailboxKind::Latest,
-        };
         let mut transaction = MailboxTxn::deferred(self, effects);
-        let mismatch = transaction.configure_kind(kind);
+        let mismatch = transaction.configure_kind(mailbox);
         let token = MailboxBindToken::new(Arc::clone(&transaction.bind_permit));
         transaction.finish(());
         if let Some(existing) = mismatch {
             panic!(
-                "mailbox configuration changed from {existing:?} to {kind:?} after initialization"
+                "mailbox configuration changed from {existing:?} to {mailbox:?} after initialization"
             );
         }
         token
@@ -1484,13 +1523,12 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         } else if waiters.is_empty() {
             transaction.bind_available(incarnation);
         } else {
-            let MailboxKind::Queue(capacity) = kind else {
+            let ResolvedMailbox::Queue(_) = kind else {
                 unreachable!("a latest mailbox finishes all waiting submissions")
             };
             // Promotion leaves waiters only after filling a configured queue.
             // Binding Full is the total fallback too: diagnosing here would
             // unwind the waiter queue's user messages under the mailbox mutex.
-            let _ = capacity;
             transaction.bind_full(incarnation, waiters);
         }
         transaction.effects.pulse();
@@ -1571,6 +1609,14 @@ fn mint_accepted_sequence(accepted: &AtomicPoisonedCounter) -> Option<AcceptedSe
         .map(AcceptedSequence)
 }
 
+fn reject_incarnation_mismatch<M: Send + 'static>(
+    runtime: &Arc<dyn MailboxRuntime>,
+    message: M,
+) -> ! {
+    dispose(runtime, message);
+    panic!("an accepting transition observes its own binding's incarnation");
+}
+
 fn accept_locked<M>(
     state: &mut MailboxState<M>,
     incarnation: Incarnation,
@@ -1585,14 +1631,13 @@ where
         MailboxBinding::Bound(BoundState::Available(current)) => {
             // `incarnation` was read from this same binding by the surrounding
             // transaction, so a mismatch is a framework invariant failure.
-            // Keep it total -- the by-value user message returns through the
-            // caller's post-unlock path rather than being destroyed under the
-            // mailbox mutex -- and raise the diagnostic through the same
-            // effects sink, which flushes it after unlock.
+            // Keep it total: a dedicated transition carries the by-value user
+            // message through the caller's post-unlock disposal path before
+            // the diagnostic is raised. In particular, it must not share the
+            // ordinary Full transition, whose submit caller parks a queue
+            // waiter and is structurally invalid for a Latest mailbox.
             if *current != incarnation {
-                effects.invariant_panic =
-                    Some("an accepting transition observes its own binding's incarnation");
-                return AcceptTransition::Full(message);
+                return AcceptTransition::IncarnationMismatch(message);
             }
         }
         MailboxBinding::Bound(BoundState::Full { .. }) => {
@@ -1605,24 +1650,24 @@ where
         }
     }
     let kind = match state.kind {
-        Some(MailboxKind::Queue(capacity)) if state.queue.len() < capacity.get() => {
-            MailboxKind::Queue(capacity)
+        Some(ResolvedMailbox::Queue(capacity)) if state.queue.len() < capacity.get() => {
+            ResolvedMailbox::Queue(capacity)
         }
-        Some(MailboxKind::Latest) => MailboxKind::Latest,
-        Some(MailboxKind::Queue(_)) => return AcceptTransition::Full(message),
+        Some(ResolvedMailbox::Latest) => ResolvedMailbox::Latest,
+        Some(ResolvedMailbox::Queue(_)) => return AcceptTransition::Full(message),
         None => unreachable!("a bound mailbox is always configured"),
     };
     let Some(accepted_sequence) = mint_accepted_sequence(accepted) else {
         return AcceptTransition::Exhausted(message);
     };
     match kind {
-        MailboxKind::Queue(_) => {
+        ResolvedMailbox::Queue(_) => {
             state.queue.push_back(Envelope {
                 message,
                 accepted_sequence,
             });
         }
-        MailboxKind::Latest => {
+        ResolvedMailbox::Latest => {
             let displaced = state.latest.replace(Envelope {
                 message,
                 accepted_sequence,
@@ -1661,13 +1706,20 @@ fn promote_waiters<M: Send + 'static>(
         accepted_sequence,
         effects,
     );
+    // Bind-time exhaustion freezes because no live incarnation has yet been
+    // published. A receive is different: it has already removed an accepted
+    // envelope from this live incarnation, and freezing here would make
+    // `LiveThrough` stop observing the remaining accepted envelopes. Leave a
+    // nonempty waiter queue Full instead. Exhaustion is a fatal diagnostic;
+    // if execution nevertheless continues, each later receive that opens
+    // capacity may re-observe and re-report the poisoned sequence counter.
     if waiters.is_empty() {
         state.binding = MailboxBinding::Bound(BoundState::Available(incarnation));
     }
 }
 
 fn promote_waiter_queue<M: Send + 'static>(
-    kind: MailboxKind,
+    kind: ResolvedMailbox,
     incarnation: Incarnation,
     waiters: &mut WaiterQueue<M>,
     queue: &mut VecDeque<Envelope<M>>,
@@ -1676,8 +1728,8 @@ fn promote_waiter_queue<M: Send + 'static>(
     effects: &mut MailboxEffects<'_, '_, M>,
 ) {
     let available = match kind {
-        MailboxKind::Queue(capacity) => capacity.get().saturating_sub(queue.len()),
-        MailboxKind::Latest => usize::MAX,
+        ResolvedMailbox::Queue(capacity) => capacity.get().saturating_sub(queue.len()),
+        ResolvedMailbox::Latest => usize::MAX,
     };
     let mut accepted = 0usize;
     while accepted < available {
@@ -1697,11 +1749,11 @@ fn promote_waiter_queue<M: Send + 'static>(
             continue;
         };
         match kind {
-            MailboxKind::Queue(_) => queue.push_back(Envelope {
+            ResolvedMailbox::Queue(_) => queue.push_back(Envelope {
                 message,
                 accepted_sequence,
             }),
-            MailboxKind::Latest => {
+            ResolvedMailbox::Latest => {
                 if let Some(displaced) = latest.replace(Envelope {
                     message,
                     accepted_sequence,
@@ -1718,6 +1770,15 @@ fn promote_waiter_queue<M: Send + 'static>(
 pub(super) enum WithdrawalDisposition {
     Inline,
     Isolated,
+}
+
+impl WithdrawalDisposition {
+    fn action(self, runtime: &Arc<dyn MailboxRuntime>) -> WakerAction {
+        match self {
+            Self::Inline => WakerAction::DropInline,
+            Self::Isolated => WakerAction::Dispose(Arc::clone(runtime)),
+        }
+    }
 }
 
 pub(super) struct Withdrawal<M> {

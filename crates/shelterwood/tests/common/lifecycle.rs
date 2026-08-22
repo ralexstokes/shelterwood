@@ -1,4 +1,6 @@
-use shelterwood::{ExitKind, LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem};
+use shelterwood::{
+    Exit, ExitKind, LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem,
+};
 
 pub(crate) async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
     tokio::time::timeout(super::POLL_TIMEOUT, events.recv())
@@ -21,6 +23,23 @@ pub(crate) async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
         LifecycleItem::Event(event) => event,
         LifecycleItem::Lagged { dropped } => {
             panic!("unexpected lifecycle lag marker dropping {dropped}")
+        }
+    }
+}
+
+/// Returns the next exit published for `id`, rejecting fixture lag.
+///
+/// It stops at the *first* matching exit, so it judges one incarnation only.
+/// A fixture that restarts the child and means the final exit wants
+/// [`last_panic_message`]'s drain-to-closure shape instead.
+pub(crate) async fn next_exit_of(events: &mut LifecycleEvents, id: &str) -> Exit {
+    loop {
+        if let LifecycleEventKind::Exited {
+            id: exited, exit, ..
+        } = next_event(events).await.kind
+            && exited.as_str() == id
+        {
+            return exit;
         }
     }
 }

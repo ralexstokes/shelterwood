@@ -12,12 +12,12 @@ use std::{
 
 use crate::common::{
     POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually, assert_quiet, last_panic_message,
-    next_event,
+    next_exit_of,
 };
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
-    Guard, Handler, LifecycleEventKind, Mailbox, MailboxShutdown, RawActor, RawContext, RawOnceDef,
-    Readiness, Shutdown, StartupError, StartupFailureCause, StopContext, Tree,
+    Guard, Handler, Mailbox, MailboxShutdown, RawActor, RawContext, RawOnceDef, Readiness,
+    Shutdown, StartupError, StartupFailureCause, StopContext, Tree,
 };
 
 enum ZeroMessage {
@@ -1039,18 +1039,7 @@ async fn cancellation_destructor_panic_wakes_an_otherwise_idle_actor() {
 
     guard.cancel();
 
-    let exit = tokio::time::timeout(POLL_TIMEOUT, async {
-        loop {
-            let event = next_event(&mut events).await;
-            if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
-                && id.as_str() == "idle-offload"
-            {
-                break exit;
-            }
-        }
-    })
-    .await
-    .expect("the retained panic wakes the idle actor");
+    let exit = next_exit_of(&mut events, "idle-offload").await;
     let ExitKind::Panicked { message } = exit.kind() else {
         panic!("expected destructor panic, got {:?}", exit.kind());
     };
@@ -1362,18 +1351,7 @@ async fn hostile_finished_waker_cannot_strand_later_offload_or_exit_publication(
     let mut events = system.scope().subscribe_lifecycle();
 
     actor.send(()).await.expect("actor is live");
-    let exit = tokio::time::timeout(POLL_TIMEOUT, async {
-        loop {
-            let event = next_event(&mut events).await;
-            if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
-                && id.as_str() == "hostile-finished"
-            {
-                break exit;
-            }
-        }
-    })
-    .await
-    .expect("the incarnation publishes its exit without parent shutdown");
+    let exit = next_exit_of(&mut events, "hostile-finished").await;
 
     let ExitKind::Panicked { message } = exit.kind() else {
         panic!("expected hostile-waker panic exit, got {:?}", exit.kind());

@@ -160,11 +160,14 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
-        task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
+        task::{Context, Poll, Wake, Waker},
         time::Duration,
     };
 
-    use crate::mailbox::capability::{DisposingReceiver, OneShotClose, oneshot};
+    use crate::mailbox::{
+        capability::{DisposingReceiver, OneShotClose, oneshot},
+        test_support::probe_waker,
+    };
     use shelterwood_core::{
         ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
     };
@@ -218,51 +221,14 @@ mod tests {
         }
     }
 
-    struct DropCounter {
-        drops: Arc<AtomicUsize>,
-        hostile: bool,
-    }
-
-    unsafe fn clone_counted_drop_waker(data: *const ()) -> RawWaker {
-        // SAFETY: every pointer using this vtable came from an Arc of the
-        // matching type. ManuallyDrop preserves the represented reference;
-        // the returned raw waker owns only the new clone.
-        let state = ManuallyDrop::new(unsafe { Arc::<DropCounter>::from_raw(data.cast()) });
-        RawWaker::new(
-            Arc::into_raw(Arc::clone(&state)).cast(),
-            &COUNTED_DROP_WAKER_VTABLE,
-        )
-    }
-
-    unsafe fn wake_counted_drop_waker(data: *const ()) {
-        // SAFETY: wake consumes the Arc reference represented by this waker.
-        drop(unsafe { Arc::<DropCounter>::from_raw(data.cast()) });
-    }
-
-    unsafe fn wake_by_ref_counted_drop_waker(_data: *const ()) {}
-
-    unsafe fn drop_counted_drop_waker(data: *const ()) {
-        // SAFETY: drop consumes the Arc reference represented by this waker.
-        let state = unsafe { Arc::<DropCounter>::from_raw(data.cast()) };
-        state.drops.fetch_add(1, Ordering::SeqCst);
-        assert!(!state.hostile, "injected reply caller-waker drop panic");
-    }
-
-    static COUNTED_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-        clone_counted_drop_waker,
-        wake_counted_drop_waker,
-        wake_by_ref_counted_drop_waker,
-        drop_counted_drop_waker,
-    );
-
     fn drop_waker(drops: Arc<AtomicUsize>, hostile: bool) -> Waker {
-        let raw = RawWaker::new(
-            Arc::into_raw(Arc::new(DropCounter { drops, hostile })).cast(),
-            &COUNTED_DROP_WAKER_VTABLE,
-        );
-        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-        // ownership across clone, wake, and drop.
-        unsafe { Waker::from_raw(raw) }
+        probe_waker(
+            || {},
+            move || {
+                drops.fetch_add(1, Ordering::SeqCst);
+                assert!(!hostile, "injected reply caller-waker drop panic");
+            },
+        )
     }
 
     fn counted_drop_waker(drops: Arc<AtomicUsize>) -> Waker {

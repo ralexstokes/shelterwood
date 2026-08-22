@@ -569,6 +569,12 @@ impl ScopeCell {
         )
     }
 
+    /// Publishes a fabricated scope state.
+    ///
+    /// `Stopped` goes through the live terminal publisher rather than the
+    /// nonterminal writer, so a fixture that publishes it twice — or over a
+    /// stronger recorded reason — is suppressed by SPEC §11 stop precedence
+    /// instead of overwriting.
     #[cfg(test)]
     pub(crate) fn set_state(&self, state: ScopeState) {
         self.with_observation_gate(|txn| match state {
@@ -619,6 +625,7 @@ impl ScopeCell {
         }
         let mut state = Some(state);
         let mut startup = startup;
+        let mut startup_installed = false;
         let published = self.with_observation_gate(|txn| {
             if !terminal_disposals.iter().all(|member| {
                 self.current_observation_gate()
@@ -627,7 +634,7 @@ impl ScopeCell {
                 return false;
             }
             if let Some(startup) = startup.take() {
-                self.set_startup_locked(startup, txn);
+                startup_installed = self.set_startup_locked(startup, txn);
             }
             self.set_state_locked(
                 state
@@ -642,10 +649,19 @@ impl ScopeCell {
             published,
             "a drain entry may mark only a resident member on its observation gate"
         );
-        // A successful publication installed its own retained record copy.
-        // Surrender the diagnostic-only guards as raw refcount traffic.
-        for exit in retained_startup {
-            drop(exit.into_exit());
+        if startup_installed {
+            // The record installed its own retained copy, so the diagnostic
+            // guards are surrendered as raw refcount traffic.
+            for exit in retained_startup {
+                drop(exit.into_exit());
+            }
+        } else {
+            // A record that already held a startup result rejected this one,
+            // and the rejected raw result retired through the transaction's
+            // own guards — into isolated disposal, which is still running.
+            // Surrendering these guards raw would race that job for the last
+            // owner, so they retire the same way instead.
+            drop(retained_startup);
         }
     }
 
@@ -916,7 +932,18 @@ impl ScopeCell {
         self.with_observation_gate(|txn| self.set_startup_locked(startup, txn));
     }
 
-    fn set_startup_locked(&self, startup: Result<(), StartupError>, txn: &mut ObservationTxn<'_>) {
+    /// Installs the startup result unless one is already recorded.
+    ///
+    /// Returns whether this call installed it. A caller holding its own
+    /// transient guards needs that verdict: only an installed result leaves an
+    /// equivalent retained copy in the record, which is what makes surrendering
+    /// those guards raw refcount traffic rather than a race with the isolated
+    /// disposal a rejected result starts here.
+    fn set_startup_locked(
+        &self,
+        startup: Result<(), StartupError>,
+        txn: &mut ObservationTxn<'_>,
+    ) -> bool {
         let mut retained = Vec::new();
         RetainedExit::retain_startup_result(&mut retained, &startup);
         let mut incoming = Some((startup, retained));
@@ -945,6 +972,7 @@ impl ScopeCell {
             txn.pulse(&self.member.record);
             txn.pulse(&self.observation.record);
         }
+        published
     }
 
     pub(crate) fn begin_incarnation(&self, state: ScopeState) -> Option<Epoch> {
@@ -1307,7 +1335,9 @@ impl ScopeCell {
     ///
     /// Returns whether the member's `Admitted` transition was legal. A refusal
     /// publishes nothing: no gate handoff, no parent wiring, no retained
-    /// residency and no `Added` event.
+    /// residency and no `Added` event. The residency diagnostic below returns
+    /// `false` after those steps have landed, but it also queues a panic, so no
+    /// caller observes that verdict.
     ///
     /// A *panic* between the residency push and the `Added` publication is
     /// different: residency keeps the resident so its possibly-last mailbox
@@ -1417,6 +1447,11 @@ impl ScopeCell {
                 })
         };
         if !announced_is_admission {
+            // Residency no longer holds this admission, so the lookup clone
+            // can be the last member/mailbox owner. Move it into the
+            // transaction ahead of the diagnostic, exactly as the refusal pop
+            // above does, rather than unwinding it under the observation gate.
+            txn.defer(move || runtime::dispose_detached(projection));
             txn.defer(|| panic!("success announces the admission-local resident"));
             return false;
         }

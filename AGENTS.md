@@ -169,10 +169,11 @@ the pattern; where releasing is impossible, `debug_assert!` instead, as
 `MailboxState::take_waiters` does). And a value that may block on destruction
 goes to `runtime::dispose_detached`, not merely past the unlock. That second
 convention is currently met for mailbox payloads, construction closures,
-blocking-offload captured state, displaced resident graphs and rejected
-admission projections. Raw incarnation-owned values — async offload futures,
-continuations, timers and completions — instead follow SPEC §6.5's on-task
-contained funnel because its disposal verdict is part of exit classification.
+blocking-offload captured state, displaced resident graphs, and rejected
+lifecycle events and admission projections. Raw incarnation-owned values —
+async offload futures, continuations, timers and completions — instead
+follow SPEC §6.5's on-task contained funnel, because a destructor panic
+there is cleanup evidence that exit classification must fold in.
 Framework-retained `Exit` copies meet it through `RetainedExit`,
 including driver completions and pending terminal disposal; exits handed to
 users keep ordinary drop timing. Its fail-safe under exhausted thread

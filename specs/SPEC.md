@@ -2865,8 +2865,9 @@ Two conventions travel with the rule. Panicking while holding a mutex the
 implementation expects unpoisoned poisons it for every later caller —
 compute the verdict, release, *then* panic; where releasing is
 impossible, debug-assert instead. And a value that may block on
-destruction goes to detached disposal (§5.5's venue), not merely past the
-unlock.
+destruction goes to isolated disposal (§5.5's venue — the detached lane,
+or the critical lane when a critical section retires the carrier), not
+merely past the unlock.
 
 ### 15.5 Promises are owned completions
 
@@ -3269,13 +3270,13 @@ fixtures for the driver shell and end-to-end invariants.
     schedule, and retire the projection that carried it — every one must
     be destroyed after the guard. The lock-held probe is the direct
     oracle: a payload destructor that asks whether the framework lock is
-    held must answer no, on every path that retires one. What this item does
-    *not* assert is one common destructor venue: §5.5 separately assigns
-    framework-initiated mailbox/reply disposal and framework-retained
-    failed-exit application errors to isolated lanes, while live `latest()`
-    displacement and user-held `Exit` copies retain their documented ordinary
-    Rust drop timing. Those venue rules are independent of this item's
-    after-unlock requirement.
+    held must answer no, on every path that retires one. What this item
+    does *not* assert is where the destructor then runs: §5.5 separately
+    assigns framework-initiated mailbox/reply disposal and
+    framework-retained failed-exit application errors to isolated lanes,
+    while live `latest()` displacement and user-held `Exit` copies retain
+    their documented ordinary Rust drop timing. Those venue rules are
+    independent of this item's after-unlock requirement.
 
 ---
 

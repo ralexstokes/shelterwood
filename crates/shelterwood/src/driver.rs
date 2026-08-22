@@ -770,8 +770,10 @@ impl ScopeRuntime {
         }
         let root = Arc::clone(&self.root);
         let installed = root.with_observation_gate(|txn| {
-            // The dynamic-state mutex rides inside the root gate here. Every
-            // reservation was adopted onto this same gate before publication,
+            // The dynamic-state mutex rides inside the root gate here. The
+            // route check above admitted only a request whose control is this
+            // driver's live one, so its reservation was minted against this
+            // very root and adopted onto this same gate before publication,
             // and a root with a live dynamic route cannot be re-homed. Thus
             // `admit_child_locked`'s handoff check below short-circuits on gate
             // identity: it never acquires a second gate under `state`. This is

@@ -12,7 +12,7 @@ here rather than inventing a new one.
 | `crates/shelterwood/examples/` | Everyone above | The tested artifacts the book and README quote | Each ends in assertions; `just examples` runs all of them in CI |
 | `specs/SPEC.md` | Maintainers and reviewers | The normative contract the implementation is held to | Conformance obligations map to tests; adjudication protocol in the tracker |
 | `README.md` | The front door | Orientation and the quickstart quote | Quotes `examples/quickstart.rs`, which CI runs |
-| `CLAUDE.md` / code comments | Contributors in the diff | Invariants the code cannot say itself | Reviewed beside the code they constrain |
+| `AGENTS.md` (`CLAUDE.md` symlinks to it) / code comments | Contributors in the diff | Invariants the code cannot say itself | Reviewed beside the code they constrain |
 
 Two corollaries the pass that created this structure settled:
 

@@ -2,8 +2,9 @@
 //!
 //! The store owns every armed timer's user key and message, mints the arming
 //! orders that index them, and is the only place either value is destroyed —
-//! so both always retire through [`RawDisposal`] rather than on the actor
-//! task.
+//! so both retire through [`RawDisposal`]'s contained funnel on the
+//! incarnation's own task, per SPEC §6.5, rather than escaping into the
+//! actor's control flow.
 
 use std::{
     any::{Any, TypeId},
@@ -19,7 +20,11 @@ use crate::{
 
 pub(super) enum TimerMessage<M> {
     Once(M),
-    Interval(M, fn(&M) -> M),
+    Interval {
+        message: M,
+        clone: fn(&M) -> M,
+        period: Duration,
+    },
 }
 
 /// A timer's index identity, mintable only by the store that installs it.
@@ -40,13 +45,6 @@ struct TimerEntry<M> {
     deadline: Option<Instant>,
     arming_order: ArmingOrder,
     message: TimerMessage<M>,
-    period: Option<Duration>,
-}
-
-pub(super) enum IntervalRearm<M> {
-    Missing,
-    OneShot,
-    Interval(M),
 }
 
 #[derive(Clone, Copy)]
@@ -119,7 +117,6 @@ impl<M> TimerStore<M> {
         key: K,
         deadline: Option<Instant>,
         message: TimerMessage<M>,
-        period: Option<Duration>,
     ) -> ArmingOrder
     where
         K: Hash + Eq + Send + 'static,
@@ -145,7 +142,6 @@ impl<M> TimerStore<M> {
             deadline,
             arming_order,
             message: message.into_inner(),
-            period,
         });
         let previous = self.armings.insert(arming_order, hash);
         assert!(previous.is_none());
@@ -277,31 +273,6 @@ impl<M> TimerStore<M> {
         Some(TimerLocation { hash, index })
     }
 
-    /// Unlinks a one-shot timer and yields its message for delivery.
-    ///
-    /// The key is retired through disposal here rather than handed out, so no
-    /// caller can destroy a timer's user key on the actor task.
-    pub(super) fn take_due_once(&mut self, arming_order: ArmingOrder) -> Option<M> {
-        let location = self.locate_arming(arming_order)?;
-        let TimerEntry { key, message, .. } = self.unlink(location);
-        self.disposal.dispose(key);
-        let TimerMessage::Once(message) = message else {
-            unreachable!("a non-interval timer must own a one-shot message")
-        };
-        Some(message)
-    }
-
-    fn entry_mut(&mut self, arming_order: ArmingOrder) -> Option<&mut TimerEntry<M>> {
-        let location = self.locate_arming(arming_order)?;
-        Some(
-            self.keyed
-                .get_mut(&location.hash)
-                .expect("a timer location must reference a key bucket")
-                .get_mut(location.index)
-                .expect("a timer location must reference a timer"),
-        )
-    }
-
     pub(super) fn take_due(&mut self, now: Instant) -> VecDeque<ArmingOrder> {
         let due = self
             .deadlines
@@ -320,31 +291,57 @@ impl<M> TimerStore<M> {
         }
     }
 
-    pub(super) fn rearm_interval(
-        &mut self,
-        arming_order: ArmingOrder,
-        now: Instant,
-    ) -> IntervalRearm<M> {
-        let (message, deadline) = {
-            let Some(entry) = self.entry_mut(arming_order) else {
-                return IntervalRearm::Missing;
-            };
-            let Some(period) = entry.period else {
-                return IntervalRearm::OneShot;
-            };
-            let deadline = crate::deadline::Deadline::after(now, period).instant();
-            let TimerMessage::Interval(message, clone_message) = &entry.message else {
-                unreachable!("an interval timer must own a message factory")
-            };
-            // Cloning is user code. Keep the entry's prior deadline intact
-            // until it succeeds so the fired batch can retry this arming if
-            // the panic escapes `recv` and the raw actor catches it.
-            let message = clone_message(message);
-            entry.deadline = deadline;
-            (message, deadline)
+    /// Resolves one captured arming to its delivery with a single index walk.
+    ///
+    /// An interval remains installed and is rearmed after cloning its next
+    /// message. A one-shot is unlinked, and its key retires through contained
+    /// disposal before the message is returned. A missing arming was cleared
+    /// or superseded after its fired batch was captured and is simply skipped.
+    pub(super) fn deliver_due(&mut self, arming_order: ArmingOrder, now: Instant) -> Option<M> {
+        let location = self.locate_arming(arming_order)?;
+        let interval_delivery = {
+            let entry = self
+                .keyed
+                .get_mut(&location.hash)
+                .expect("a timer location must reference a key bucket")
+                .get_mut(location.index)
+                .expect("a timer location must reference a timer");
+            match &mut entry.message {
+                TimerMessage::Once(_) => None,
+                TimerMessage::Interval {
+                    message,
+                    clone,
+                    period,
+                } => {
+                    let deadline = crate::deadline::Deadline::after(now, *period).instant();
+                    // Cloning is user code. Keep the entry's prior deadline
+                    // intact until it succeeds so the fired batch can retry
+                    // this arming if the panic escapes `recv` and the raw
+                    // actor catches it.
+                    let message = clone(message);
+                    entry.deadline = deadline;
+                    Some((message, deadline))
+                }
+            }
         };
-        self.arm_deadline(arming_order, deadline);
-        IntervalRearm::Interval(message)
+        if let Some((message, deadline)) = interval_delivery {
+            self.arm_deadline(arming_order, deadline);
+            return Some(message);
+        }
+
+        let TimerEntry { key, message, .. } = self.unlink(location);
+        self.disposal.dispose(key);
+        match message {
+            TimerMessage::Once(message) => Some(message),
+            // No callback or re-entrant operation separates the variant check
+            // above from `unlink`, so this branch is structurally unavailable.
+            // Keep its defensive path contained rather than putting user
+            // ownership on an invariant-panic stack.
+            interval @ TimerMessage::Interval { .. } => {
+                self.disposal.dispose(interval);
+                None
+            }
+        }
     }
 
     pub(super) fn next_deadline(&self) -> Option<Instant> {
@@ -370,7 +367,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{IntervalRearm, PoisonedCounter, TimerMessage, TimerStore};
+    use super::{PoisonedCounter, TimerMessage, TimerStore};
 
     #[derive(Eq, PartialEq)]
     struct CollidingKey(u8);
@@ -499,7 +496,6 @@ mod tests {
                 },
                 None,
                 TimerMessage::Once(message),
-                None,
             );
         }
 
@@ -514,19 +510,16 @@ mod tests {
             7_u8,
             Some(start + Duration::from_secs(3)),
             TimerMessage::Once("old-u8"),
-            None,
         );
         let u16_arming = timers.replace(
             7_u16,
             Some(start + Duration::from_secs(1)),
             TimerMessage::Once("u16"),
-            None,
         );
         let replacement = timers.replace(
             7_u8,
             Some(start + Duration::from_secs(2)),
             TimerMessage::Once("new-u8"),
-            None,
         );
 
         assert_eq!(timers.next_deadline(), Some(start + Duration::from_secs(1)));
@@ -536,14 +529,95 @@ mod tests {
             "different key types coexist and replacement takes a fresh order"
         );
         assert_eq!(
-            timers.take_due_once(u16_arming).expect("u16 timer remains"),
+            timers
+                .deliver_due(u16_arming, start + Duration::from_secs(3))
+                .expect("u16 timer remains"),
             "u16"
         );
         assert_eq!(
             timers
-                .take_due_once(replacement)
+                .deliver_due(replacement, start + Duration::from_secs(3))
                 .expect("replacement remains"),
             "new-u8"
+        );
+        assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn interval_to_one_shot_replacement_skips_a_captured_arming_and_old_cadence() {
+        let start = Instant::now();
+        let mut timers = TimerStore::default();
+        let superseded = timers.replace(
+            "key",
+            Some(start),
+            TimerMessage::Interval {
+                message: "interval",
+                clone: Clone::clone,
+                period: Duration::from_secs(5),
+            },
+        );
+
+        assert_eq!(
+            timers.take_due(start),
+            [superseded],
+            "the fired batch captures the interval's original arming"
+        );
+        let replacement = timers.replace(
+            "key",
+            Some(start + Duration::from_secs(7)),
+            TimerMessage::Once("one-shot"),
+        );
+
+        assert_eq!(
+            timers.deliver_due(superseded, start),
+            None,
+            "the already-captured superseded interval is skipped"
+        );
+        assert!(
+            timers.take_due(start + Duration::from_secs(6)).is_empty(),
+            "the interval's old five-second cadence was not rearmed"
+        );
+        assert_eq!(
+            timers.take_due(start + Duration::from_secs(7)),
+            [replacement]
+        );
+        assert_eq!(
+            timers.deliver_due(replacement, start + Duration::from_secs(7)),
+            Some("one-shot")
+        );
+        assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn a_rearmed_interval_keeps_its_entry_and_deadline_index_in_step() {
+        let start = Instant::now();
+        let mut timers = TimerStore::default();
+        let arming = timers.replace(
+            "interval",
+            Some(start),
+            TimerMessage::Interval {
+                message: "tick",
+                clone: Clone::clone,
+                period: Duration::from_secs(5),
+            },
+        );
+        assert_eq!(timers.take_due(start), [arming]);
+
+        assert_eq!(timers.deliver_due(arming, start), Some("tick"));
+        assert_eq!(
+            timers.next_deadline(),
+            Some(start + Duration::from_secs(5)),
+            "the rearm publishes the next cadence deadline"
+        );
+
+        // Unlinking reads the deadline back off the entry, so a rearm that
+        // wrote only the deadline index would strand a phantom wakeup for an
+        // arming nothing can deliver.
+        assert!(timers.remove(&"interval"));
+        assert_eq!(
+            timers.next_deadline(),
+            None,
+            "clearing a rearmed interval leaves no orphaned deadline"
         );
         assert!(timers.is_empty());
     }
@@ -558,22 +632,15 @@ mod tests {
         let arming = timers.replace(
             "interval",
             Some(now),
-            TimerMessage::Interval("tick", Clone::clone),
-            Some(Duration::MAX),
+            TimerMessage::Interval {
+                message: "tick",
+                clone: Clone::clone,
+                period: Duration::MAX,
+            },
         );
         assert_eq!(timers.take_due(now), [arming]);
 
-        assert!(matches!(
-            timers.rearm_interval(arming, now),
-            IntervalRearm::Interval("tick")
-        ));
-        assert_eq!(
-            timers
-                .entry_mut(arming)
-                .expect("the dormant interval remains clearable")
-                .deadline,
-            None
-        );
+        assert_eq!(timers.deliver_due(arming, now), Some("tick"));
         assert_eq!(
             timers.next_deadline(),
             None,
@@ -588,14 +655,9 @@ mod tests {
     #[test]
     fn hash_collision_uses_exact_erased_key_equality() {
         let mut timers = TimerStore::default();
-        timers.replace(CollidingKey(1), None, TimerMessage::Once("first"), None);
-        timers.replace(CollidingKey(2), None, TimerMessage::Once("second"), None);
-        timers.replace(
-            CollidingKey(1),
-            None,
-            TimerMessage::Once("replacement"),
-            None,
-        );
+        timers.replace(CollidingKey(1), None, TimerMessage::Once("first"));
+        timers.replace(CollidingKey(2), None, TimerMessage::Once("second"));
+        timers.replace(CollidingKey(1), None, TimerMessage::Once("replacement"));
 
         assert_eq!(
             once(
@@ -629,7 +691,6 @@ mod tests {
             },
             Some(deadline),
             TimerMessage::Once("message"),
-            None,
         );
         let query = PanickingEqKey {
             value: 7,
@@ -668,7 +729,6 @@ mod tests {
                 PanickingHashKey(Arc::clone(&drops)),
                 None,
                 TimerMessage::Once(PanickingTimerMessage(Arc::clone(&drops))),
-                None,
             );
         }))
         .expect_err("the user key hash panic escapes the timer operation");
@@ -713,7 +773,6 @@ mod tests {
                 PanickingDropKey(Arc::clone(&drops)),
                 None,
                 TimerMessage::Once(PanickingTimerMessage(Arc::clone(&drops))),
-                None,
             );
         }))
         .expect_err("the exhausted arming domain remains a framework panic");
@@ -773,7 +832,6 @@ mod tests {
             PanickingDropKey(Arc::clone(&drops)),
             None,
             TimerMessage::Once("message"),
-            None,
         );
 
         // Delivery hands back only the message. A hostile key destructor is
@@ -781,7 +839,7 @@ mod tests {
         // the actor task.
         assert_eq!(
             timers
-                .take_due_once(arming)
+                .deliver_due(arming, Instant::now())
                 .expect("the timer is registered"),
             "message"
         );
@@ -806,7 +864,7 @@ mod tests {
     #[test]
     fn unlink_is_total_when_the_arming_hash_disagrees() {
         let mut timers = TimerStore::default();
-        let arming = timers.replace(7_u8, None, TimerMessage::Once("message"), None);
+        let arming = timers.replace(7_u8, None, TimerMessage::Once("message"));
         let recorded = timers.armings[&arming];
         timers
             .armings
@@ -845,7 +903,6 @@ mod tests {
                 key,
                 Some(start + Duration::from_secs((TIMERS - index) as u64)),
                 TimerMessage::Once(()),
-                None,
             );
         }
         for key in keys.into_iter().rev() {

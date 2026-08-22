@@ -589,6 +589,40 @@ mod tests {
     }
 
     #[test]
+    fn a_rearmed_interval_keeps_its_entry_and_deadline_index_in_step() {
+        let start = Instant::now();
+        let mut timers = TimerStore::default();
+        let arming = timers.replace(
+            "interval",
+            Some(start),
+            TimerMessage::Interval {
+                message: "tick",
+                clone: Clone::clone,
+                period: Duration::from_secs(5),
+            },
+        );
+        assert_eq!(timers.take_due(start), [arming]);
+
+        assert_eq!(timers.deliver_due(arming, start), Some("tick"));
+        assert_eq!(
+            timers.next_deadline(),
+            Some(start + Duration::from_secs(5)),
+            "the rearm publishes the next cadence deadline"
+        );
+
+        // Unlinking reads the deadline back off the entry, so a rearm that
+        // wrote only the deadline index would strand a phantom wakeup for an
+        // arming nothing can deliver.
+        assert!(timers.remove(&"interval"));
+        assert_eq!(
+            timers.next_deadline(),
+            None,
+            "clearing a rearmed interval leaves no orphaned deadline"
+        );
+        assert!(timers.is_empty());
+    }
+
+    #[test]
     fn interval_rearm_overflow_makes_the_live_entry_dormant() {
         let now = Instant::now();
         let mut timers = TimerStore::default();

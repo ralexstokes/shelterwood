@@ -22,6 +22,8 @@ type SharedWork = Arc<SharedOffloadState>;
 // of the memory model exercised by a particular CI host. The witness below
 // verifies the data-flow consequence across threads; its exact-ordering
 // assertions keep a strong-memory machine from accepting a Relaxed mutation.
+// They are the only permitted spelling of that pair: inlining an ordering at
+// either use site below moves it out of the test's reach.
 const FINISHED_PUBLISH_ORDERING: Ordering = Ordering::Release;
 const FINISHED_OBSERVE_ORDERING: Ordering = Ordering::Acquire;
 

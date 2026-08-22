@@ -1049,7 +1049,7 @@ handlers non-blocking. Contracts:
 - Grace bounds cannot interrupt user destruction already running in the
   incarnation-owned funnel. That funnel runs inline so a disposal panic can
   become the incarnation's own verdict; consequently, a non-panicking
-  destructor that blocks pins the Tokio worker executing that disposal until
+  destructor that blocks pins the executor thread running that disposal until
   it returns. This is a venue cost of the required verdict semantics, not
   grounds to move the value to the detached-disposal lane.
 - `run_blocking(f)` hands the closure a cancellation token that is a

@@ -106,8 +106,8 @@ impl<F> Deadlined<F> {
             // with it would allocate a proxy and dispatch the caller's `clone`
             // vtable for a wake that cannot happen, and then dispatch its
             // `drop` vtable again at retirement. This is the documented
-            // unbounded-wait idiom (`docs/observation.md`), not an edge case,
-            // so it stays as free as it was before the proxy.
+            // unbounded-wait idiom (the book's observation chapter), not an
+            // edge case, so it stays as free as it was before the proxy.
             return Poll::Pending;
         }
         Pin::new(
@@ -511,7 +511,7 @@ mod tests {
 
     /// An unbounded deadline is `std::future::pending()`: it wakes nobody, so
     /// registering with it would clone a caller waker for an event that cannot
-    /// happen. This is `docs/observation.md`'s unbounded-wait idiom, reached
+    /// happen. This is the observation chapter's unbounded-wait idiom, reached
     /// by every `Duration::MAX` budget in the public API.
     #[crate::runtime::test(start_paused = true)]
     async fn an_unbounded_deadline_never_allocates_a_timer_proxy() {

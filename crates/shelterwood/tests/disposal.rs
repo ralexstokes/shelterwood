@@ -17,13 +17,13 @@ use std::{
 
 use crate::common::{
     DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, advance_time,
-    assert_eventually, assert_quiet, next_event, policy::never, poll_once,
+    assert_eventually, assert_quiet, next_exit_of, policy::never, poll_once,
 };
 use shelterwood::{
     Backoff, CallErrorKind, Cancellation, ChildId, ChildState, DynamicTree, ExitError, ExitKind,
-    ExitResult, Jitter, LifecycleEventKind, Mailbox, RawActor, RawContext, RawDef, RawOnceDef,
-    Readiness, ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition,
-    RestartPolicy, ScopeState, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+    ExitResult, Jitter, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
+    ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition, RestartPolicy,
+    ScopeState, StaticReserveError, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
 
 struct DropProbe {
@@ -347,13 +347,7 @@ async fn panicking_unread_messages_are_all_disposed_without_reclassifying_the_ac
         "one payload panic must not strand the remaining unread messages"
     )
     .await;
-    let exit = loop {
-        if let LifecycleEventKind::Exited { id, exit, .. } = next_event(&mut lifecycle).await.kind
-            && id.as_str() == "unread"
-        {
-            break exit;
-        }
-    };
+    let exit = next_exit_of(&mut lifecycle, "unread").await;
     assert!(matches!(exit.kind(), ExitKind::Completed));
     assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
@@ -1358,7 +1352,7 @@ async fn duplicate_id_rejection_disposes_blocking_definition_off_the_caller() {
             }),
         )
         .expect_err("duplicate id is rejected");
-    assert!(matches!(error, ReserveError::DuplicateId(id) if id.as_str() == "dup"));
+    assert!(matches!(error, StaticReserveError::DuplicateId(id) if id.as_str() == "dup"));
 
     wait_for_destructor(&gate).await;
     assert_disposed_off_current(
@@ -1497,7 +1491,7 @@ async fn duplicate_id_rejection_contains_definition_destructor_panic() {
             }),
         )
         .expect_err("duplicate id is rejected without unwinding the caller");
-    assert!(matches!(error, ReserveError::DuplicateId(id) if id.as_str() == "dup"));
+    assert!(matches!(error, StaticReserveError::DuplicateId(id) if id.as_str() == "dup"));
     assert_disposed_off_current(
         &mut drops,
         "rejected definition reports its disposal thread",
@@ -1901,13 +1895,7 @@ async fn blocking_offload_panic_remains_primary_over_factory_destructor_panic() 
     run.release();
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
 
-    let exit = loop {
-        if let LifecycleEventKind::Exited { id, exit, .. } = next_event(&mut lifecycle).await.kind
-            && id.as_str() == "offload-precedence"
-        {
-            break exit;
-        }
-    };
+    let exit = next_exit_of(&mut lifecycle, "offload-precedence").await;
     assert!(matches!(
         exit.kind(),
         ExitKind::Panicked { message }

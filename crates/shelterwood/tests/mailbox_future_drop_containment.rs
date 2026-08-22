@@ -10,6 +10,8 @@
 //! runner (`cargo test`) an abort would instead take the whole binary down --
 //! still a loud failure, but an unattributed one.
 
+mod common;
+
 use std::{
     future::Future,
     mem::ManuallyDrop,
@@ -17,12 +19,13 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker},
     time::Duration,
 };
 
+use common::ordinal_drop_waker;
 use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Reply, Tree};
 
 const OUTER_PANIC: &str = "injected outer panic";
@@ -161,46 +164,7 @@ async fn recv_drop_contains_receiver_waker_during_unwind() {
     assert_pending_then_unwind(Box::pin(receiver.recv(Duration::MAX)));
 }
 
-/// Numbers the caller-waker clones a single poll hands out so the regression
-/// can aim at one of them. `Deadlined::poll` registers the operation's clone
-/// first and the timer proxy's stored caller second. The timer itself sees
-/// only the stable framework-owned proxy, so it does not mint another clone
-/// through this hostile vtable.
-///
-/// This counter is process-global but only this vtable bumps it, and only the
-/// one test below installs this vtable, so the ordinals stay dense under any
-/// runner.
-static CLONES_MINTED: AtomicUsize = AtomicUsize::new(0);
 const TIMER_CALLER_WAKER_ORDINAL: usize = 2;
-
-unsafe fn clone_ordinal_waker(_data: *const ()) -> RawWaker {
-    let ordinal = CLONES_MINTED.fetch_add(1, Ordering::SeqCst) + 1;
-    RawWaker::new(std::ptr::without_provenance(ordinal), &ORDINAL_WAKER_VTABLE)
-}
-
-unsafe fn wake_ordinal_waker(_data: *const ()) {}
-
-unsafe fn wake_by_ref_ordinal_waker(_data: *const ()) {}
-
-unsafe fn drop_ordinal_waker(data: *const ()) {
-    if data.addr() == TIMER_CALLER_WAKER_ORDINAL {
-        panic!("injected timer-proxy caller-waker drop panic");
-    }
-}
-
-static ORDINAL_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_ordinal_waker,
-    wake_ordinal_waker,
-    wake_by_ref_ordinal_waker,
-    drop_ordinal_waker,
-);
-
-fn ordinal_waker() -> Waker {
-    // SAFETY: the vtable never dereferences its data pointer -- it carries a
-    // clone ordinal, not an address -- so every operation on it is a no-op, a
-    // counter bump, or a panic.
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &ORDINAL_WAKER_VTABLE)) }
-}
 
 /// Stands in for a user reply whose destructor is hostile. Only the abort
 /// half of the regression destroys one; the success path forgets it.
@@ -231,7 +195,13 @@ async fn recv_ready_after_parking_contains_the_retired_timer_waker() {
     let mut future = Box::pin(receiver.recv(Duration::from_secs(30)));
     // The caller-owned waker is deliberately leaked. Only the clones the
     // public future registers are under test.
-    let hostile = ManuallyDrop::new(ordinal_waker());
+    // `Deadlined::poll` registers the operation's clone first and the timer
+    // proxy's stored caller second. The timer itself sees only the stable
+    // framework-owned proxy, so it does not mint another hostile clone.
+    let (hostile, state) = ordinal_drop_waker(TIMER_CALLER_WAKER_ORDINAL, || {
+        panic!("injected timer-proxy caller-waker drop panic")
+    });
+    let hostile = ManuallyDrop::new(hostile);
 
     // Parking registers one clone in the reply channel and one behind the
     // timer proxy; only the proxy-owned caller clone's destructor is hostile.
@@ -241,7 +211,7 @@ async fn recv_ready_after_parking_contains_the_retired_timer_waker() {
     ));
 
     assert_eq!(
-        CLONES_MINTED.load(Ordering::SeqCst),
+        state.clones(),
         TIMER_CALLER_WAKER_ORDINAL,
         "parking must register exactly the operation and timer-proxy caller clones"
     );

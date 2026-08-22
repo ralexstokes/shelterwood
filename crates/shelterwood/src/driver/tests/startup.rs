@@ -79,6 +79,38 @@ fn pre_admission_restart_shutdown_is_published_when_the_scope_gets_a_parent() {
     );
 }
 
+#[test]
+fn consumed_pre_admission_shutdown_is_not_published_when_the_scope_gets_a_parent() {
+    let mut tree = Tree::new();
+    tree.add_subtree("nested", SubtreeDef::factory(Tree::new))
+        .expect("valid subtree");
+    let plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let nested = plan.children[0]
+        .slot
+        .scope
+        .as_ref()
+        .expect("nested scope cell");
+
+    let target = nested
+        .request_shutdown()
+        .expect("the pre-admission shutdown targets the first epoch");
+    assert!(nested.take_shutdown_request(target));
+    assert!(
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        )
+    );
+
+    assert!(
+        root.take_control_events().is_empty(),
+        "parent wiring cannot replay a shutdown request the child already consumed"
+    );
+}
+
 #[crate::runtime::test]
 async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnation() {
     let mut tree = Tree::new();

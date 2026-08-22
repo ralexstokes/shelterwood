@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults,
-    cells::{MemberCell, ObservationTxn, ReserveError, ScopeCell},
+    cells::{MemberCell, ObservationTxn, ReserveError, ScopeCell, StaticReserveError},
     definition::DefinitionSource,
     identity::{MembershipReconciliation, ScopeIdentity},
     policy::{CommonOptions, ResolvedCommonOptions, ResolvedDefaults, ScopeFlavor, resolve_common},
@@ -33,15 +33,21 @@ pub(crate) fn mint_reserved_slot(
     id: &ChildId,
     child_scope: Option<ScopeFlavor>,
 ) -> Result<Arc<SlotCell>, ReserveError> {
-    let membership = parent
-        .mint_membership(id)
-        .ok_or(ReserveError::IdentityExhausted)?;
+    mint_reserved_slot_inner(parent, id, child_scope).ok_or(ReserveError::IdentityExhausted)
+}
+
+fn mint_reserved_slot_inner(
+    parent: &ScopeCell,
+    id: &ChildId,
+    child_scope: Option<ScopeFlavor>,
+) -> Option<Arc<SlotCell>> {
+    let membership = parent.mint_membership(id)?;
     let member = MemberCell::new(id.clone(), membership);
     let scope = child_scope.map(|flavor| {
         let identity = ScopeIdentity::new();
         ScopeCell::new(Arc::clone(&member), flavor, identity)
     });
-    Ok(SlotCell::new(member, scope))
+    Some(SlotCell::new(member, scope))
 }
 
 /// Installs a valid option set for a manually constructed resident fixture,
@@ -342,12 +348,13 @@ impl BuilderCore {
         &mut self,
         id: impl Into<ChildId>,
         scope: Option<ScopeFlavor>,
-    ) -> Result<Arc<SlotCell>, ReserveError> {
-        let id = checked_id(id)?;
+    ) -> Result<Arc<SlotCell>, StaticReserveError> {
+        let id = non_empty_id(id).ok_or(StaticReserveError::EmptyId)?;
         if self.ids.contains(&id) {
-            return Err(ReserveError::DuplicateId(id));
+            return Err(StaticReserveError::DuplicateId(id));
         }
-        let slot = mint_reserved_slot(&self.root, &id, scope)?;
+        let slot = mint_reserved_slot_inner(&self.root, &id, scope)
+            .ok_or(StaticReserveError::IdentityExhausted)?;
         self.ids.insert(id);
         self.slots.push(Arc::clone(&slot));
         Ok(slot)
@@ -571,13 +578,15 @@ impl ScopeConstruction {
     }
 }
 
-pub(crate) fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError> {
+/// The one place the id-emptiness rule lives; each reservation error type
+/// names its own `EmptyId` on top of it.
+pub(crate) fn non_empty_id(id: impl Into<ChildId>) -> Option<ChildId> {
     let id = id.into();
-    if id.as_str().is_empty() {
-        Err(ReserveError::EmptyId)
-    } else {
-        Ok(id)
-    }
+    (!id.as_str().is_empty()).then_some(id)
+}
+
+pub(crate) fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError> {
+    non_empty_id(id).ok_or(ReserveError::EmptyId)
 }
 
 #[cfg(test)]

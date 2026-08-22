@@ -70,6 +70,7 @@ struct OrdinalWaker {
 pub(crate) struct OrdinalWakerState {
     clones: AtomicUsize,
     target: AtomicUsize,
+    action_on_wake: bool,
     action: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
@@ -103,7 +104,10 @@ unsafe fn clone_ordinal_waker(data: *const ()) -> RawWaker {
 
 unsafe fn wake_ordinal_waker(data: *const ()) {
     // SAFETY: wake consumes the Arc reference represented by this raw waker.
-    unsafe { retire_ordinal_waker(data) };
+    let current = unsafe { Arc::<OrdinalWaker>::from_raw(data.cast()) };
+    if current.shared.action_on_wake {
+        run_ordinal_action(&current);
+    }
 }
 
 unsafe fn wake_by_ref_ordinal_waker(_data: *const ()) {}
@@ -112,6 +116,10 @@ unsafe fn retire_ordinal_waker(data: *const ()) {
     // SAFETY: retirement consumes the Arc reference represented by this raw
     // waker.
     let current = unsafe { Arc::<OrdinalWaker>::from_raw(data.cast()) };
+    run_ordinal_action(&current);
+}
+
+fn run_ordinal_action(current: &OrdinalWaker) {
     if current.ordinal != current.shared.target.load(Ordering::SeqCst) {
         return;
     }
@@ -133,13 +141,33 @@ static ORDINAL_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     retire_ordinal_waker,
 );
 
+/// Creates an ordinal waker whose target action runs when the target is
+/// retired by either consuming `wake` or `drop`.
 pub(crate) fn ordinal_waker(
     target: usize,
+    action: impl FnOnce() + Send + 'static,
+) -> (Waker, Arc<OrdinalWakerState>) {
+    make_ordinal_waker(target, true, action)
+}
+
+/// Creates an ordinal waker whose target action runs only from the vtable's
+/// `drop` operation, not its consuming `wake` operation.
+pub(crate) fn ordinal_drop_waker(
+    target: usize,
+    action: impl FnOnce() + Send + 'static,
+) -> (Waker, Arc<OrdinalWakerState>) {
+    make_ordinal_waker(target, false, action)
+}
+
+fn make_ordinal_waker(
+    target: usize,
+    action_on_wake: bool,
     action: impl FnOnce() + Send + 'static,
 ) -> (Waker, Arc<OrdinalWakerState>) {
     let shared = Arc::new(OrdinalWakerState {
         clones: AtomicUsize::new(0),
         target: AtomicUsize::new(target),
+        action_on_wake,
         action: Mutex::new(Some(Box::new(action))),
     });
     let raw = RawWaker::new(

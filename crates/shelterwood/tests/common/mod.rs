@@ -22,7 +22,8 @@ pub(crate) use timing::{
     poll_until_ready,
 };
 pub(crate) use waker::{
-    LiveWakerCounter, OrdinalWakerState, counting_waker, hostile_waker, ordinal_waker,
+    LiveWakerCounter, OrdinalWakerState, counting_waker, hostile_waker, ordinal_drop_waker,
+    ordinal_waker,
 };
 
 macro_rules! assert_eventually {

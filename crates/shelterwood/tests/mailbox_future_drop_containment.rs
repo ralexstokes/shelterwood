@@ -25,7 +25,7 @@ use std::{
     time::Duration,
 };
 
-use common::ordinal_waker;
+use common::ordinal_drop_waker;
 use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Reply, Tree};
 
 const OUTER_PANIC: &str = "injected outer panic";
@@ -198,7 +198,7 @@ async fn recv_ready_after_parking_contains_the_retired_timer_waker() {
     // `Deadlined::poll` registers the operation's clone first and the timer
     // proxy's stored caller second. The timer itself sees only the stable
     // framework-owned proxy, so it does not mint another hostile clone.
-    let (hostile, state) = ordinal_waker(TIMER_CALLER_WAKER_ORDINAL, || {
+    let (hostile, state) = ordinal_drop_waker(TIMER_CALLER_WAKER_ORDINAL, || {
         panic!("injected timer-proxy caller-waker drop panic")
     });
     let hostile = ManuallyDrop::new(hostile);

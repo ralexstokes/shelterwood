@@ -3878,8 +3878,9 @@ Defines add no definition-validation errors: validation is spent eagerly
 at spec construction (§10.3), on both flavors. A dynamic define still
 crosses §9's admission boundary, so it can return `NoRuntime` at first
 poll or `NotAdmitting`; declaration builders share the reserve id errors
-(`EmptyId`, `DuplicateId`), require no runtime for reservation or
-define, and their defines cannot fail (§9).
+(`EmptyId`, `DuplicateId`, `IdentityExhausted`) through
+`StaticReserveError`, require no runtime for reservation or define, and
+their defines cannot fail (§9).
 
 `BuildError` (spawn-time, §12) is enumerated and exhaustive pre-release:
 `NoRuntime` (no ambient async runtime reachable through the private

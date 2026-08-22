@@ -7,11 +7,11 @@ use shelterwood::{
     DynamicTree, ExitError, ExitResult, GracePhase, Guard, Handler, Incarnation, Intensity,
     LifecycleEvents, LifecycleTryRecvError, Mailbox, MailboxShutdown, Membership, MembershipStatus,
     NonZeroDuration, OneShotTaskRef, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
-    ReadinessDeadline, Removal, Reply, ReplyReceive, ReplyReceiver, RestartAttempt, RestartCount,
-    RestartPolicy, Retention, ScopeDefaults, ScopeRef, SendError, SendFuture, SendTimeout,
-    Shutdown, SnapshotClosed, SnapshotReceiver, StaticReserveError, StopContext, SubtreeDef,
-    SubtreeOnceDef, SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, TotalRestarts,
-    Tree, WaitError,
+    ReadinessDeadline, Removal, Reply, ReplyReceive, ReplyReceiver, ReserveError, RestartAttempt,
+    RestartCount, RestartPolicy, Retention, ScopeDefaults, ScopeRef, SendError, SendFuture,
+    SendTimeout, Shutdown, SnapshotClosed, SnapshotReceiver, StaticReserveError, StopContext,
+    SubtreeDef, SubtreeOnceDef, SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot,
+    TotalRestarts, Tree, WaitError,
 };
 
 fn assert_error<T: Error>() {}
@@ -206,6 +206,7 @@ impl Actor for ClonedActor {
 #[test]
 fn actor_types_obey_resource_and_payload_trait_contracts() {
     assert_error::<DeadlineElapsed>();
+    assert_error::<ReserveError>();
     assert_error::<StaticReserveError>();
     assert_raw::<Handler<OpaqueActor>>();
     assert_send_type::<Context<'static, OpaqueActor>>();
@@ -370,6 +371,14 @@ fn nominal_add_methods_preserve_the_parallel_typed_surface() {
 
     let _: fn(Tree) -> Result<System<ScopeRef>, BuildError> = Tree::spawn;
     let _: fn(DynamicTree) -> Result<System<DynamicScopeRef>, BuildError> = DynamicTree::spawn;
+
+    let _assert_live_dynamic_reservation_errors = |scope: &DynamicScopeRef| {
+        let _: Result<DynamicActorSlot<Cell<()>>, ReserveError> =
+            scope.reserve_actor("live-actor-slot");
+        let _: Result<DynamicTaskSlot, ReserveError> = scope.reserve_task("live-task-slot");
+        let _: Result<DynamicSubtreeSlot<Tree>, ReserveError> =
+            scope.reserve_subtree("live-subtree-slot");
+    };
 }
 
 #[test]

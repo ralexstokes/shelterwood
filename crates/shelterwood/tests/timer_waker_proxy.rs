@@ -12,7 +12,7 @@ use std::{
 
 use common::{
     DestructorGate, LiveWakerCounter, OrdinalWakerState, POLL_TIMEOUT, counting_waker,
-    ordinal_waker as action_ordinal_waker,
+    ordinal_drop_waker as action_ordinal_drop_waker, ordinal_waker as action_ordinal_waker,
 };
 use shelterwood::{
     Actor, ActorOnceDef, Context, DynamicTree, ExitError, ExitResult, RawActor, RawContext,
@@ -35,7 +35,12 @@ impl Actor for IdleActor {
 }
 
 fn blocking_drop_waker(gate: &DestructorGate, entered: mpsc::Sender<ThreadId>) -> Waker {
-    ordinal_waker(1, gate, entered).0
+    let blocker = gate.blocker();
+    action_ordinal_drop_waker(1, move || {
+        let _ = entered.send(thread::current().id());
+        drop(blocker);
+    })
+    .0
 }
 
 fn ordinal_waker(

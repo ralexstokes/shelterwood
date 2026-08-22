@@ -1,17 +1,13 @@
 [workspace]
 default-members = [
     "crates/shelterwood",
-    "crates/shelterwood-cells",
     "crates/shelterwood-core",
-    "crates/shelterwood-mailbox",
     "crates/shelterwood-runtime",
     "tools/api-reachability",
 ]
 members = [
     "crates/shelterwood",
-    "crates/shelterwood-cells",
     "crates/shelterwood-core",
-    "crates/shelterwood-mailbox",
     "crates/shelterwood-runtime",
     "tools/api-reachability",
 ]
@@ -33,9 +29,7 @@ unreachable_pub = "warn"
 [workspace.dependencies]
 fastrand = "2.5.0"
 serde_json = "1.0.151"
-shelterwood-cells = { path = "crates/shelterwood-cells", version = "0.1.0" }
 shelterwood-core = { path = "crates/shelterwood-core", version = "0.1.0" }
-shelterwood-mailbox = { path = "crates/shelterwood-mailbox", version = "0.1.0" }
 shelterwood-runtime = { path = "crates/shelterwood-runtime", version = "0.1.0" }
 thiserror = "2.0.19"
 # Blocking-pool rejection ownership is verified against this exact Tokio

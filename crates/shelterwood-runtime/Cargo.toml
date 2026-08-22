@@ -19,7 +19,6 @@ workspace = true
 [dependencies]
 fastrand.workspace = true
 shelterwood-core.workspace = true
-shelterwood-mailbox.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

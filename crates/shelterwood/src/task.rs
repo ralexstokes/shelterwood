@@ -11,8 +11,7 @@ use std::{
 use crate::{
     ChildId, Exit, ExitError, ExitResult, Incarnation, Membership, PolicyError, Readiness,
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
-    cancellation::{CancellationToken, ParentCancellationToken},
-    cells::MemberCell,
+    cells::{CancellationToken, MemberCell, ParentCancellationToken},
     definition::DefinitionSource,
     policy::CommonOptions,
     runtime::{self, CompletionGatedLatch, Latch},

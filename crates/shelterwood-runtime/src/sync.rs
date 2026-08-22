@@ -637,7 +637,7 @@ impl<T: FrameworkPlain, E: FrameworkPlain> FrameworkPlain for Result<T, E> {}
 /// `T: Send + 'static` onto the definition of the public `OneShotTaskRef`
 /// wrapper that holds it and force downstream generic declarations to carry a
 /// bound they never asked for. Reply and call wrappers hold the separate
-/// erased `DisposingReceiver` in `shelterwood-mailbox::capability`; the two
+/// erased `DisposingReceiver` in the façade's mailbox capability module; the two
 /// boundary types preserve the same constructor-only bound. Execution bounds
 /// belong on constructors and operational impls here.
 pub struct DisposingReceiver<T> {

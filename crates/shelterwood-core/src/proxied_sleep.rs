@@ -7,8 +7,8 @@ use std::{
 
 use crate::{
     BoxedSleep, MailboxRuntime,
-    cell::waker_slot::{WakerAction, WakerEffects},
     panic::PanicAccumulator,
+    waker::{WakerAction, WakerEffects},
     waker_proxy::ProxiedPoll,
 };
 
@@ -52,7 +52,8 @@ impl ProxiedSleep {
     /// Used when a containing future completes by a non-timer branch. The
     /// caller-waker destructor is fully drained before the containing future
     /// hands its result back, and the wheel entry is synchronously removed.
-    pub(crate) fn retire_inline(&mut self, panics: &mut PanicAccumulator) {
+    #[doc(hidden)]
+    pub fn retire_inline(&mut self, panics: &mut PanicAccumulator) {
         self.retire(WakerAction::DropInline, panics);
     }
 
@@ -133,6 +134,12 @@ impl Drop for ProxiedSleep {
     }
 }
 
+/// White-box pins beside the type: these tests reach the private `timer` and
+/// `timer_poll` slots to hold the retirement contract — the wheel entry is
+/// gone and the proxy uninstalled when retirement returns — which black-box
+/// waker counting alone cannot distinguish from deferred cleanup. The test
+/// that needs a real disposal lane lives in the façade's mailbox timer
+/// module, so this crate keeps no dev-dependencies.
 #[cfg(test)]
 mod tests {
     use std::{
@@ -142,14 +149,51 @@ mod tests {
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
-            mpsc,
         },
         task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-        thread::{self, ThreadId},
-        time::Duration,
+        time::Instant,
     };
 
     use super::ProxiedSleep;
+    use crate::{
+        BoxedSleep, ErasedOneShotReceiver, ErasedOneShotSender, MailboxRuntime, MailboxSignal,
+    };
+
+    /// Stub capability object: `ProxiedSleep` itself touches the runtime only
+    /// through `dispose`, and every path these tests drive retires the caller
+    /// slot inline, so every capability is unreachable by construction.
+    struct InertRuntime;
+
+    impl MailboxRuntime for InertRuntime {
+        fn oneshot(
+            &self,
+        ) -> (
+            Box<dyn ErasedOneShotSender>,
+            Pin<Box<dyn ErasedOneShotReceiver>>,
+        ) {
+            unreachable!("proxied-sleep tests never open a one-shot");
+        }
+
+        fn signal(&self) -> Arc<dyn MailboxSignal> {
+            unreachable!("proxied-sleep tests never mint a signal");
+        }
+
+        fn dispose(&self, _value: Box<dyn Send + 'static>) {
+            unreachable!("inline retirement leaves drop glue nothing to dispose");
+        }
+
+        fn now(&self) -> Instant {
+            unreachable!("proxied-sleep tests never read the clock");
+        }
+
+        fn sleep_until(&self, _deadline: Option<Instant>) -> BoxedSleep {
+            unreachable!("proxied-sleep tests supply their raw timer directly");
+        }
+    }
+
+    fn runtime() -> Arc<dyn MailboxRuntime> {
+        Arc::new(InertRuntime)
+    }
 
     #[derive(Default)]
     struct WakerCounts {
@@ -217,8 +261,8 @@ mod tests {
         let state = Arc::new(WakerCounts::default());
         let waker = ManuallyDrop::new(counting_waker(&state));
         let mut context = Context::from_waker(&waker);
-        let raw: crate::BoxedSleep = Box::pin(std::future::ready(()));
-        let mut timer = Box::pin(ProxiedSleep::new(raw, crate::capability::tests::runtime()));
+        let raw: BoxedSleep = Box::pin(std::future::ready(()));
+        let mut timer = Box::pin(ProxiedSleep::new(raw, runtime()));
 
         assert!(timer.as_mut().poll(&mut context).is_ready());
         assert_eq!(state.clones.load(Ordering::SeqCst), 0);
@@ -248,15 +292,19 @@ mod tests {
         let state = Arc::new(WakerCounts::default());
         let waker = ManuallyDrop::new(counting_waker(&state));
         let mut context = Context::from_waker(&waker);
-        let raw: crate::BoxedSleep = Box::pin(ParkThenReady {
+        let raw: BoxedSleep = Box::pin(ParkThenReady {
             polls: 0,
             registered: None,
         });
-        let mut timer = Box::pin(ProxiedSleep::new(raw, crate::capability::tests::runtime()));
+        let mut timer = Box::pin(ProxiedSleep::new(raw, runtime()));
 
         assert!(timer.as_mut().poll(&mut context).is_pending());
         assert_eq!(state.clones.load(Ordering::SeqCst), 1);
         assert_eq!(state.drops.load(Ordering::SeqCst), 0);
+        assert!(
+            timer.timer_poll.is_parked(),
+            "a pending poll parks the caller behind the installed proxy"
+        );
 
         assert!(timer.as_mut().poll(&mut context).is_ready());
         assert_eq!(
@@ -264,6 +312,11 @@ mod tests {
             1,
             "the caller clone is gone synchronously when the ready poll returns"
         );
+        assert!(
+            timer.timer.is_none(),
+            "the wheel entry is gone when ready retirement returns"
+        );
+        assert!(!timer.timer_poll.is_parked());
     }
 
     #[test]
@@ -271,8 +324,8 @@ mod tests {
         let state = Arc::new(WakerCounts::default());
         let waker = ManuallyDrop::new(counting_waker(&state));
         let mut context = Context::from_waker(&waker);
-        let raw: crate::BoxedSleep = Box::pin(std::future::pending());
-        let mut timer = ProxiedSleep::new(raw, crate::capability::tests::runtime());
+        let raw: BoxedSleep = Box::pin(std::future::pending());
+        let mut timer = ProxiedSleep::new(raw, runtime());
 
         assert!(Pin::new(&mut timer).poll(&mut context).is_pending());
         assert_eq!(state.clones.load(Ordering::SeqCst), 1);
@@ -295,70 +348,6 @@ mod tests {
             state.clones.load(Ordering::SeqCst),
             1,
             "repolling a cancelled timer never reaches the caller vtable"
-        );
-    }
-
-    struct ThreadDrop(mpsc::Sender<ThreadId>);
-
-    unsafe fn clone_thread_drop(data: *const ()) -> RawWaker {
-        // SAFETY: every pointer using this vtable came from an Arc of the
-        // matching type. ManuallyDrop preserves the reference represented by
-        // `data`; the returned raw waker owns only the new clone.
-        let state = ManuallyDrop::new(unsafe { Arc::<ThreadDrop>::from_raw(data.cast()) });
-        RawWaker::new(
-            Arc::into_raw(Arc::clone(&state)).cast(),
-            &THREAD_DROP_VTABLE,
-        )
-    }
-
-    unsafe fn wake_thread_drop(data: *const ()) {
-        // SAFETY: wake consumes the Arc reference represented by this waker.
-        drop(unsafe { Arc::<ThreadDrop>::from_raw(data.cast()) });
-    }
-
-    unsafe fn wake_by_ref_thread_drop(_data: *const ()) {}
-
-    unsafe fn drop_thread_drop(data: *const ()) {
-        // SAFETY: drop consumes the Arc reference represented by this waker.
-        let state = unsafe { Arc::<ThreadDrop>::from_raw(data.cast()) };
-        let _ = state.0.send(thread::current().id());
-    }
-
-    static THREAD_DROP_VTABLE: RawWakerVTable = RawWakerVTable::new(
-        clone_thread_drop,
-        wake_thread_drop,
-        wake_by_ref_thread_drop,
-        drop_thread_drop,
-    );
-
-    fn thread_drop_waker(sender: mpsc::Sender<ThreadId>) -> Waker {
-        let raw = RawWaker::new(
-            Arc::into_raw(Arc::new(ThreadDrop(sender))).cast(),
-            &THREAD_DROP_VTABLE,
-        );
-        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-        // ownership across clone, wake, and drop.
-        unsafe { Waker::from_raw(raw) }
-    }
-
-    #[crate::runtime::test]
-    async fn drop_glue_retires_the_caller_waker_on_the_disposal_lane() {
-        let (dropped_tx, dropped_rx) = mpsc::channel();
-        let caller_thread = thread::current().id();
-        let waker = ManuallyDrop::new(thread_drop_waker(dropped_tx));
-        let mut context = Context::from_waker(&waker);
-        let raw: crate::BoxedSleep = Box::pin(std::future::pending());
-        let mut timer = Box::pin(ProxiedSleep::new(raw, crate::capability::tests::runtime()));
-
-        assert!(timer.as_mut().poll(&mut context).is_pending());
-        drop(timer);
-
-        let destructor_thread = dropped_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the disposal lane retires the stored caller clone");
-        assert_ne!(
-            destructor_thread, caller_thread,
-            "drop glue must not run the caller-waker destructor on its own thread"
         );
     }
 }

@@ -31,11 +31,11 @@ pub(crate) use shutdown::shutdown_scope;
 use crate::{
     Cancellation, ChildId, DeadlineBudget, Exit, GracePhase, Incarnation, JitterSample, Readiness,
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
-    admission::{NotAdmittingCause, ReserveError},
     cells::{
-        MemberCell, MemberStage, MemberTransition, ResidentProjection, RetainedExit,
-        RetainedRecordedOutcome, RetainedStopReason, ScopeCell, ScopeControlEvent,
-        StartupDisposition, classify_disposal_panic_retaining, classify_exit_retaining,
+        LifecycleEventKind, MemberCell, MemberStage, MemberTransition, NotAdmittingCause,
+        ReserveError, ResidentProjection, RetainedExit, RetainedRecordedOutcome,
+        RetainedStopReason, ScopeCell, ScopeControlEvent, StartupDisposition,
+        classify_disposal_panic_retaining, classify_exit_retaining,
         reconcile_recorded_outcomes_retaining,
     },
     deadline::Deadline,
@@ -51,7 +51,6 @@ use crate::{
     },
     identity::IncarnationCounter,
     mailbox::{MailboxBindToken, MailboxControl, MailboxEffectQueue},
-    observe::LifecycleEventKind,
     plan::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
     },

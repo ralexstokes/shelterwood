@@ -9,7 +9,7 @@ use std::{
 
 use shelterwood_core::DeadlineBudget;
 
-use crate::{
+use crate::mailbox::{
     ActorIdentity, ChildId, Incarnation, MailboxRuntime, Membership, capability::DisposingReceiver,
 };
 
@@ -69,19 +69,16 @@ impl<M> ActorRef<M> {
     }
 }
 
-/// Builds the façade's actor handle from its cross-crate identity and mailbox
+/// Builds the façade's actor handle from its internal identity and mailbox
 /// capabilities without exposing a new inherent constructor on `ActorRef`.
 ///
-/// This sibling-crate seam is not a supported constructor. The identity and
+/// This crate-private seam is not a supported constructor. The identity and
 /// mailbox must belong to the same member; violating that invariant produces
 /// a handle whose equality and error identity disagree with its route.
-// `doc(hidden)` trades enforcement for rustdoc tidiness: the rustdoc-JSON
-// reachability walk (`shelterwood-api-reachability`) skips hidden items, so it
-// no longer sees this signature. It names only local types today, so nothing
-// leaks; the sole remaining enforcement that the façade cannot re-export it is
-// `tools/check-external-consumer.sh`'s `installable-seams` probe.
-#[doc(hidden)]
-pub fn actor_ref_from_parts<I, M>(member: Arc<I>, mailbox: Arc<MailboxCell<M>>) -> ActorRef<M>
+pub(crate) fn actor_ref_from_parts<I, M>(
+    member: Arc<I>,
+    mailbox: Arc<MailboxCell<M>>,
+) -> ActorRef<M>
 where
     I: ActorIdentity + 'static,
 {
@@ -696,8 +693,11 @@ mod tests {
     use shelterwood_core::DeadlineBudget;
 
     use crate::{
-        CallErrorKind, Incarnation, MailboxControl, MailboxEffectQueue, MailboxReceiver, Reply,
-        policy::ResolvedMailbox, test_support::mint_actor_incarnation,
+        mailbox::{
+            CallErrorKind, Incarnation, MailboxControl, MailboxEffectQueue, MailboxReceiver, Reply,
+            test_support::mint_actor_incarnation,
+        },
+        policy::ResolvedMailbox,
     };
 
     use super::{
@@ -937,11 +937,11 @@ mod tests {
 
     #[test]
     fn construction_that_consumes_the_budget_is_disposed_without_submission() {
-        let start = crate::capability::tests::runtime().now();
+        let start = crate::mailbox::capability::tests::runtime().now();
         let clock = Arc::new(Mutex::new(start));
         let runtime_clock = Arc::clone(&clock);
         let runtime = Arc::new(
-            crate::capability::tests::TestRuntime::new()
+            crate::mailbox::capability::tests::TestRuntime::new()
                 .with_now(move || *runtime_clock.lock().expect("controlled clock mutex")),
         );
         let (mailbox, actor) = actor_for_with_runtime(runtime);
@@ -1359,8 +1359,10 @@ mod tests {
         // subject of this regression.
         let hostile = ManuallyDrop::new(panicking_drop_waker(waker_thread.clone()));
         let mut context = Context::from_waker(&hostile);
-        let deadline =
-            crate::deadline::Deadline::after(crate::capability::tests::runtime().now(), width);
+        let deadline = crate::deadline::Deadline::after(
+            crate::mailbox::capability::tests::runtime().now(),
+            width,
+        );
 
         assert!(
             send.deadlined
@@ -1408,7 +1410,7 @@ mod tests {
         let hostile = panicking_drop_waker(waker_thread.clone());
         let mut context = Context::from_waker(&hostile);
         let deadline = crate::deadline::Deadline::after(
-            crate::capability::tests::runtime().now(),
+            crate::mailbox::capability::tests::runtime().now(),
             Duration::from_secs(1),
         );
 

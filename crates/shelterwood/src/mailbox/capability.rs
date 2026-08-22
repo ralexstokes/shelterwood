@@ -1,85 +1,19 @@
 use std::{
-    any::Any,
-    future::Future,
     marker::PhantomData,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Instant,
 };
 
-use crate::{
-    cell::waker_slot::{WakerAction, WakerEffects},
-    panic::PanicAccumulator,
-    waker_proxy::ProxiedPoll,
+#[cfg(test)]
+use shelterwood_core::{BoxedSleep, MailboxSignal, MailboxSignalWatcher};
+use shelterwood_core::{
+    ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue, MailboxRuntime,
+    ProxiedPoll,
+    waker::{WakerAction, WakerEffects},
 };
 
-pub type BoxedSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-pub type ErasedValue = Box<dyn Any + Send + 'static>;
-
-/// Runtime-neutral single-delivery send capability.
-#[doc(hidden)]
-pub trait ErasedOneShotSender: Send {
-    fn send(self: Box<Self>, value: ErasedValue) -> Result<(), ErasedValue>;
-}
-
-/// Runtime-neutral single-delivery receive capability.
-#[doc(hidden)]
-pub trait ErasedOneShotReceiver: Send {
-    fn poll_receive(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<ErasedValue>>;
-    fn close_and_poll_receive(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> ErasedOneShotClose;
-    fn close(self: Pin<&mut Self>);
-    fn close_and_take(self: Pin<&mut Self>) -> Option<ErasedValue>;
-}
-
-#[doc(hidden)]
-pub enum ErasedOneShotClose {
-    Value(ErasedValue),
-    SenderClosed,
-    Empty,
-    Pending,
-}
-
-/// Runtime-neutral one-shot change notification.
-#[doc(hidden)]
-pub trait MailboxSignal: Send + Sync {
-    fn pulse(&self);
-    fn watcher(&self) -> Box<dyn MailboxSignalWatcher>;
-}
-
-/// Runtime-neutral wait side of [`MailboxSignal`].
-#[doc(hidden)]
-pub trait MailboxSignalWatcher: Send {
-    fn changed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
-}
-
-/// The four runtime capabilities needed by the mailbox shell.
-///
-/// The public façade installs one object per mailbox. Type erasure keeps the
-/// adapter out of `ActorRef`'s type parameters while this crate remains free of
-/// Tokio and every other concrete executor.
-///
-/// # Implementation boundary
-///
-/// This is an implementation seam for Shelterwood's runtime-adapter crate,
-/// not a user-supplied executor interface. Foreign implementations and direct
-/// construction of mailbox cells are outside the supported façade contract.
-#[doc(hidden)]
-pub trait MailboxRuntime: Send + Sync {
-    fn oneshot(
-        &self,
-    ) -> (
-        Box<dyn ErasedOneShotSender>,
-        Pin<Box<dyn ErasedOneShotReceiver>>,
-    );
-    fn signal(&self) -> Arc<dyn MailboxSignal>;
-    fn dispose(&self, value: Box<dyn Send + 'static>);
-    fn now(&self) -> Instant;
-    fn sleep_until(&self, deadline: Option<Instant>) -> BoxedSleep;
-}
+use crate::runtime::PanicAccumulator;
 
 fn downcast<T: Send + 'static>(value: ErasedValue) -> T {
     *value
@@ -201,7 +135,7 @@ impl<T> DisposingReceiver<T> {
         // to remove.
         let mut panics = PanicAccumulator::default();
         self.retire_reply_waker(&mut panics);
-        crate::panic::discard_panic(panics.take());
+        crate::runtime::discard_panic(panics.take());
     }
 
     /// Takes the caller waker out of the proxy and queues its destructor into
@@ -312,15 +246,14 @@ impl<T> Drop for DisposingReceiver<T> {
 
 /// The capability object this crate's own tests run against.
 ///
-/// `shelterwood-runtime` depends on this crate, so its `mailbox_runtime()`
-/// implements the trait belonging to the *non-test* build of this crate and
-/// cannot satisfy the `cfg(test)` one. The binding is therefore rebuilt here,
-/// but only as delegation to the same adapter primitives production uses:
-/// restating one-shot, signal, or clock semantics in a hand-written double
-/// would let a divergence from the adapter read as a passing test.
+/// The binding is built only as delegation to the same adapter primitives
+/// production uses: restating one-shot, signal, or clock semantics in a
+/// hand-written double would let a divergence from the adapter read as a
+/// passing test. The wrapper exists because focused mailbox tests need to
+/// replace one capability while every other operation keeps the real adapter.
 ///
-/// The dev-dependency does not weaken the inversion, which is a claim about
-/// the production graph — `cargo tree -p shelterwood-mailbox -e normal`.
+/// These adapter-integration tests stay in the façade so core itself retains
+/// no dev-dependencies.
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{

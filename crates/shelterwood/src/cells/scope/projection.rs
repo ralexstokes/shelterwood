@@ -6,11 +6,11 @@ use shelterwood_core::{
 
 #[cfg(test)]
 use crate::cells::ObservationGate;
-#[cfg(any(test, feature = "test-util"))]
-use shelterwood_runtime as runtime;
+#[cfg(test)]
+use crate::runtime;
 
-use crate::{
-    cells::{MemberRecord, MemberStage, ObservationTxn, RetainedExit},
+use crate::cells::{
+    MemberRecord, MemberStage, ObservationTxn, RetainedExit,
     observe::{
         ChildSnapshot, ChildState, LifecycleEventKind, LifecycleEvents, LifecycleSeq,
         RetainedLifecycleEvent, RetainedScopeSnapshot, ScopeSnapshot, SnapshotReceiver,
@@ -22,7 +22,7 @@ use super::{ResidentProjection, ScopeCell};
 /// Observation-only projection of the authoritative engine lifecycle.
 /// Driver decisions never read this record back as liveness policy.
 #[derive(Clone, Debug)]
-pub struct ScopeRecord {
+pub(crate) struct ScopeRecord {
     pub state: ScopeState,
     pub startup: Option<Result<(), StartupError>>,
     /// Read only by this crate's snapshot publication; the driver takes its
@@ -51,16 +51,16 @@ pub(super) struct ObservationConfig {
 }
 
 impl ScopeCell {
-    pub fn record(&self) -> ScopeRecord {
+    pub(crate) fn record(&self) -> ScopeRecord {
         self.observation.record.read_cloned()
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn record_watcher(&self) -> runtime::WatchReceiver<ScopeRecord> {
+    #[cfg(test)]
+    pub(crate) fn record_watcher(&self) -> runtime::WatchReceiver<ScopeRecord> {
         self.observation.record.watcher()
     }
 
-    pub fn set_observation_config(&self, intensity: Intensity) {
+    pub(crate) fn set_observation_config(&self, intensity: Intensity) {
         self.with_observation_gate(|wakes| {
             *self
                 .observation
@@ -72,16 +72,16 @@ impl ScopeCell {
         });
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn emit(&self, event: LifecycleEventKind) {
+    #[cfg(test)]
+    pub(crate) fn emit(&self, event: LifecycleEventKind) {
         self.with_observation_gate(|wakes| self.emit_locked(wakes, event));
     }
 
-    pub fn snapshot(&self) -> Arc<ScopeSnapshot> {
+    pub(crate) fn snapshot(&self) -> Arc<ScopeSnapshot> {
         self.with_observation_gate(|_| self.snapshot_locked().into_public())
     }
 
-    pub fn subscribe_snapshots(&self) -> SnapshotReceiver {
+    pub(crate) fn subscribe_snapshots(&self) -> SnapshotReceiver {
         let (receiver, closed_consistent) = self.with_observation_gate(|wakes| {
             let receiver = self
                 .observation
@@ -98,7 +98,7 @@ impl ScopeCell {
         receiver
     }
 
-    pub fn subscribe_lifecycle(&self) -> LifecycleEvents {
+    pub(crate) fn subscribe_lifecycle(&self) -> LifecycleEvents {
         let (events, closed_consistent) = self.with_observation_gate(|txn| {
             let events = self.observation.lifecycle.subscribe(txn);
             let closed_consistent = !self.observation.closed.load(Ordering::Acquire)
@@ -326,8 +326,8 @@ impl ScopeCell {
         self.observation.closed.store(true, Ordering::Release);
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn set_lifecycle_sequence(&self, current: u64) {
+    #[cfg(test)]
+    pub(crate) fn set_lifecycle_sequence(&self, current: u64) {
         self.observation
             .lifecycle_seq
             .set(current, Ordering::Relaxed);

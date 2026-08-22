@@ -7,9 +7,10 @@ use std::{
 
 use shelterwood_core::DeadlineBudget;
 
-use crate::{MailboxRuntime, ProxiedSleep, panic::PanicAccumulator};
-
-pub(crate) use shelterwood_core::deadline::Deadline;
+use crate::{
+    mailbox::{MailboxRuntime, ProxiedSleep},
+    runtime::PanicAccumulator,
+};
 
 /// Which of the two passes an operation is being polled in.
 ///
@@ -193,7 +194,7 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             // delivery seam.
             let mut panics = PanicAccumulator::default();
             this.retire_timer_inline(&mut panics);
-            crate::panic::discard_panic(panics.take());
+            crate::runtime::discard_panic(panics.take());
             return Poll::Ready(result);
         }
         if this.phase == DeadlinePhase::InitialAttempt {
@@ -213,7 +214,7 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             // this seam exists to remove.
             let mut panics = PanicAccumulator::default();
             this.retire_timer_inline(&mut panics);
-            crate::panic::discard_panic(panics.take());
+            crate::runtime::discard_panic(panics.take());
         }
         this.operation
             .poll_deadlined(context, budget, DeadlinePhase::TimeoutArbitration)
@@ -392,7 +393,7 @@ mod tests {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
             width,
-            crate::capability::tests::runtime(),
+            crate::mailbox::capability::tests::runtime(),
         ));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
@@ -412,7 +413,7 @@ mod tests {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             ReadyAfterParking::default(),
             width,
-            crate::capability::tests::runtime(),
+            crate::mailbox::capability::tests::runtime(),
         ));
         let recorder = Arc::new(WakeRecorder::default());
         let waker = Waker::from(Arc::clone(&recorder));
@@ -453,7 +454,7 @@ mod tests {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             ImmediatelyReady,
             std::time::Duration::from_secs(1),
-            crate::capability::tests::runtime(),
+            crate::mailbox::capability::tests::runtime(),
         ));
         let counter = Arc::new(CloneCounter::default());
         let waker = counting_waker(&counter);
@@ -483,7 +484,7 @@ mod tests {
             .checked_sub(std::time::Duration::from_secs(60))
             .expect("the test clock is far enough past its origin to date a budget backwards");
         let runtime =
-            Arc::new(crate::capability::tests::TestRuntime::new().with_now(move || stale));
+            Arc::new(crate::mailbox::capability::tests::TestRuntime::new().with_now(move || stale));
         let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
             std::time::Duration::from_secs(1),
@@ -517,7 +518,7 @@ mod tests {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
             std::time::Duration::MAX,
-            crate::capability::tests::runtime(),
+            crate::mailbox::capability::tests::runtime(),
         ));
         let counter = Arc::new(CloneCounter::default());
         let waker = counting_waker(&counter);
@@ -542,7 +543,7 @@ mod tests {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
             shelterwood_core::DeadlineBudget::ZERO,
-            crate::capability::tests::runtime(),
+            crate::mailbox::capability::tests::runtime(),
         ));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);

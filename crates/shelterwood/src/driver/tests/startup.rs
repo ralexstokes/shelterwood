@@ -958,7 +958,7 @@ async fn queued_removal_suppresses_replayed_self_stop_readiness() {
     scope.handle_self_stop(key, incarnation);
 
     let mut published = Vec::new();
-    while let Ok(crate::observe::LifecycleItem::Event(event)) = lifecycle.try_recv() {
+    while let Ok(crate::cells::LifecycleItem::Event(event)) = lifecycle.try_recv() {
         published.push(event.kind);
     }
     assert!(

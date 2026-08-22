@@ -7,19 +7,21 @@ use std::{
     time::Instant,
 };
 
+use crate::{
+    mailbox::{ActorIdentity, MailboxControl, MailboxTermination},
+    runtime,
+};
 use shelterwood_core::{
     ChildId, Exit, ExitKind, Incarnation, Membership, RestartCount,
     engine::MembershipStatus,
     identity::{IncarnationCounter, MintedMembership},
     policy::ResolvedCommonOptions,
 };
-use shelterwood_mailbox::{ActorIdentity, MailboxControl, MailboxTermination};
-use shelterwood_runtime as runtime;
 
 use super::{ObservationGate, ObservationTxn, RetainedExit};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MemberStage {
+pub(crate) enum MemberStage {
     Reserved,
     Admitted,
     Starting,
@@ -30,7 +32,7 @@ pub enum MemberStage {
 }
 
 /// One non-terminal member-record transition owned by the cell layer.
-pub enum MemberTransition {
+pub(crate) enum MemberTransition {
     Admitted,
     Starting {
         incarnation: Incarnation,
@@ -77,7 +79,7 @@ impl MemberTransition {
 
 /// Whether a terminal child incarnation failed during aggregate startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StartupDisposition {
+pub(crate) enum StartupDisposition {
     /// Terminalization is outside the supervised startup decision.
     Unchanged,
     /// The supervised exit did not abort aggregate startup.
@@ -87,7 +89,7 @@ pub enum StartupDisposition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemberRecord {
+pub(crate) struct MemberRecord {
     pub stage: MemberStage,
     pub incarnation: Option<Incarnation>,
     pub last_incarnation: Option<Incarnation>,
@@ -170,7 +172,7 @@ impl MemberRecord {
 }
 
 #[derive(Debug)]
-pub struct MemberCell {
+pub(crate) struct MemberCell {
     id: ChildId,
     membership: Membership,
     rebased_membership: OnceLock<Membership>,
@@ -249,7 +251,7 @@ impl fmt::Debug for MemberMailbox {
 }
 
 impl MemberCell {
-    pub fn new(id: ChildId, identity: MintedMembership) -> Arc<Self> {
+    pub(crate) fn new(id: ChildId, identity: MintedMembership) -> Arc<Self> {
         let (membership, incarnations) = identity.into_pair();
         let (record, _) = runtime::watch(MemberRecord {
             stage: MemberStage::Reserved,
@@ -275,18 +277,18 @@ impl MemberCell {
         })
     }
 
-    pub fn id(&self) -> &ChildId {
+    pub(crate) fn id(&self) -> &ChildId {
         &self.id
     }
 
-    pub fn membership(&self) -> Membership {
+    pub(crate) fn membership(&self) -> Membership {
         self.rebased_membership
             .get()
             .copied()
             .unwrap_or(self.membership)
     }
 
-    pub fn rebase_membership(&self, identity: MintedMembership) {
+    pub(crate) fn rebase_membership(&self, identity: MintedMembership) {
         let (membership, incarnations) = identity.into_pair();
         let record = self.record();
         assert!(
@@ -304,7 +306,7 @@ impl MemberCell {
             .expect("incarnation counter mutex poisoned") = Some(incarnations);
     }
 
-    pub fn take_incarnation_counter(&self) -> IncarnationCounter {
+    pub(crate) fn take_incarnation_counter(&self) -> IncarnationCounter {
         self.incarnations
             .lock()
             .expect("incarnation counter mutex poisoned")
@@ -312,8 +314,8 @@ impl MemberCell {
             .expect("a membership's incarnation counter is issued to one runtime")
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn lock_incarnation_counter(
+    #[cfg(test)]
+    pub(crate) fn lock_incarnation_counter(
         &self,
     ) -> std::sync::MutexGuard<'_, Option<IncarnationCounter>> {
         self.incarnations
@@ -321,17 +323,17 @@ impl MemberCell {
             .expect("incarnation counter mutex starts healthy")
     }
 
-    pub fn record(&self) -> MemberRecord {
+    pub(crate) fn record(&self) -> MemberRecord {
         self.record.read_cloned()
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn record_watcher(&self) -> runtime::WatchReceiver<MemberRecord> {
+    #[cfg(test)]
+    pub(crate) fn record_watcher(&self) -> runtime::WatchReceiver<MemberRecord> {
         self.record.watcher()
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn stage_terminal_before_mailbox(&self, exit: Exit) {
+    #[cfg(test)]
+    pub(crate) fn stage_terminal_before_mailbox(&self, exit: Exit) {
         let mut mailbox = self.mailbox.lock().expect("member mailbox mutex poisoned");
         assert!(matches!(*mailbox, MemberMailbox::Unattached));
         *mailbox = MemberMailbox::Terminal {
@@ -369,7 +371,7 @@ impl MemberCell {
     ///   write/read pair supplies happens-before, and coherence then forbids
     ///   this load from returning a value preceding `true` in the marker's
     ///   modification order.
-    pub fn terminal_or_disposal_pending(&self) -> bool {
+    pub(crate) fn terminal_or_disposal_pending(&self) -> bool {
         self.terminal_disposal_pending.load(Ordering::Acquire)
             || matches!(self.record().stage, MemberStage::Terminal(_))
     }
@@ -382,7 +384,7 @@ impl MemberCell {
     /// the setting store is made visible by the `Draining` record write that
     /// `publish_drain` performs afterwards. See
     /// [`Self::terminal_or_disposal_pending`] for the full argument.
-    pub fn set_terminal_disposal_pending(&self, pending: bool) {
+    pub(crate) fn set_terminal_disposal_pending(&self, pending: bool) {
         self.terminal_disposal_pending
             .store(pending, Ordering::Release);
     }
@@ -391,8 +393,8 @@ impl MemberCell {
     ///
     /// Test-only escape hatch around [`Self::transition`]; the wake-bus
     /// contract documented there binds this path too.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
+    #[cfg(test)]
+    pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
         self.with_observation_txn(|txn| self.update_locked(txn, update));
     }
 
@@ -404,9 +406,9 @@ impl MemberCell {
     ///
     /// Returns whether the reducer accepted the event; see
     /// [`Self::transition_locked`].
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     #[must_use = "an illegal member transition is rejected, not applied"]
-    pub fn transition(&self, transition: MemberTransition) -> bool {
+    pub(crate) fn transition(&self, transition: MemberTransition) -> bool {
         self.with_observation_txn(|txn| self.transition_locked(txn, transition))
     }
 
@@ -443,8 +445,8 @@ impl MemberCell {
             .clone()
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn observation_gate(&self) -> ObservationGate {
+    #[cfg(test)]
+    pub(crate) fn observation_gate(&self) -> ObservationGate {
         self.current_observation_gate()
     }
 
@@ -574,7 +576,7 @@ impl MemberCell {
     /// It says nothing about state the caller committed before calling — see
     /// the driver call sites, each of which asserts legality in debug builds.
     #[must_use = "an illegal member transition is rejected, not applied"]
-    pub fn transition_locked(
+    pub(crate) fn transition_locked(
         &self,
         txn: &mut ObservationTxn<'_>,
         transition: MemberTransition,
@@ -616,7 +618,7 @@ impl MemberCell {
         true
     }
 
-    pub fn set_options(&self, options: ResolvedCommonOptions) {
+    pub(crate) fn set_options(&self, options: ResolvedCommonOptions) {
         self.options
             .set(options)
             .expect("member options are resolved exactly once");
@@ -629,7 +631,7 @@ impl MemberCell {
             .expect("resident member options are resolved before snapshot publication")
     }
 
-    pub fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
+    pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
         self.with_observation_txn(|txn| {
             let mut rejected = None;
             let terminal_exit = {
@@ -677,7 +679,7 @@ impl MemberCell {
         });
     }
 
-    pub fn mailbox(&self) -> Option<Arc<dyn MailboxControl>> {
+    pub(crate) fn mailbox(&self) -> Option<Arc<dyn MailboxControl>> {
         match &*self.mailbox.lock().expect("member mailbox mutex poisoned") {
             MemberMailbox::Unattached => None,
             MemberMailbox::Attached(control) => Some(Arc::clone(control)),
@@ -685,13 +687,13 @@ impl MemberCell {
         }
     }
 
-    pub fn terminalize(&self, exit: Exit, startup: StartupDisposition) {
+    pub(crate) fn terminalize(&self, exit: Exit, startup: StartupDisposition) {
         self.with_observation_txn(|txn| {
             self.terminalize_locked(exit, startup, txn);
         });
     }
 
-    pub fn terminalize_locked(
+    pub(crate) fn terminalize_locked(
         &self,
         exit: Exit,
         startup: StartupDisposition,
@@ -793,7 +795,7 @@ impl MemberCell {
         terminal_exit
     }
 
-    pub async fn wait_terminal(&self) -> Exit {
+    pub(crate) async fn wait_terminal(&self) -> Exit {
         let mut watcher = self.record.watcher();
         loop {
             if let MemberStage::Terminal(exit) = watcher.borrow_cloned().stage {
@@ -814,9 +816,11 @@ mod tests {
         time::Duration,
     };
 
+    use crate::{
+        mailbox::{MailboxCell, MailboxControl},
+        runtime,
+    };
     use shelterwood_core::{Cancellation, ExitError, identity::ScopeIdentity, policy::ScopeFlavor};
-    use shelterwood_mailbox::{MailboxCell, MailboxControl};
-    use shelterwood_runtime as runtime;
 
     use super::*;
     use crate::cells::test_support::{ThreadProbe, isolated_scope};

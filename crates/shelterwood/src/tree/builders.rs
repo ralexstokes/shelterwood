@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use crate::{
     ActorDef, ActorOnceDef, ActorRef, ChildId, Intensity, ScopeDefaults,
-    admission::ReserveError,
+    cells::ReserveError,
     plan::{BuilderCore, LowerError},
     policy::{ResolvedDefaults, ScopeFlavor},
     raw::{RawDef, RawOnceDef},

@@ -11,13 +11,9 @@ exit-new = []
 from-latch = []
 installable-seams = []
 lifecycle-capacity = []
-sealed-mailbox-seams = ["dep:shelterwood-core", "dep:shelterwood-mailbox"]
-private-seal-module = ["dep:shelterwood-mailbox"]
 
 [dependencies]
 shelterwood = { path = "../../crates/shelterwood" }
-shelterwood-core = { path = "../../crates/shelterwood-core", optional = true }
-shelterwood-mailbox = { path = "../../crates/shelterwood-mailbox", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["rt", "time"] }

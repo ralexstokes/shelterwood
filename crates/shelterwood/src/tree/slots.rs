@@ -2,7 +2,7 @@ use std::{fmt, marker::PhantomData, sync::Arc};
 
 use crate::{
     ActorDef, ActorOnceDef, ActorRef, ChildId,
-    admission::ReserveError,
+    cells::ReserveError,
     driver::DynamicReservation,
     mailbox::{MailboxCell, actor_ref_from_parts},
     plan::{BuilderCore, ChildConstruction, SlotCell},

@@ -8,7 +8,7 @@ use crate::{
     ActorRef, Blocking, ChildId, DeadlineBudget, DeadlineElapsed, ExitError, ExitResult, Guard,
     Incarnation, Mailbox, MailboxShutdown, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
     ReadinessDeadline, Rejected, RestartPolicy, Retention, ScopeRef, Shutdown,
-    cancellation::CancellationToken, policy::CommonOptions,
+    cells::CancellationToken, policy::CommonOptions,
 };
 
 /// Callback-oriented actor contract.

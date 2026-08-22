@@ -11,13 +11,13 @@ use serde_json::Value;
 const FORBIDDEN_ROOTS: &[&str] = &["fastrand", "shelterwood_runtime", "tokio", "tokio_util"];
 const SUPPORTED_FORMAT_VERSION: u64 = 61;
 
-// This walk is scoped to the items one document actually contains. Rustdoc
-// JSON does not inline cross-crate re-exports: an item the façade re-exports
-// from a sibling crate appears only as a `use` whose target lives in that
-// sibling's document, so its signature is invisible here even though rustdoc
-// renders it as part of the façade's public API. Covering the façade surface
-// therefore means running this check once per crate that contributes public
-// items to it, not once on the façade — see the `runtime-api-check` recipe.
+// This walk is scoped to the items one document actually contains. Mailbox and
+// cell items now live in the façade, so its document covers those signatures
+// directly. Rustdoc JSON still does not inline the remaining cross-crate core
+// re-exports: they appear only as `use` items whose target signatures are
+// invisible here. Core's runtime-free dependency graph is the structural proof
+// for that opaque residue, and `tools/check-core-manifest.sh` asserts it in
+// the same `runtime-api-check` lane; see that recipe and SPEC §16.13.
 
 fn main() -> Result<(), Box<dyn Error>> {
     let path = env::args_os()
@@ -283,15 +283,15 @@ mod tests {
         );
     }
 
-    /// Pins the limitation that makes the per-crate lanes necessary.
+    /// Pins the limitation that keeps cross-crate core signatures opaque.
     ///
     /// A façade item re-exported from a sibling crate reaches this document
     /// only as a `use` pointing at an id the document does not describe, so
     /// whatever that item's signature names is unreachable from here even
-    /// though rustdoc renders it as public façade API. The walk must run on
-    /// the sibling's own document to see it. If rustdoc ever begins inlining
-    /// cross-crate re-exports this test fails, which is the signal to revisit
-    /// whether the extra lanes are still required.
+    /// though rustdoc renders it as public façade API. Core has no forbidden
+    /// runtime dependency for such a hidden signature to name. If rustdoc ever
+    /// begins inlining cross-crate re-exports this test fails, which is the
+    /// signal to revisit that assumption.
     #[test]
     fn cannot_see_through_a_cross_crate_re_export() {
         let document = json!({
@@ -303,7 +303,7 @@ mod tests {
                 },
                 "1": {
                     "id": 1,
-                    "inner": { "use": { "id": 2, "name": "ActorRef" } }
+                    "inner": { "use": { "id": 2, "name": "DeadlineBudget" } }
                 }
             },
             "paths": {
@@ -311,7 +311,7 @@ mod tests {
                 // The re-exported type itself is not forbidden; the leak would
                 // be inside one of its methods, which this document omits
                 // entirely because the item is defined in another crate.
-                "2": { "crate_id": 5, "path": ["shelterwood_mailbox", "futures", "ActorRef"] }
+                "2": { "crate_id": 5, "path": ["shelterwood_core", "deadline", "DeadlineBudget"] }
             }
         });
 

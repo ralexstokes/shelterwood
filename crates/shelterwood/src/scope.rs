@@ -8,10 +8,11 @@ use std::{
 
 use crate::{
     DeadlineBudget,
-    cells::ScopeCell,
+    cells::{
+        ChildSnapshot, LifecycleEvents, ScopeCell, ScopeSnapshot, SnapshotReceiver, WaitError,
+    },
     exit::StopReason,
     identity::{ChildId, Membership},
-    observe::{ChildSnapshot, LifecycleEvents, ScopeSnapshot, SnapshotReceiver, WaitError},
     policy::ScopeFlavor,
 };
 

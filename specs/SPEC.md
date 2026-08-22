@@ -2624,26 +2624,31 @@ a reachable escape hatch:
   publication path.
 
 **The runtime boundary.** All integration with the ambient async runtime
-(and with any randomness source) is confined to one private runtime
-façade; nothing above it names a runtime type, and no runtime or adapter
-type is reachable from any public item (§1 principle 7, checked per
-§16.13). Each mailbox receives one type-erased runtime capability object
-through that façade — one-shot delivery, change signals, isolated
-disposal, and the clock/timer pair — and the same object flows through
-reply channels and deadline futures, so virtual-time and disposal
-semantics cannot silently switch adapters. Runtime choice is deliberately
-absent from `ActorRef<M>`'s type parameters, and the mailbox layer is
-runtime-neutral in its production dependency graph.
+(and with any randomness source) is confined to the runtime-adapter crate
+and the façade's private runtime module; no runtime or adapter type is
+reachable from a public item (§1 principle 7, checked per §16.13). The
+type-erased capability interface lives in the runtime-neutral core: one-shot
+delivery, change signals, isolated disposal, and the clock/timer pair. Each
+mailbox receives one capability object, and the same object flows through
+reply channels and deadline futures, so virtual-time and disposal semantics
+cannot silently switch adapters. Runtime choice is deliberately absent from
+`ActorRef<M>`'s type parameters. The production graph makes the isolation
+structural: the core has no runtime dependency, the runtime adapter depends
+only on the core among implementation crates, and only the adapter names the
+concrete runtime.
 
-**The supported boundary.** Cross-crate implementation seams that must be
-`pub` for the implementation's own crates to reach each other are not
-user surface: the supported façade exports neither those traits nor their
-installation paths, and implementing or installing them through a direct
-dependency on an implementation crate is unsupported — it voids the lock
-discipline (§15.4) and identity-pairing contracts, which assume
-framework-only implementations. How the boundary is enforced (visibility,
-sealing, documentation-reachability checks) is implementation-defined;
-that the supported surface excludes the seams is not.
+**The supported boundary.** The cells, mailbox, and façade share one crate,
+so locked-path implementation traits (`MailboxControl`,
+`MailboxTermination`, `MailboxEffectSink`, `ActorIdentity`, and
+`DynamicRoute`) and every installer are crate-private: foreign
+implementations are excluded by construction. Cross-crate core/runtime
+capability traits remain technically public so the adapter can implement
+them, but the supported façade exports neither those traits nor a path that
+installs a foreign object. Implementing a capability through a direct core
+dependency remains unsupported, while installing one is unrepresentable.
+How the supported boundary's residual cross-crate surface is checked
+(visibility, documentation reachability, and external-consumer probes) is
+implementation-defined; that the supported surface excludes it is not.
 
 ### 15.2 Policies are plain data
 
@@ -3179,21 +3184,23 @@ fixtures for the driver shell and end-to-end invariants.
     forward — no stop/restart storm under `Always`.
 13. **No runtime or runtime-adapter types are reachable from public
     façade items.** Runtime and randomness integration is confined to the
-    private runtime façade (§15.1); the layers above it carry no such
-    dependency, so no public item can name one. The check is real, not
-    implied: an automated walk over the public API (e.g. rustdoc-JSON
-    reachability) MUST reject public reachability of runtime and adapter
-    types, run over every crate that contributes public façade items —
-    cross-crate re-exports are invisible to a single-document walk.
-    Cross-crate implementation seams that are technically public, and
-    hidden bridge items a façade needs from a lower crate, are outside
-    the supported boundary per §15.1; what holds them out of the public
-    surface (visibility shims, hidden-item conventions, an
-    external-consumer probe) is implementation-defined, but a public
-    re-export of a runtime-typed seam MUST be a hard failure —
-    compile-time where achievable — not a documentation nicety. Public
-    adapter types on the event lane are opaque wrappers, never aliases of
-    runtime types, and internal buffer capacities are not façade API.
+    runtime adapter and the façade's private runtime module (§15.1), so no
+    public item can name a concrete adapter type. The check is real, not
+    implied: an automated walk over the façade's public API (e.g.
+    rustdoc-JSON reachability) MUST reject public reachability of runtime and
+    adapter types. Mailbox and cell items are defined in that same crate, so
+    one façade document exposes their signatures to the walk. Cross-crate
+    core re-exports remain opaque to it, but the core's runtime-free manifest
+    is the structural proof that those hidden signatures cannot name a
+    concrete adapter — and an automated check MUST assert that manifest's
+    dependency allowlist rather than assume it. The core/runtime capability
+    traits are outside the
+    supported boundary, every façade installer is crate-private, and an
+    external-consumer probe MUST reject their façade reachability. A public
+    re-export of a runtime-typed seam is a hard failure — compile-time where
+    achievable — not a documentation nicety. Public adapter types on the
+    event lane are opaque wrappers, never aliases of runtime types, and
+    internal buffer capacities are not façade API.
 14. **Event-woken observers see consistent-or-newer snapshots.**
     Subscribe to lifecycle events; *synchronously inside the event arm*,
     read the snapshot and assert it already reflects the event — at both

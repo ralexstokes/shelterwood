@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::{
-    cell::waker_slot::{WakerAction, WakerEffects, WakerSlot},
     panic::PanicAccumulator,
+    waker::{WakerAction, WakerEffects, WakerSlot},
 };
 
 /// Reusable probe, registration, and proxy-poll state machine.
@@ -98,7 +98,8 @@ impl ProxiedPoll {
     }
 
     /// Retires the current caller registration into a mailbox effects sink.
-    pub(crate) fn retire(&mut self, action: WakerAction, effects: &mut WakerEffects) {
+    #[doc(hidden)]
+    pub fn retire(&mut self, action: WakerAction, effects: &mut WakerEffects) {
         let proxy = self.proxy.take();
         if let Some(proxy) = &proxy {
             proxy.retire(action, effects);
@@ -309,7 +310,7 @@ mod tests {
     };
 
     use super::{WakerProxy, WakerProxyState};
-    use crate::cell::waker_slot::{WakerAction, WakerEffects};
+    use crate::waker::{WakerAction, WakerEffects};
 
     #[derive(Default)]
     struct CountWake(AtomicUsize);

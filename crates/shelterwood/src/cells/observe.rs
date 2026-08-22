@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::runtime;
 use shelterwood_core::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartAttempt, RestartCount, RestartPolicy,
     Retention, Strategy, TotalRestarts,
@@ -13,13 +14,11 @@ use shelterwood_core::{
     identity::PoisonedCounter,
     policy::ScopeFlavor,
 };
-use shelterwood_runtime as runtime;
 
 use crate::cells::RetainedExit;
 
 /// Number of lifecycle events retained independently for each subscriber.
-#[doc(hidden)]
-pub const LIFECYCLE_EVENT_CAPACITY: usize = 128;
+pub(crate) const LIFECYCLE_EVENT_CAPACITY: usize = 128;
 
 // Tokio rounds broadcast capacity up to a power of two. `try_recv` compares
 // receiver length with this requested capacity and therefore requires the
@@ -442,8 +441,8 @@ impl SnapshotReceiver {
     }
 
     /// Borrows the newest snapshot and terminal flag from one retained state.
-    // This method bridges the lower cell crate to the downstream façade's
-    // `ScopeRef` implementation. It remains callable on the façade-public
+    // This method bridges the internal cell module to the façade's `ScopeRef`
+    // implementation. It remains callable on the façade-public
     // receiver, but its signature is entirely supported façade data and grants
     // no construction or implementation capability. Hiding it from generated
     // docs is the explicit boundary ruling; the rustdoc-JSON walk deliberately
@@ -461,7 +460,7 @@ impl SnapshotReceiver {
     /// whether a transaction minted one edge or ten. A test that pins the
     /// publication economy — one edge per hub per transaction — has to read
     /// the counter directly.
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     #[must_use]
     pub fn current_generation(&self) -> u64 {
         self.inner.borrow_cloned().generation.current()
@@ -1041,14 +1040,14 @@ mod tests {
         },
     };
 
+    use crate::runtime;
     use shelterwood_core::{
         ChildId, Intensity, TotalRestarts,
         identity::{PoisonedCounter, ScopeIdentity},
         policy::ScopeFlavor,
     };
-    use shelterwood_runtime as runtime;
 
-    use crate::observe::{
+    use crate::cells::{
         LifecycleEvent, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, ScopeSnapshot,
     };
     use shelterwood_core::{ScopeState, StopReason};
@@ -1265,7 +1264,7 @@ mod tests {
         ));
     }
 
-    #[shelterwood_runtime::test]
+    #[crate::runtime::test]
     async fn snapshot_publication_before_close_is_drained() {
         let hub = SnapshotHub::default();
         let mut txn = crate::cells::ObservationTxn::detached();
@@ -1332,7 +1331,7 @@ mod tests {
         assert!(after_close.changed().await.is_err());
     }
 
-    #[shelterwood_runtime::test]
+    #[crate::runtime::test]
     async fn receiverless_snapshot_close_installs_the_terminal_state() {
         let hub = SnapshotHub::default();
         let mut txn = crate::cells::ObservationTxn::detached();
@@ -1355,7 +1354,7 @@ mod tests {
         assert!(receiver.changed().await.is_err());
     }
 
-    #[shelterwood_runtime::test]
+    #[crate::runtime::test]
     async fn initialized_receiverless_snapshot_close_refreshes_the_terminal_state() {
         let hub = SnapshotHub::default();
         let mut txn = crate::cells::ObservationTxn::detached();
@@ -1383,7 +1382,7 @@ mod tests {
         assert!(receiver.changed().await.is_err());
     }
 
-    #[shelterwood_runtime::test]
+    #[crate::runtime::test]
     async fn snapshot_close_installs_the_terminal_state_even_with_live_receivers() {
         // A close site may terminalize without publishing a `Stopped`
         // projection first; the retained value is what every later subscriber
@@ -1417,7 +1416,7 @@ mod tests {
         assert!(later.changed().await.is_err());
     }
 
-    #[shelterwood_runtime::test]
+    #[crate::runtime::test]
     async fn lifecycle_close_wakes_parked_receivers() {
         let hub = Arc::new(LifecycleHub::default());
         let mut txn = crate::cells::ObservationTxn::detached();

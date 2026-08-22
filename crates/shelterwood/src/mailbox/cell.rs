@@ -11,14 +11,16 @@ use std::{
 };
 
 use crate::{
-    ChildId, Incarnation, MailboxBindToken, MailboxClose, MailboxControl, MailboxDisposal,
-    MailboxEffectQueue, MailboxEffectSink, MailboxRuntime, MailboxSignal, MailboxSignalWatcher,
-    MailboxTermination,
-    capability::{dispose, dispose_value},
-    identity::{AtomicPoisonedCounter, PoisonedCounter},
-    panic::{PanicAccumulator, PanicPayload, resume_panic},
+    identity::{AtomicPoisonedCounter, ChildId, Incarnation, PoisonedCounter},
+    mailbox::{
+        MailboxBindToken, MailboxClose, MailboxControl, MailboxDisposal, MailboxEffectQueue,
+        MailboxEffectSink, MailboxRuntime, MailboxSignal, MailboxSignalWatcher, MailboxTermination,
+        capability::{dispose, dispose_value},
+    },
     policy::ResolvedMailbox,
+    runtime::{PanicAccumulator, PanicPayload, resume_panic},
 };
+use shelterwood_core::waker::{WakerAction, WakerEffects, WakerSlot};
 
 use super::{SendError, SendErrorKind};
 
@@ -87,7 +89,7 @@ pub(super) struct Envelope<M> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct AcceptedSequence(u64);
+pub(crate) struct AcceptedSequence(u64);
 
 pub(super) enum OperationOutcome<M> {
     Waiting {
@@ -107,10 +109,6 @@ pub(super) struct OperationState<M> {
     waker: WakerSlot,
     registration: Option<WaiterId>,
 }
-
-pub(crate) mod waker_slot;
-
-use waker_slot::{WakerAction, WakerEffects, WakerSlot};
 
 pub(super) struct SendOperation<M> {
     pub(super) state: Mutex<OperationState<M>>,
@@ -1009,8 +1007,6 @@ impl<M: Send + 'static> MailboxTermination for MailboxTeardown<M> {
     }
 }
 
-impl<M: Send + 'static> crate::private::SealedMailboxTermination for MailboxTeardown<M> {}
-
 impl<M: Send + 'static> Drop for MailboxTeardown<M> {
     fn drop(&mut self) {
         let mut panics = PanicAccumulator::default();
@@ -1026,7 +1022,7 @@ impl<M: Send + 'static> Drop for MailboxTeardown<M> {
 /// Dropping the last handle can destroy unread user payloads. Framework owners
 /// must therefore close or terminalize the cell and transfer its payload to
 /// isolated disposal before releasing their final handle.
-pub struct MailboxCell<M> {
+pub(crate) struct MailboxCell<M> {
     pub(super) actor_id: ChildId,
     pub(super) state: Mutex<MailboxState<M>>,
     accepted: AtomicPoisonedCounter,
@@ -1044,12 +1040,9 @@ impl<M> fmt::Debug for MailboxCell<M> {
 }
 
 impl<M: Send + 'static> MailboxCell<M> {
-    // This constructor bridges the lower mailbox crate to the downstream
-    // façade and therefore cannot be crate-private. Direct construction is
-    // outside the supported API; the façade does not export either this type
-    // or the `MailboxRuntime` capability in its signature.
-    #[doc(hidden)]
-    pub fn new(actor_id: ChildId, runtime: Arc<dyn MailboxRuntime>) -> Arc<Self> {
+    // Only the façade can pair a mailbox with the runtime capability object
+    // selected by its private adapter.
+    pub(crate) fn new(actor_id: ChildId, runtime: Arc<dyn MailboxRuntime>) -> Arc<Self> {
         let changed = runtime.signal();
         Arc::new(Self {
             actor_id,
@@ -1572,8 +1565,6 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
     }
 }
 
-impl<M: Send + 'static> crate::private::SealedMailboxControl for MailboxCell<M> {}
-
 fn mint_accepted_sequence(accepted: &AtomicPoisonedCounter) -> Option<AcceptedSequence> {
     accepted
         .mint(Ordering::Release, Ordering::Relaxed)
@@ -1762,14 +1753,14 @@ pub(super) enum WithdrawalOutcome<M> {
         observed: Option<Incarnation>,
     },
 }
-pub struct MailboxReceiver<M> {
+pub(crate) struct MailboxReceiver<M> {
     mailbox: Arc<MailboxCell<M>>,
     incarnation: Incarnation,
     watcher: Box<dyn MailboxSignalWatcher>,
 }
 
 impl<M: Send + 'static> MailboxReceiver<M> {
-    pub fn new(mailbox: Arc<MailboxCell<M>>, incarnation: Incarnation) -> Self {
+    pub(crate) fn new(mailbox: Arc<MailboxCell<M>>, incarnation: Incarnation) -> Self {
         let watcher = mailbox.watcher();
         Self {
             mailbox,
@@ -1778,31 +1769,31 @@ impl<M: Send + 'static> MailboxReceiver<M> {
         }
     }
 
-    pub fn try_recv(&self) -> Option<M> {
+    pub(crate) fn try_recv(&self) -> Option<M> {
         self.mailbox.receive(self.incarnation, ReceiveMode::Drain)
     }
 
-    pub fn try_recv_live_through(&self, accepted_sequence: AcceptedSequence) -> Option<M> {
+    pub(crate) fn try_recv_live_through(&self, accepted_sequence: AcceptedSequence) -> Option<M> {
         self.mailbox.receive(
             self.incarnation,
             ReceiveMode::LiveThrough(accepted_sequence),
         )
     }
 
-    pub fn accepted_sequence(&self) -> AcceptedSequence {
+    pub(crate) fn accepted_sequence(&self) -> AcceptedSequence {
         self.mailbox.accepted_sequence()
     }
 
-    pub fn freeze(&self) {
+    pub(crate) fn freeze(&self) {
         let mut effects = MailboxEffectQueue::default();
         self.mailbox.freeze(self.incarnation, &mut effects);
     }
 
     /// Waits for mailbox activity in the façade's merged raw-actor event loop.
     ///
-    /// This remains public only as the cross-crate receiver seam used by
-    /// `RawContext`; it is not reachable from Shelterwood's supported API.
-    pub async fn changed(&mut self) {
+    /// This crate-private receiver seam is used by `RawContext`; it is not
+    /// reachable from Shelterwood's supported API.
+    pub(crate) async fn changed(&mut self) {
         self.watcher.changed().await;
     }
 }

@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use shelterwood_mailbox::MailboxEffectSink;
-use shelterwood_runtime as runtime;
-
-use crate::observe::{SnapshotHub, SnapshotPublication};
+use crate::{
+    cells::observe::{SnapshotHub, SnapshotPublication},
+    mailbox::MailboxEffectSink,
+    runtime,
+};
 
 /// Shared critical section for one resident tree's observation projection.
 ///
@@ -11,7 +12,7 @@ use crate::observe::{SnapshotHub, SnapshotPublication};
 /// lock deliberately tolerates poisoning: a panic in an observation path must
 /// not permanently wedge later observation or a subtree handoff.
 #[derive(Clone, Debug)]
-pub struct ObservationGate(Arc<Mutex<()>>);
+pub(crate) struct ObservationGate(Arc<Mutex<()>>);
 
 impl ObservationGate {
     pub(super) fn new() -> Self {
@@ -22,12 +23,12 @@ impl ObservationGate {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn same_gate(&self, other: &Self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn same_gate(&self, other: &Self) -> bool {
         self.shares_gate(other)
     }
 
-    pub fn lock(&self) -> MutexGuard<'_, ()> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -40,9 +41,9 @@ impl ObservationGate {
     /// answers without the reentrant acquisition that would deadlock. A
     /// poisoned but unheld gate reports `false`, matching [`Self::lock`]'s
     /// deliberate poison tolerance.
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     #[must_use]
-    pub fn is_held(&self) -> bool {
+    pub(crate) fn is_held(&self) -> bool {
         matches!(self.0.try_lock(), Err(std::sync::TryLockError::WouldBlock))
     }
 
@@ -50,9 +51,9 @@ impl ObservationGate {
     ///
     /// This is test instrumentation for assertions that must resume only
     /// after an observation transaction has released its guard.
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     #[must_use]
-    pub fn is_poisoned(&self) -> bool {
+    pub(crate) fn is_poisoned(&self) -> bool {
         self.0.is_poisoned()
     }
 }
@@ -66,7 +67,7 @@ impl ObservationGate {
 /// and disposal work then flush only after its gate guard has been released.
 /// The same drop path runs during unwind, preventing a poisoned transaction
 /// from stranding already-committed wakes.
-pub struct ObservationTxn<'a> {
+pub(crate) struct ObservationTxn<'a> {
     guard: Option<MutexGuard<'a, ()>>,
     effects: Vec<Box<dyn FnOnce()>>,
     snapshots: Vec<SnapshotPublication>,
@@ -90,7 +91,7 @@ impl<'a> ObservationTxn<'a> {
         }
     }
 
-    pub fn defer(&mut self, operation: impl FnOnce() + 'static) {
+    pub(crate) fn defer(&mut self, operation: impl FnOnce() + 'static) {
         self.effects.push(Box::new(operation));
     }
 
@@ -177,7 +178,7 @@ mod tests {
         task::{Context, Wake, Waker},
     };
 
-    use shelterwood_runtime as runtime;
+    use crate::runtime;
 
     use super::*;
 

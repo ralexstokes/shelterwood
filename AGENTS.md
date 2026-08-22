@@ -16,22 +16,22 @@ panic and a process abort.
 
 Two types implement the rule and are the shapes to reach for:
 
-- **`ObservationTxn`** (`shelterwood-cells/src/cells/gate.rs`) holds the
+- **`ObservationTxn`** (`crates/shelterwood/src/cells/gate.rs`) holds the
   observation-gate guard plus a deferred-effect list. `defer`/`pulse` queue
   work; `commit` drops the guard *then* runs the queue through a
   `PanicAccumulator`. Its `Drop` runs the same path during an unwind, so a
   poisoned transaction cannot strand already-committed wakes. Every retained
   control-plane writer takes the token, which makes an out-of-transaction
   mutation unavailable by construction.
-- **`MailboxTxn`** (`shelterwood-mailbox/src/cell.rs`) is the same idea for
+- **`MailboxTxn`** (`crates/shelterwood/src/mailbox/cell.rs`) is the same idea for
   every mutable mailbox transition. It owns the state guard beside a
   `MailboxEffects` sink that collects signal pulses, waker wake/drop actions,
   displaced payloads and isolated-disposal requests; its `Drop` empties the
   guard field before Rust drops the sink, so the flush necessarily runs with no
   mailbox mutex held, unwind included. `WakerSlot` makes the waker half
-  structural rather than conventional: its storage is private even from the
-  parent module, and no operation returns or replaces a `Waker` without an
-  effects sink. `Withdrawal`, `Termination` and `MailboxPayload` are its
+  structural rather than conventional: its storage is private to
+  `shelterwood-core`'s waker module, and no operation returns or replaces a
+  `Waker` without an effects sink. `Withdrawal`, `Termination` and `MailboxPayload` are its
   single-purpose siblings.
 
 What the rule does *not* forbid — the exemptions every remaining lock site
@@ -85,16 +85,15 @@ rests on:
   nested residency and on `ScopeCell`'s own drop glue, which is what SPEC §5.5
   asks of this lane.
 - **Framework `dyn` seams.** `MailboxControl`, `MailboxTermination`,
-  `MailboxRuntime`, `MailboxEffectSink`, `ActorIdentity` and `DynamicRoute` are
-  implementation seams
-  with framework-only impls, not user traits; where the framework invokes one
-  under a lock, no caller code runs. `MailboxControl` and
-  `MailboxTermination` are private-supertrait sealed because their legitimate
-  implementations live in the defining mailbox crate. The other four hold
-  their boundary by convention rather than by construction, and so do the
-  sub-capabilities `MailboxRuntime` mints: `MailboxSignal`,
-  `MailboxSignalWatcher` and the `ErasedOneShot*` family are public unsealed
-  cross-crate traits for the same reason and ride under the same ruling.
+  `MailboxEffectSink`, `ActorIdentity` and `DynamicRoute` are `pub(crate)`
+  implementation seams inside the façade, not user traits. Their only
+  implementations are framework-owned, and a foreign implementation is
+  unrepresentable. `MailboxRuntime` and the sub-capabilities it mints —
+  `MailboxSignal`, `MailboxSignalWatcher` and the `ErasedOneShot*` family —
+  remain public, unsealed, doc-hidden traits in `shelterwood-core` because the
+  separate `shelterwood-runtime` adapter must implement them. They ride under
+  the same framework-only ruling, but every path that installs one in a
+  mailbox is private to the façade.
   `WakerProxy` and its `retire_with` seam ride with them: the proxy is a
   public doc-hidden cross-crate type whose `retire_with` takes a
   caller-supplied `fn(Waker)`, but the effect is queued under the proxy's
@@ -105,18 +104,19 @@ rests on:
   ready-edge retirement flushes the stored caller waker through the same
   post-unlock effects path. The supported façade re-exports neither type
   nor anything that could install one.
-  `MailboxEffectSink` is the sharpest case: the framework calls
-  `defer_mailbox_effect` while holding both the resident-tree observation gate
-  and `MemberCell::mailbox`, and its `MailboxEffectQueue` implementation is
-  `pub` and `Default`, so an unsupported direct dependent could both construct
-  a sink and supply its own. The supported façade re-exports neither, which is
-  what keeps the ruling true. Rust
-  cannot private-seal a trait in the lower crate while permitting its
-  legitimate implementation in a downstream sibling, and a public capability
-  token would be obtainable by the same unsupported direct dependent. The
-  supported `shelterwood` façade exports neither the traits nor their
-  installers; implementing or installing any of them through a direct
-  dependency invalidates the lock rule. `MailboxRuntime`
+  `MailboxEffectSink` was the sharpest open case before the fold: the
+  framework calls `defer_mailbox_effect` while holding both the resident-tree
+  observation gate and `MemberCell::mailbox`. It and `MailboxEffectQueue` are
+  now crate-private, so an unsupported direct dependent can neither construct
+  a sink nor supply its own. The same construction-held boundary covers
+  `MailboxControl`, `MailboxTermination`, `ActorIdentity`, and `DynamicRoute`;
+  what remains conventional is the core-to-runtime capability family plus the
+  waker machinery that moved to core beside the proxy — `WakerSlot`,
+  `WakerAction`, and `WakerEffects` are public doc-hidden core items a direct
+  core dependent could construct. They ride under the same framework-only
+  ruling; the supported façade re-exports none of them, and the
+  external-consumer probe rejects façade reachability for the whole family.
+  `MailboxRuntime`
   is nonetheless kept off every locked path: its disposal capability hands
   work to a blocking worker, so it belongs to the effects flush like the user
   code it carries. That is a preference, not a prohibition, and
@@ -142,7 +142,7 @@ rests on:
   stays inside the rule — the record is framework-owned data and the retained
   clone is provably non-last — but it is the deepest the exemption goes, so a
   new operation added to the doubled section needs the same accounting.
-  `WakerProxy`'s mutex (`shelterwood-mailbox/src/waker_proxy.rs`) sits at the
+  `WakerProxy`'s mutex (`crates/shelterwood-core/src/waker_proxy.rs`) sits at the
   other end of that order: it is a **leaf**. `wake_by_ref` acquires it from
   whatever thread drives the external primitive — the timer driver, a sender,
   any executor — so no framework lock may be taken under it, and a wider lock

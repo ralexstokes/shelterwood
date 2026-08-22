@@ -1,0 +1,52 @@
+name: docs
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Enable shared Nix cache
+        uses: cachix/cachix-action@v17
+        with:
+          name: ralexstokes
+          skipPush: true
+
+      - name: Build docs
+        run: |
+          ./tools/dev mdbook build book
+          ./tools/dev cargo doc --workspace --no-deps --all-features
+          echo '<meta http-equiv="refresh" content="0; url=shelterwood/index.html">' > target/doc/index.html
+
+          mkdir -p _site/api
+          cp -r book/book/. _site/
+          cp -r target/doc/. _site/api/
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

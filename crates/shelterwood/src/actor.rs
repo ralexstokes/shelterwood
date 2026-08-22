@@ -88,9 +88,11 @@ macro_rules! context_common_forwarders {
         /// Starts blocking work tied to actor shutdown and returned-future drop.
         ///
         /// Available from [`StopContext`] too — deliberately, unlike
-        /// continuations, timers, and offloads. Awaiting the returned
-        /// [`Blocking`] resumes a panic raised inside the closure at the
-        /// await point.
+        /// continuations, timers, and offloads. The returned [`Blocking`] is
+        /// caller-owned rather than tracked in the incarnation resource
+        /// ledger, so intake freeze and teardown never depend on its
+        /// completion. Awaiting it resumes a panic raised inside the closure
+        /// at the await point.
         ///
         /// Cancellation is cooperative; a hard-aborted operation's OS thread
         /// detaches and may outlive this actor incarnation.
@@ -280,10 +282,19 @@ impl<A: Actor> fmt::Debug for Context<'_, A> {
 }
 
 impl<'a, A: Actor> Context<'a, A> {
-    fn new(raw: &'a mut RawContext<A::Msg>, stage: DeliveryStage) -> Self {
+    fn new_live(raw: &'a mut RawContext<A::Msg>) -> Self {
         Self {
             raw,
-            stage,
+            stage: DeliveryStage::Live,
+            owns_init_boundary: false,
+            actor: PhantomData,
+        }
+    }
+
+    fn new_draining(raw: &'a mut RawContext<A::Msg>) -> Self {
+        Self {
+            raw,
+            stage: DeliveryStage::DrainingFrozenPrefix,
             owns_init_boundary: false,
             actor: PhantomData,
         }
@@ -697,7 +708,7 @@ impl<A: Actor> RawActor for Handler<A> {
 
         while let Some(message) = raw.recv().await {
             let handled = {
-                let mut context = Context::<A>::new(raw, DeliveryStage::Live);
+                let mut context = Context::<A>::new_live(raw);
                 actor.handle(message, &mut context).await
             };
             if let Err(error) = handled {
@@ -709,8 +720,7 @@ impl<A: Actor> RawActor for Handler<A> {
             MailboxShutdown::Drain => {
                 while let Some(message) = raw.try_recv() {
                     let handled = {
-                        let mut context =
-                            Context::<A>::new(raw, DeliveryStage::DrainingFrozenPrefix);
+                        let mut context = Context::<A>::new_draining(raw);
                         actor.handle(message, &mut context).await
                     };
                     if let Err(error) = handled {

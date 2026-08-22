@@ -58,10 +58,12 @@ response wait.
 
 ## The rest of the error surface, briefly
 
-- **Declaration and admission** — `ReserveError` (duplicate or in-removal
-  id, scope not admitting: `NotAdmittingCause`), `BuildError` (root
-  lowering), `PolicyError` (invalid policy data, rejected at
-  construction).
+- **Declaration and admission** — `StaticReserveError` (empty or duplicate
+  id, identity exhaustion) for pre-spawn tree declarations; `ReserveError`
+  (those common id failures plus in-removal ids, unavailable runtime, and a
+  scope not admitting: `NotAdmittingCause`) for live dynamic admission;
+  `BuildError` (root lowering); `PolicyError` (invalid policy data, rejected
+  at construction).
 - **Startup** — `StartupError` from `wait_started`; `StartOrShutdownError`
   pairs the startup failure with any rollback timeout report;
   `StartupFailure`/`StartupFailureCause` describe a nested scope's failed

@@ -488,7 +488,10 @@ async fn hard_force_preserves_the_first_terminal_observer_panic_across_its_fallb
         .await
         .dispatch(&mut scope);
     }
-    gate.wait_entered().await;
+    assert!(matches!(
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, gate.wait_entered()).await,
+        crate::runtime::Timeout::Completed(())
+    ));
     let arrived_completion = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, async {
         while scope.disposal_event_receiver.is_empty() {
             crate::runtime::yield_now().await;

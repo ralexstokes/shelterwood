@@ -726,8 +726,14 @@ pub fn step(state: &mut SupervisorState, event: Event, effects: &mut Vec<Effect>
 
 /// Admits one membership and returns its never-reused registration key.
 ///
-/// Admission policy lives in the runtime facade. This structural operation
-/// rejects only a duplicate live membership or an exhausted key domain.
+/// Admission policy lives in the runtime facade. In particular, this pure
+/// reducer remains permissive while draining; the supported driver's
+/// `handle_admission` gate must reject the request before reaching here. The
+/// exploration walk is blind to that boundary by design because admission
+/// mints an unbounded sequence of keys, so the facade test
+/// `draining_scopes_reject_admission_and_treat_removal_as_absent` pins it.
+/// This structural operation rejects only a duplicate live membership or an
+/// exhausted key domain.
 pub fn admit(
     state: &mut SupervisorState,
     membership: Membership,
@@ -953,6 +959,41 @@ mod tests {
         state.check_invariants();
     }
 
+    /// A forced stop deliberately leaves the readiness gate armed, so its
+    /// final signal can arrive after structural state has entered `Stopping`.
+    /// Losing this permissive acceptance is a progress failure — aggregate
+    /// startup would remain pending — rather than a state the exploration
+    /// walk's safety assertions can distinguish.
+    #[test]
+    fn ready_during_stopping_releases_the_initial_readiness_gate() {
+        let membership = memberships(1)[0];
+        let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::starting());
+        let child = admit(&mut state, membership, true);
+
+        step(&mut state, Event::Spawned { child }, &mut Vec::new());
+        step(&mut state, Event::StopStarted { child }, &mut Vec::new());
+        // Pin the precondition too: without it a `StopStarted` that stopped
+        // transitioning would leave this an ordinary `Active` readiness test
+        // still passing under its own name.
+        assert_eq!(
+            state.child_state(child),
+            Some(ChildState::Resident(IncarnationState::Stopping))
+        );
+        assert!(!state.initial_ready(child));
+
+        step(
+            &mut state,
+            Event::Ready {
+                child,
+                removal_latched: false,
+            },
+            &mut Vec::new(),
+        );
+
+        assert!(state.initial_ready(child));
+        state.check_invariants();
+    }
+
     /// R4 — dynamic startup emits one start per *unspawned* initial member.
     /// A member awaiting a restart deadline has spawned once already, and its
     /// re-construction belongs to the restart path rather than to settlement;
@@ -1123,6 +1164,32 @@ mod tests {
         assert_eq!(state.ordered_stop_waiting(), None);
         assert!(state.all_children_joined());
         state.check_invariants();
+    }
+
+    #[test]
+    fn draining_an_empty_roster_finishes_on_settlement() {
+        for flavor in [ScopeFlavor::Ordered, ScopeFlavor::Dynamic] {
+            let mut state = SupervisorState::new(flavor, ScopeLifecycle::running());
+            let mut effects = Vec::new();
+            assert_eq!(
+                super::begin_drain(&mut state, StopReason::ShutdownRequested, &mut effects),
+                Some((false, ScopeState::Draining))
+            );
+            assert!(effects.is_empty());
+
+            step(&mut state, Event::Settle, &mut effects);
+            assert_eq!(
+                effects,
+                [Effect::Finished {
+                    reason: StopReason::ShutdownRequested
+                }],
+                "{flavor:?} drain finishes through vacuous all-children-joined"
+            );
+            effects.clear();
+            step(&mut state, Event::Settle, &mut effects);
+            assert!(effects.is_empty(), "{flavor:?} finish is emitted once");
+            state.check_invariants();
+        }
     }
 
     #[test]

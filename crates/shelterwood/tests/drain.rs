@@ -8,11 +8,10 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, assert_eventually, assert_quiet, next_event, poll_until};
+use crate::common::{ReleaseGate, assert_eventually, assert_quiet, next_exit_of, poll_until};
 use shelterwood::{
     Actor, ActorOnceDef, Cancellation, Context, Exit, ExitError, ExitKind, ExitResult, GracePhase,
-    LifecycleEventKind, LifecycleEvents, Mailbox, MailboxShutdown, SendErrorKind, Shutdown,
-    StopContext, Tree,
+    Mailbox, MailboxShutdown, SendErrorKind, Shutdown, StopContext, Tree,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -412,16 +411,6 @@ struct FaultOutcome {
     blocking_result: usize,
 }
 
-async fn exited_actor(events: &mut LifecycleEvents) -> Exit {
-    loop {
-        if let LifecycleEventKind::Exited { id, exit, .. } = next_event(events).await.kind
-            && id.as_str() == "actor"
-        {
-            return exit;
-        }
-    }
-}
-
 async fn run_fault_fixture(
     mode: FaultMode,
     mailbox_shutdown: MailboxShutdown,
@@ -499,7 +488,7 @@ async fn run_fault_fixture(
         .expect("shutdown task joins")
         .expect("the child policy bounds shutdown");
     let elapsed = tokio::time::Instant::now() - started_at;
-    let exit = exited_actor(&mut events).await;
+    let exit = next_exit_of(&mut events, "actor").await;
     let drained = drained.load(Ordering::SeqCst);
     // Tying the observation count to `drained` keeps an absent handler from
     // passing: a mode that never drains records nothing and expects nothing.

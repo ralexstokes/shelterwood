@@ -81,7 +81,9 @@ fn raw_readiness_override_rejects_after_init_eagerly() {
 
 static STATEFUL_READINESS_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-struct StatefulReadiness;
+struct StatefulReadiness {
+    observed: Arc<Mutex<Option<Readiness>>>,
+}
 
 impl RawActor for StatefulReadiness {
     type Msg = ();
@@ -92,7 +94,10 @@ impl RawActor for StatefulReadiness {
     }
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
-        assert_eq!(context.readiness(), Readiness::Immediate);
+        *self
+            .observed
+            .lock()
+            .expect("readiness observation mutex poisoned") = Some(context.readiness());
         Ok(())
     }
 }
@@ -100,14 +105,27 @@ impl RawActor for StatefulReadiness {
 #[tokio::test]
 async fn raw_readiness_is_definition_metadata_evaluated_once() {
     STATEFUL_READINESS_CALLS.store(0, Ordering::SeqCst);
+    let observed = Arc::new(Mutex::new(None));
     let mut tree = Tree::new();
-    tree.add_raw_once("stateful-readiness", RawOnceDef::new(StatefulReadiness))
-        .expect("valid actor");
+    tree.add_raw_once(
+        "stateful-readiness",
+        RawOnceDef::new(StatefulReadiness {
+            observed: Arc::clone(&observed),
+        }),
+    )
+    .expect("valid actor");
     assert_eq!(STATEFUL_READINESS_CALLS.load(Ordering::SeqCst), 1);
 
     let system = tree.spawn().expect("runtime is available");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(STATEFUL_READINESS_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *observed
+            .lock()
+            .expect("readiness observation mutex poisoned"),
+        Some(Readiness::Immediate),
+        "the raw context exposes the definition's resolved readiness"
+    );
 }
 
 static RESTARTING_READINESS_CALLS: AtomicUsize = AtomicUsize::new(0);

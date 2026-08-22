@@ -569,9 +569,20 @@ impl ScopeCell {
         )
     }
 
+    /// Publishes a fabricated scope state.
+    ///
+    /// `Stopped` goes through the live terminal publisher rather than the
+    /// nonterminal writer, so a fixture that publishes it twice — or over a
+    /// stronger recorded reason — is suppressed by SPEC §11 stop precedence
+    /// instead of overwriting.
     #[cfg(test)]
     pub(crate) fn set_state(&self, state: ScopeState) {
-        self.with_observation_gate(|txn| self.set_state_locked(state, &[], txn));
+        self.with_observation_gate(|txn| match state {
+            ScopeState::Stopped { reason } => {
+                self.publish_stopped_locked(txn, reason, None, None);
+            }
+            state => self.set_state_locked(state, &[], txn),
+        });
     }
 
     pub(crate) fn set_state_and_startup(
@@ -579,6 +590,10 @@ impl ScopeCell {
         state: ScopeState,
         startup: Result<(), StartupError>,
     ) {
+        assert!(
+            !matches!(state, ScopeState::Stopped { .. }),
+            "terminal scope state is published through publish_stopped_locked"
+        );
         self.with_observation_gate(|txn| {
             self.set_startup_locked(startup, txn);
             self.set_state_locked(state, &[], txn);
@@ -599,8 +614,18 @@ impl ScopeCell {
         terminal_disposals: &[Arc<MemberCell>],
     ) {
         assert!(matches!(state, ScopeState::Draining));
+        // Keep the failed startup's user error owned across the foreign-gate
+        // diagnostic below. The raw startup local is declared after these
+        // guards so unwind releases it first; the guard then transfers final
+        // destruction to critical disposal rather than running it on this
+        // driver thread.
+        let mut retained_startup = Vec::new();
+        if let Some(startup) = &startup {
+            RetainedExit::retain_startup_result(&mut retained_startup, startup);
+        }
         let mut state = Some(state);
         let mut startup = startup;
+        let mut startup_installed = false;
         let published = self.with_observation_gate(|txn| {
             if !terminal_disposals.iter().all(|member| {
                 self.current_observation_gate()
@@ -609,7 +634,7 @@ impl ScopeCell {
                 return false;
             }
             if let Some(startup) = startup.take() {
-                self.set_startup_locked(startup, txn);
+                startup_installed = self.set_startup_locked(startup, txn);
             }
             self.set_state_locked(
                 state
@@ -624,6 +649,20 @@ impl ScopeCell {
             published,
             "a drain entry may mark only a resident member on its observation gate"
         );
+        if startup_installed {
+            // The record installed its own retained copy, so the diagnostic
+            // guards are surrendered as raw refcount traffic.
+            for exit in retained_startup {
+                drop(exit.into_exit());
+            }
+        } else {
+            // A record that already held a startup result rejected this one,
+            // and the rejected raw result retired through the transaction's
+            // own guards — into isolated disposal, which is still running.
+            // Surrendering these guards raw would race that job for the last
+            // owner, so they retire the same way instead.
+            drop(retained_startup);
+        }
     }
 
     fn set_state_locked(
@@ -632,6 +671,10 @@ impl ScopeCell {
         terminal_disposals: &[Arc<MemberCell>],
         txn: &mut ObservationTxn<'_>,
     ) {
+        debug_assert!(
+            !matches!(state, ScopeState::Stopped { .. }),
+            "terminal scope state is published through publish_stopped_locked"
+        );
         // The marker slice is part of the state-writer signature so the #270
         // regression guard cannot be reordered at a caller. Every marker is
         // stored before the `Draining` record write whose release edge makes
@@ -639,8 +682,6 @@ impl ScopeCell {
         for member in terminal_disposals {
             member.set_terminal_disposal_pending(true);
         }
-        let mut transient_retained = Vec::new();
-        RetainedExit::retain_scope_state(&mut transient_retained, &state);
         if matches!(state, ScopeState::Draining | ScopeState::StartupFailed)
             && let Some(route) = self.dynamic_route_in(txn)
         {
@@ -650,12 +691,6 @@ impl ScopeCell {
             record.state = state.clone();
             record.refresh_retained_exits();
         });
-        // The scope record and emitted lifecycle event each install their own
-        // guards. Avoid an extra disposal submission for this call-local
-        // unwind guard.
-        for exit in transient_retained {
-            drop(exit.into_exit());
-        }
         txn.pulse(&self.observation.record);
         txn.pulse(&self.member.record);
         self.emit_locked(txn, LifecycleEventKind::ScopeState { state });
@@ -865,7 +900,6 @@ impl ScopeCell {
         let Some(resident) = resident else {
             return false;
         };
-        let resident_matches = resident.projection().member.membership() == membership;
         // Mirror the announcement: a resident an unwound admission installed
         // never published `Added`, and SPEC §3.2's pairing is both edges or
         // neither. It is still withdrawn and disposed.
@@ -874,22 +908,11 @@ impl ScopeCell {
             membership,
             last_incarnation: resident.projection().member.record().last_incarnation,
         });
-        // Queue the framework diagnostic ahead of every other effect. The
-        // accumulator keeps the first panic, so this is the one ordering under
-        // which an invariant failure cannot be displaced by an effect that
-        // panics for an unrelated reason. Every deferred-diagnostic site in
-        // the tree uses it.
-        if !resident_matches {
-            txn.defer(|| panic!("pruning must remove the requested resident membership"));
-        }
         // The projection can carry the last member/mailbox owner. Put it in
         // the transaction before the fallible publication path so unwind also
         // retires it only after the observation gate is released. The detached
         // handoff deliberately makes final member teardown asynchronous.
         txn.defer(move || runtime::dispose_detached(resident));
-        if !resident_matches {
-            return false;
-        }
         if let Some(event) = event {
             self.emit_locked(txn, event);
         }
@@ -909,7 +932,18 @@ impl ScopeCell {
         self.with_observation_gate(|txn| self.set_startup_locked(startup, txn));
     }
 
-    fn set_startup_locked(&self, startup: Result<(), StartupError>, txn: &mut ObservationTxn<'_>) {
+    /// Installs the startup result unless one is already recorded.
+    ///
+    /// Returns whether this call installed it. A caller holding its own
+    /// transient guards needs that verdict: only an installed result leaves an
+    /// equivalent retained copy in the record, which is what makes surrendering
+    /// those guards raw refcount traffic rather than a race with the isolated
+    /// disposal a rejected result starts here.
+    fn set_startup_locked(
+        &self,
+        startup: Result<(), StartupError>,
+        txn: &mut ObservationTxn<'_>,
+    ) -> bool {
         let mut retained = Vec::new();
         RetainedExit::retain_startup_result(&mut retained, &startup);
         let mut incoming = Some((startup, retained));
@@ -938,6 +972,7 @@ impl ScopeCell {
             txn.pulse(&self.member.record);
             txn.pulse(&self.observation.record);
         }
+        published
     }
 
     pub(crate) fn begin_incarnation(&self, state: ScopeState) -> Option<Epoch> {
@@ -1300,7 +1335,9 @@ impl ScopeCell {
     ///
     /// Returns whether the member's `Admitted` transition was legal. A refusal
     /// publishes nothing: no gate handoff, no parent wiring, no retained
-    /// residency and no `Added` event.
+    /// residency and no `Added` event. The residency diagnostic below returns
+    /// `false` after those steps have landed, but it also queues a panic, so no
+    /// caller observes that verdict.
     ///
     /// A *panic* between the residency push and the `Added` publication is
     /// different: residency keeps the resident so its possibly-last mailbox
@@ -1331,7 +1368,12 @@ impl ScopeCell {
         // what makes a lingering half-wired resident invisible rather than a
         // membership with only half its edges.
         let projection = child.clone();
-        self.current_children().push(ResidentChild::new(child));
+        let residency_index = {
+            let mut children = self.current_children();
+            let index = children.len();
+            children.push(ResidentChild::new(child));
+            index
+        };
         let gate = self.current_observation_gate();
         let admitted = if let Some(scope) = &projection.scope {
             let admitted = scope.admit_observation_gate(self, &gate, txn);
@@ -1388,13 +1430,30 @@ impl ScopeCell {
         }
         let id = projection.member.id().clone();
         let membership = projection.member.membership();
-        // Mark the resident announced before `emit_locked`: the Added
+        // Mark this admission's exact resident before `emit_locked`: the Added
         // publication schedules the commit-time snapshot, and that producer
-        // walks residency and skips whatever is still unannounced. This rests
-        // on the same "no residency mutation interleaves under the gate"
-        // invariant as the refusal pop above, which is where it is diagnosed.
-        if let Some(resident) = self.current_children().last_mut() {
-            resident.announced = true;
+        // walks residency and skips whatever is still unannounced. Refusing a
+        // missing or mismatched index prevents a different resident from being
+        // paired with this Added edge and diagnoses the same no-interleaving
+        // invariant as the refusal pop above.
+        let announced_is_admission = {
+            let mut children = self.current_children();
+            children
+                .get_mut(residency_index)
+                .filter(|resident| resident.projection().member.membership() == membership)
+                .is_some_and(|resident| {
+                    resident.announced = true;
+                    true
+                })
+        };
+        if !announced_is_admission {
+            // Residency no longer holds this admission, so the lookup clone
+            // can be the last member/mailbox owner. Move it into the
+            // transaction ahead of the diagnostic, exactly as the refusal pop
+            // above does, rather than unwinding it under the observation gate.
+            txn.defer(move || runtime::dispose_detached(projection));
+            txn.defer(|| panic!("success announces the admission-local resident"));
+            return false;
         }
         self.emit_locked(txn, LifecycleEventKind::Added { id, membership });
         true
@@ -1665,7 +1724,7 @@ mod tests {
     use shelterwood_core::{
         Cancellation, ExitError, GracePhase, IntensityTrip, StartupFailure, StartupFailureCause,
         identity::ScopeIdentity,
-        policy::{ResolvedMailbox, RestartCount, ScopeFlavor},
+        policy::{ResolvedMailbox, RestartAttempt, RestartCount, ScopeFlavor},
     };
 
     use super::*;
@@ -1891,6 +1950,45 @@ mod tests {
     }
 
     #[test]
+    fn foreign_gate_drain_retains_startup_exit_across_the_diagnostic() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let foreign = isolated_scope("foreign", ScopeFlavor::Ordered);
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let retiring_thread = std::thread::current().id();
+        let startup = Err(StartupError::StartupFailed(StartupFailure {
+            cause: StartupFailureCause::Child {
+                id: foreign.member.id().clone(),
+                membership: foreign.member.membership(),
+                exit: Exit::failed(
+                    ExitError::from(ThreadProbe(dropped)),
+                    Cancellation::NotObserved,
+                ),
+            },
+        }));
+
+        catch_unwind(AssertUnwindSafe(|| {
+            root.publish_drain(
+                ScopeState::Draining,
+                Some(startup),
+                &[Arc::clone(&foreign.member)],
+            );
+        }))
+        .expect_err("a drain cannot mark a member from another observation gate");
+
+        assert!(
+            !root.observation_gate().is_poisoned(),
+            "the foreign-gate diagnostic resumes only after the transaction unlocks"
+        );
+        assert_ne!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("the rejected startup exit is destroyed"),
+            retiring_thread,
+            "the diagnostic cannot destroy the nested user error on the unwinding driver thread"
+        );
+    }
+
+    #[test]
     fn rejected_resident_admission_detaches_its_last_mailbox_owner() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let mut lifecycle = root.subscribe_lifecycle();
@@ -2091,10 +2189,39 @@ mod tests {
     }
 
     #[test]
-    fn rejected_stage_transition_suppresses_its_lifecycle_publication() {
+    fn adoption_does_not_forward_an_already_finished_shutdown_target() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Ordered);
+        let target = nested
+            .begin_incarnation(ScopeState::Starting)
+            .expect("the nested scope begins its first epoch");
+        nested.finish_incarnation(target, StopReason::Finished);
+        nested
+            .control
+            .lock()
+            .expect("scope control mutex remains healthy")
+            .shutdown = Some(ScopeRequest {
+            epoch: target,
+            consumed: false,
+        });
+
+        assert!(root.admit_child(ResidentProjection::new(
+            Arc::clone(&nested.member),
+            Some(nested),
+        )));
+        assert!(
+            root.take_control_events().is_empty(),
+            "adoption cannot forward a target the nested epoch plane already finished"
+        );
+    }
+
+    #[test]
+    fn rejected_stage_transition_disposes_its_lifecycle_exit_off_thread() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let member = child_member(&root, "invalid");
         let mut events = root.subscribe_lifecycle();
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let retiring_thread = std::thread::current().id();
 
         assert!(
             !root.transition_child_stage(
@@ -2111,13 +2238,73 @@ mod tests {
                         .take_incarnation_counter()
                         .mint()
                         .expect("incarnation available"),
-                    exit: Exit::completed(Cancellation::NotObserved),
+                    exit: Exit::failed(
+                        ExitError::from(ThreadProbe(dropped)),
+                        Cancellation::NotObserved,
+                    ),
                 }),
             ),
             "the Reserved-to-Restarting projection transition is illegal"
         );
         assert!(matches!(member.record().stage, MemberStage::Reserved));
         assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
+        assert_ne!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("the refused lifecycle exit is destroyed"),
+            retiring_thread,
+            "a refused scope event keeps the detached disposal venue"
+        );
+    }
+
+    #[test]
+    fn rejected_restart_publication_disposes_its_lifecycle_exit_off_thread() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let member = child_member(&root, "invalid");
+        let mut events = root.subscribe_lifecycle();
+        let incarnation = member
+            .take_incarnation_counter()
+            .mint()
+            .expect("incarnation available");
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let retiring_thread = std::thread::current().id();
+
+        assert!(
+            !root.publish_child_restart(
+                &member,
+                TotalRestarts::ZERO,
+                MemberTransition::RestartScheduled {
+                    exit: Exit::completed(Cancellation::NotObserved),
+                    restart_count: RestartCount::ZERO.bump(),
+                    restart_at: None,
+                },
+                LifecycleEventKind::Exited {
+                    id: member.id().clone(),
+                    membership: member.membership(),
+                    incarnation,
+                    exit: Exit::failed(
+                        ExitError::from(ThreadProbe(dropped)),
+                        Cancellation::NotObserved,
+                    ),
+                },
+                LifecycleEventKind::RestartScheduled {
+                    id: member.id().clone(),
+                    membership: member.membership(),
+                    attempt: RestartAttempt::ZERO.bump(),
+                    delay: Duration::ZERO,
+                },
+            ),
+            "the Reserved-to-Restarting projection transition is illegal"
+        );
+        assert!(matches!(member.record().stage, MemberStage::Reserved));
+        assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
+        assert_ne!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("the refused restart exit is destroyed"),
+            retiring_thread,
+            "both refused restart events keep the detached disposal venue"
+        );
     }
 
     struct InertRoute;

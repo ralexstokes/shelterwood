@@ -767,9 +767,15 @@ applies), and that destruction is terminal: a payload whose own destructor
 panics has its replacement discarded, never requeued. A panic payload
 *displaced* by one that outranks it — a rejected panic-slot record, a losing
 cleanup panic — is still discarded inline, since it is already a spent
-diagnostic. Incarnation-owned continuations, timer messages, and offload
-state instead follow §6.5 and §8's incarnation teardown and verdict rules. No
-single disposal-thread identity is promised.
+diagnostic. Application errors carried by framework-retained failed exits and
+provisional failed outcomes likewise retire through critical isolated
+disposal, never inline on the framework stack that retires the carrier. If no
+worker can be started, the job stays queued for a later attempt — potentially
+for the process lifetime — rather than destroy the value in a critical
+section. Exits handed to users retain ordinary Rust drop timing.
+Incarnation-owned continuations, timer messages, and offload state instead
+follow §6.5 and §8's incarnation teardown and verdict rules. No single
+disposal-thread identity is promised.
 
 (The synchronization discipline behind every mailbox transition — the
 effects sink paired with the state guard, and the structural waker slot —
@@ -2865,8 +2871,9 @@ Two conventions travel with the rule. Panicking while holding a mutex the
 implementation expects unpoisoned poisons it for every later caller —
 compute the verdict, release, *then* panic; where releasing is
 impossible, debug-assert instead. And a value that may block on
-destruction goes to detached disposal (§5.5's venue), not merely past the
-unlock.
+destruction goes to isolated disposal (§5.5's venue — the detached lane,
+or the critical lane when a critical section retires the carrier), not
+merely past the unlock.
 
 ### 15.5 Promises are owned completions
 
@@ -3270,12 +3277,12 @@ fixtures for the driver shell and end-to-end invariants.
     be destroyed after the guard. The lock-held probe is the direct
     oracle: a payload destructor that asks whether the framework lock is
     held must answer no, on every path that retires one. What this item
-    does *not* assert is where the destructor then runs: a mailbox
-    payload reaches isolated disposal, an `Exit`'s application error is
-    destroyed on the framework thread that released the guard. Moving the
-    second to isolated disposal is a separate rule about blocking
-    destructors on framework threads, outside this item, because the same
-    thread already destroys exits on paths that hold no lock at all.
+    does *not* assert is where the destructor then runs: §5.5 separately
+    assigns framework-initiated mailbox/reply disposal and
+    framework-retained failed-exit application errors to isolated lanes,
+    while live `latest()` displacement and user-held `Exit` copies retain
+    their documented ordinary Rust drop timing. Those venue rules are
+    independent of this item's after-unlock requirement.
 
 ---
 

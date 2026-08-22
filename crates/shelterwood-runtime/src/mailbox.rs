@@ -120,6 +120,7 @@ impl MailboxSignalWatcher for TokioSignalWatcher {
 #[cfg(test)]
 mod tests {
     use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -216,6 +217,35 @@ mod tests {
         assert_eq!(
             *value.downcast::<u8>().expect("value type is preserved"),
             11
+        );
+    }
+
+    #[test]
+    fn adapter_oneshot_rejects_poll_after_close_and_take_with_framework_diagnostic() {
+        const REPOLL: &str = "shelterwood one-shot receiver polled after completion";
+
+        let runtime = mailbox_runtime();
+        let (sender, mut receiver) = runtime.oneshot();
+        sender
+            .send(Box::new(12_u8))
+            .unwrap_or_else(|_| panic!("the adapter receiver is live"));
+        let value = receiver
+            .as_mut()
+            .close_and_take()
+            .expect("close-and-take recovers the published erased value");
+        assert_eq!(
+            *value.downcast::<u8>().expect("value type is preserved"),
+            12
+        );
+
+        let mut context = Context::from_waker(Waker::noop());
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receiver.as_mut().poll_receive(&mut context);
+        }))
+        .expect_err("an erased receiver cannot poll after terminal take");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some(REPOLL)
         );
     }
 

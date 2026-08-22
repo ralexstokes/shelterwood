@@ -1,6 +1,6 @@
 mod common;
 
-use std::{error::Error, fmt, sync::mpsc, time::Duration};
+use std::{error::Error, fmt, sync::mpsc, thread::ThreadId, time::Duration};
 
 use crate::common::next_exit_of;
 use shelterwood::{
@@ -9,9 +9,12 @@ use shelterwood::{
 };
 
 const ACTOR_DROP_PANIC: &str = "injected actor-state destructor panic";
+const PROBE_WAIT: Duration = Duration::from_secs(10);
+
+type ThreadProbe = mpsc::SyncSender<ThreadId>;
 
 #[derive(Debug)]
-struct HostileError(mpsc::SyncSender<std::thread::ThreadId>);
+struct HostileError(ThreadProbe);
 
 impl fmt::Display for HostileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -28,9 +31,33 @@ impl Drop for HostileError {
     }
 }
 
+/// Asserts that the epilogue moved the application error off the very thread
+/// that ran teardown, rather than off whichever thread happens to host the
+/// test. The two coincide only under the default current-thread flavour, so
+/// comparing against the teardown thread keeps the probe honest if the actor
+/// is ever scheduled elsewhere.
+fn assert_disposed_off_the_teardown_thread(
+    teardown: &mpsc::Receiver<ThreadId>,
+    disposal: &mpsc::Receiver<ThreadId>,
+) {
+    let teardown_thread = teardown
+        .recv_timeout(PROBE_WAIT)
+        .expect("the actor's destructor runs during teardown");
+    let disposal_thread = disposal
+        .recv_timeout(PROBE_WAIT)
+        .expect("the hostile error is eventually disposed");
+    assert_ne!(
+        disposal_thread, teardown_thread,
+        "the teardown unwind must not destroy the application error inline"
+    );
+}
+
 /// Returns an application error, then panics from actor destruction while the
 /// raw incarnation epilogue still owns that result.
-struct RawReturnsHostileErrorThenPanicsOnDrop(Option<HostileError>);
+struct RawReturnsHostileErrorThenPanicsOnDrop {
+    error: Option<HostileError>,
+    teardown: ThreadProbe,
+}
 
 impl RawActor for RawReturnsHostileErrorThenPanicsOnDrop {
     type Msg = ();
@@ -38,28 +65,30 @@ impl RawActor for RawReturnsHostileErrorThenPanicsOnDrop {
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
         let _ = context.recv().await;
         Err(ExitError::from(
-            self.0.take().expect("hostile error is returned once"),
+            self.error.take().expect("hostile error is returned once"),
         ))
     }
 }
 
 impl Drop for RawReturnsHostileErrorThenPanicsOnDrop {
     fn drop(&mut self) {
+        let _ = self.teardown.send(std::thread::current().id());
         panic!("{ACTOR_DROP_PANIC}");
     }
 }
 
 #[tokio::test]
 async fn raw_error_is_retained_while_the_teardown_panic_unwinds() {
-    let actor_thread = std::thread::current().id();
     let (dropped, observed) = mpsc::sync_channel(1);
+    let (torn_down, teardown) = mpsc::sync_channel(1);
     let mut tree = Tree::new();
     let actor = tree
         .add_raw_once(
             "hostile-raw",
-            RawOnceDef::new(RawReturnsHostileErrorThenPanicsOnDrop(Some(HostileError(
-                dropped,
-            )))),
+            RawOnceDef::new(RawReturnsHostileErrorThenPanicsOnDrop {
+                error: Some(HostileError(dropped)),
+                teardown: torn_down,
+            }),
         )
         .expect("valid raw actor");
     let system = tree.spawn().expect("runtime is available");
@@ -74,49 +103,53 @@ async fn raw_error_is_retained_while_the_teardown_panic_unwinds() {
         ExitKind::Panicked { message } if message.as_deref() == Some(ACTOR_DROP_PANIC)
     ));
     assert_eq!(system.wait().await, StopReason::Finished);
-    assert_ne!(
-        observed
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the hostile error is eventually disposed"),
-        actor_thread,
-        "the teardown unwind must not destroy the application error inline"
-    );
+    assert_disposed_off_the_teardown_thread(&teardown, &observed);
 }
 
 /// The supported callback-oriented actor surface reaches the same raw
 /// epilogue through `Handler<A>`.
-struct HandlerReturnsHostileError(Option<HostileError>);
+struct HandlerReturnsHostileError {
+    error: Option<HostileError>,
+    teardown: ThreadProbe,
+}
 
 impl Actor for HandlerReturnsHostileError {
     type Msg = ();
-    type Args = HostileError;
+    type Args = (HostileError, ThreadProbe);
 
-    async fn init(error: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
-        Ok(Self(Some(error)))
+    async fn init(
+        (error, teardown): Self::Args,
+        _: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        Ok(Self {
+            error: Some(error),
+            teardown,
+        })
     }
 
     async fn handle(&mut self, (): Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
         Err(ExitError::from(
-            self.0.take().expect("hostile error is returned once"),
+            self.error.take().expect("hostile error is returned once"),
         ))
     }
 }
 
 impl Drop for HandlerReturnsHostileError {
     fn drop(&mut self) {
+        let _ = self.teardown.send(std::thread::current().id());
         panic!("{ACTOR_DROP_PANIC}");
     }
 }
 
 #[tokio::test]
 async fn handler_error_is_retained_while_the_teardown_panic_unwinds() {
-    let actor_thread = std::thread::current().id();
     let (dropped, observed) = mpsc::sync_channel(1);
+    let (torn_down, teardown) = mpsc::sync_channel(1);
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
             "hostile-handler",
-            ActorOnceDef::<HandlerReturnsHostileError>::new(HostileError(dropped)),
+            ActorOnceDef::<HandlerReturnsHostileError>::new((HostileError(dropped), torn_down)),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
@@ -131,11 +164,5 @@ async fn handler_error_is_retained_while_the_teardown_panic_unwinds() {
         ExitKind::Panicked { message } if message.as_deref() == Some(ACTOR_DROP_PANIC)
     ));
     assert_eq!(system.wait().await, StopReason::Finished);
-    assert_ne!(
-        observed
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the hostile error is eventually disposed"),
-        actor_thread,
-        "the teardown unwind must not destroy the application error inline"
-    );
+    assert_disposed_off_the_teardown_thread(&teardown, &observed);
 }

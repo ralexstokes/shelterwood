@@ -5,7 +5,7 @@ use shelterwood_core::{
     Exit,
     engine::ScopeState,
     exit::{
-        Cancellation, ExitKind, GracePhase, JoinOutcome, RecordedOutcome, StartupError,
+        Cancellation, ExitKind, ExitResult, GracePhase, JoinOutcome, RecordedOutcome, StartupError,
         StartupFailure, StartupFailureCause, StopReason, classify_disposal_panic, classify_exit,
         reconcile_recorded_outcomes,
     },
@@ -171,6 +171,42 @@ impl Drop for RetainedRecordedOutcome {
         };
         if outcome.is_failed() {
             runtime::dispose_critical(outcome);
+        }
+    }
+}
+
+/// A completed incarnation result retained across a fallible teardown epilogue.
+///
+/// The failed variant owns a type-erased application error that no framework
+/// copy has reached yet: the first retention point downstream is
+/// [`RetainedRecordedOutcome`], one hop after the incarnation future returns.
+/// The raw epilogue runs several contained teardown steps while holding the
+/// completed result and then resumes any surviving panic, so the carrier is
+/// dropped during that unwind — and destroying a user error there is a second
+/// panic inside the first one's cleanup, which aborts the process.
+/// [`Self::into_result`] on the normal return path preserves ordinary
+/// downstream ownership.
+pub(crate) struct RetainedExitResult(Option<ExitResult>);
+
+impl RetainedExitResult {
+    pub(crate) fn new(result: ExitResult) -> Self {
+        Self(Some(result))
+    }
+
+    pub(crate) fn into_result(mut self) -> ExitResult {
+        self.0
+            .take()
+            .expect("retained exit result was already taken")
+    }
+}
+
+impl Drop for RetainedExitResult {
+    fn drop(&mut self) {
+        let Some(result) = self.0.take() else {
+            return;
+        };
+        if let Err(error) = result {
+            runtime::dispose_critical(error);
         }
     }
 }
@@ -392,6 +428,40 @@ mod tests {
                 .recv_timeout(TEST_WAIT)
                 .expect("recorded failure disposal completes"),
             retiring_thread
+        );
+    }
+
+    #[test]
+    fn retained_failed_exit_result_disposes_off_the_retiring_thread() {
+        let retiring_thread = std::thread::current().id();
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let retained = RetainedExitResult::new(Err(ExitError::from(ThreadProbe(dropped))));
+
+        drop(retained);
+
+        assert_ne!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("retained result disposal completes"),
+            retiring_thread,
+            "a teardown unwind must not run the application error's destructor inline"
+        );
+    }
+
+    #[test]
+    fn taken_exit_result_preserves_the_callers_drop_thread() {
+        let caller = std::thread::current().id();
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let retained = RetainedExitResult::new(Err(ExitError::from(ThreadProbe(dropped))));
+
+        drop(retained.into_result());
+
+        assert_eq!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("taken result destruction completes"),
+            caller,
+            "the normal return path keeps ordinary downstream drop timing"
         );
     }
 

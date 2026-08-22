@@ -6,12 +6,12 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc};
 use crate::{
     ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown, PolicyError, Readiness,
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
-    cells::MemberCell,
+    cells::{MemberCell, RetainedExitResult},
     definition::DefinitionSource,
     mailbox::{MailboxCell, MailboxControl, MailboxEffectQueue, actor_ref_from_parts},
     policy::CommonOptions,
     runtime::{
-        self, CompletionGatedLatch, Isolated, Latch, PanicAccumulator, PanicPayload, UnwindPanics,
+        CompletionGatedLatch, Isolated, Latch, PanicAccumulator, PanicPayload, UnwindPanics,
         catch_panic, keep_first_panic, resume_preferred_panic,
         resume_preferred_panic_outside_unwind,
     },
@@ -169,37 +169,6 @@ impl<R: RawActor> RawOnceDef<R> {
 
 type RawFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'static>>;
 type RawFactory = Arc<dyn Fn() -> Box<dyn ErasedRawInstance> + Send + Sync + 'static>;
-
-/// A completed raw outcome retained across the fallible teardown epilogue.
-///
-/// A failed result owns a type-erased application error. If teardown resumes a
-/// panic, the incarnation future drops this carrier during that unwind, so the
-/// error must not be destroyed on the same stack. The normal return path takes
-/// the result back and preserves ordinary downstream ownership.
-struct RetainedExitResult(Option<ExitResult>);
-
-impl RetainedExitResult {
-    fn new(result: ExitResult) -> Self {
-        Self(Some(result))
-    }
-
-    fn into_result(mut self) -> ExitResult {
-        self.0
-            .take()
-            .expect("retained exit result was already taken")
-    }
-}
-
-impl Drop for RetainedExitResult {
-    fn drop(&mut self) {
-        let Some(result) = self.0.take() else {
-            return;
-        };
-        if let Err(error) = result {
-            runtime::dispose_critical(error);
-        }
-    }
-}
 
 pub(crate) trait ErasedRawInstance: Send {
     fn run(self: Box<Self>, context: RawRunContext, readiness: Readiness) -> RawFuture;

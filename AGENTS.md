@@ -44,8 +44,8 @@ rests on:
   a drop. What must be outside the critical section is the *destination*:
   `MailboxTxn::finish`/`finish_returned` handing the value back only after
   releasing the guard, `withdraw`'s `Withdrawal` carrying its outcome and
-  post-unlock effects together, and `Acceptance`'s `#[must_use]` result all
-  encode that.
+  post-unlock effects together, and `MailboxTxn::take_payload`'s `#[must_use]`
+  carrier all encode that.
 - **`Arc` traffic that cannot reach zero.** Cloning an `Arc` under a lock is
   refcount work; dropping one is only refcount work while another owner is
   provable. Prefer restructuring over the proof — every violation the #235
@@ -142,6 +142,16 @@ rests on:
   stays inside the rule — the record is framework-owned data and the retained
   clone is provably non-last — but it is the deepest the exemption goes, so a
   new operation added to the doubled section needs the same accounting.
+  Dynamic admission has two further, narrowly accounted shapes around this
+  order. `DynamicControl::reserve` holds its state mutex while
+  `mint_reserved_slot` takes the child-identity mutex and adoption acquires the
+  new child's gate; both belong to a member minted inside that critical
+  section and are unpublished, hence uncontended. Admission install holds the
+  same state mutex inside the root gate while calling `admit_child_locked`, but
+  the reserved member was already adopted onto that root gate and the root
+  cannot be re-homed while its dynamic route is live, so the handoff check
+  short-circuits without a second gate acquisition. Changing either
+  publication or re-homing invariant requires re-deriving this exception.
   `WakerProxy`'s mutex (`crates/shelterwood-core/src/waker_proxy.rs`) sits at the
   other end of that order: it is a **leaf**. `wake_by_ref` acquires it from
   whatever thread drives the external primitive — the timer driver, a sender,
@@ -156,7 +166,11 @@ the pattern; where releasing is impossible, `debug_assert!` instead, as
 `MailboxState::take_waiters` does). And a value that may block on destruction
 goes to `runtime::dispose_detached`, not merely past the unlock. That second
 convention is currently met for mailbox payloads, construction closures,
-offloads, displaced resident graphs and rejected admission projections. Framework-retained `Exit` copies meet it through `RetainedExit`,
+blocking-offload captured state, displaced resident graphs and rejected
+admission projections. Raw incarnation-owned values — async offload futures,
+continuations, timers and completions — instead follow SPEC §6.5's on-task
+contained funnel because its disposal verdict is part of exit classification.
+Framework-retained `Exit` copies meet it through `RetainedExit`,
 including driver completions and pending terminal disposal; exits handed to
 users keep ordinary drop timing. Its fail-safe under exhausted thread
 creation is an unreclaimed queued job — memory held for the life of the
@@ -167,6 +181,15 @@ Reviewing a new `.lock()` is one pass: name every value the critical section
 can destroy, every callback it can invoke, and every panic it can raise. If
 any of those is user code, hand it to a transaction (`txn.defer`), an effects
 struct, or the caller.
+
+## Runtime naming
+
+Non-test façade code names only the runtime capability layer, never Tokio.
+After the crate fold, façade tests, doctests and examples may use the pinned
+Tokio dev-dependency when executor control or runnable example syntax is the
+subject; internal unit tests still prefer `crate::runtime` when it exposes the
+needed operation. This dev-only allowance does not widen the public API or the
+core crate's dependency boundary.
 
 ## Running anything
 

@@ -1573,16 +1573,19 @@ The shape is content-normative (Appendix B's latitude on exact names
 applies):
 
 ```rust
-// On ordered tree builders and on DynamicScopeRef alike — reservation is
-// synchronous on both flavors, and is where the id errors reject (rules
-// below). Receivers differ by flavor: `&mut self` on builders (plain
-// owned values, §12 — exclusive access is free), `&self` on
-// `DynamicScopeRef` (a cheap-`Clone` shared handle, B.10 — `&mut`
-// would be bypassable by cloning and is not pretended); `add_*`
-// follows the same split:
-fn reserve_actor<M: Send + 'static>(&mut self, id: …) -> Result<ActorSlot<M>, ReserveError>;
-fn reserve_task(&mut self, id: …) -> Result<TaskSlot, ReserveError>;
-fn reserve_subtree<T: Subtree>(&mut self, id: …) -> Result<SubtreeSlot<T>, ReserveError>;
+// Reservation is synchronous on both flavors and is where id errors reject
+// (rules below). Pre-spawn builders take `&mut self` (plain owned values,
+// §12 — exclusive access is free) and return the three-variant
+// `StaticReserveError`; `DynamicScopeRef` takes `&self` (a cheap-`Clone`
+// shared handle, B.10 — `&mut` would be bypassable by cloning and is not
+// pretended) and returns `ReserveError`. `add_*` follows the same split:
+fn reserve_actor<M: Send + 'static>(&mut self, id: …) -> Result<ActorSlot<M>, StaticReserveError>;
+fn reserve_task(&mut self, id: …) -> Result<TaskSlot, StaticReserveError>;
+fn reserve_subtree<T: Subtree>(&mut self, id: …) -> Result<SubtreeSlot<T>, StaticReserveError>;
+
+fn reserve_actor<M: Send + 'static>(&self, id: …) -> Result<DynamicActorSlot<M>, ReserveError>;
+fn reserve_task(&self, id: …) -> Result<DynamicTaskSlot, ReserveError>;
+fn reserve_subtree<T: Subtree>(&self, id: …) -> Result<DynamicSubtreeSlot<T>, ReserveError>;
 
 // Slots are owned and non-`Clone`. Handles are available immediately —
 // before define, before spawn (§3.2):
@@ -3847,7 +3850,10 @@ observes `NotAdmitting(Terminal)` and a latched removal observes
 Debug builds MAY instead assert and panic at that boundary to expose the
 internal regression instead of returning an outcome.
 
-The public `ReserveError` is exhaustive and includes `NoRuntime`: it
+The public `StaticReserveError` is exhaustive and contains exactly
+`EmptyId`, `DuplicateId`, and `IdentityExhausted`: pre-spawn builders
+cannot observe runtime or admission state. The public dynamic
+`ReserveError` is exhaustive and includes `NoRuntime`: it
 names the absent ambient runtime at dynamic reservation or first poll,
 with the cleanup and precedence pinned in §9. Dynamic `add_*` fails with
 exactly the union of its two halves (§9): `EmptyId`, `NoRuntime`,

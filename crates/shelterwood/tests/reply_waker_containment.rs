@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     future::Future,
     sync::Arc,
@@ -5,9 +7,9 @@ use std::{
     time::Duration,
 };
 
+use crate::common::next_exit_of;
 use shelterwood::{
-    Actor, ActorOnceDef, Context, ExitError, ExitKind, ExitResult, LifecycleEventKind,
-    LifecycleItem, Reply, StopReason, Tree,
+    Actor, ActorOnceDef, Context, ExitError, ExitKind, ExitResult, Reply, StopReason, Tree,
 };
 
 const HANDLER_PANIC: &str = "injected reply-owning handler panic";
@@ -83,25 +85,7 @@ async fn unanswered_reply_drop_during_handler_panic_contains_hostile_waker() {
         .await
         .expect("crashing message is accepted");
 
-    let exit = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match events.recv().await {
-                Some(LifecycleItem::Event(event)) => {
-                    if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
-                        && id.as_str() == "panicking-reply-owner"
-                    {
-                        return exit;
-                    }
-                }
-                Some(LifecycleItem::Lagged { dropped }) => {
-                    panic!("unexpected lifecycle lag marker dropping {dropped}");
-                }
-                None => panic!("lifecycle stream closed before the actor exit"),
-            }
-        }
-    })
-    .await
-    .expect("the actor publishes its contained exit");
+    let exit = next_exit_of(&mut events, "panicking-reply-owner").await;
     assert!(matches!(
         exit.kind(),
         ExitKind::Panicked { message: Some(message) } if message == HANDLER_PANIC

@@ -11,9 +11,10 @@ fn accepts_supported_token(_: &CancellationToken) {}
 #[cfg(feature = "installable-seams")]
 use shelterwood::{
     ActorIdentity, DynamicRoute, ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender,
-    MailboxCell, MailboxControl, MailboxRuntime, MailboxSignal, MailboxSignalWatcher,
-    MailboxTermination, MemberCell, ParentCancellationToken, ProxiedPoll, ProxiedSleep, ScopeCell,
-    WakerAction, WakerEffects, WakerProxy, WakerSlot, actor_ref_from_parts,
+    MailboxCell, MailboxControl, MailboxEffectQueue, MailboxEffectSink, MailboxRuntime,
+    MailboxSignal, MailboxSignalWatcher, MailboxTermination, MemberCell, ParentCancellationToken,
+    ProxiedPoll, ProxiedSleep, ScopeCell, WakerAction, WakerEffects, WakerProxy, WakerSlot,
+    actor_ref_from_parts,
 };
 
 fn main() {

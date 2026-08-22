@@ -194,10 +194,11 @@ impl StopLadder {
                 // only expedites `Cooperative`, and this ladder is already
                 // `Escalated`. The same applies to the framework tidy beat
                 // below once the ladder reaches `AbortingFramework`. This can
-                // park either phase only when `now` is within
-                // `Deadline::ARMING_HEADROOM` of `Instant`'s ceiling; accept
-                // that theoretical clock-boundary asymmetry rather than
-                // substituting an earlier public deadline.
+                // park either phase only when `now` is within the beat plus
+                // `Deadline::ARMING_HEADROOM` of `Instant`'s ceiling — the
+                // beat is capped at ten milliseconds, so just over a second;
+                // accept that theoretical clock-boundary asymmetry rather
+                // than substituting an earlier public deadline.
                 self.deadline = Deadline::after(now, tidy_abort_beat(beat)).instant();
                 Some(StopAction::Escalate)
             }
@@ -265,7 +266,8 @@ pub fn dispatch_exit(
     // Every supported producer terminalizes the membership directly and never
     // reaches dispatch, so arriving here is a framework bug. Fail before
     // charging a restart for an incarnation that never ran or publishing the
-    // inconsistent terminal projection that SPEC §B.3 excludes.
+    // inconsistent terminal projection that SPEC §B.4 excludes: a `Removed`
+    // edge pairs `last_incarnation: None` with never having started.
     assert!(
         !matches!(exit.kind(), ExitKind::NeverStarted),
         "NeverStarted is a membership outcome outside incarnation dispatch"

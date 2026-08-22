@@ -970,16 +970,25 @@ mod tests {
         let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::starting());
         let child = admit(&mut state, membership, true);
 
-        for event in [
-            Event::Spawned { child },
-            Event::StopStarted { child },
+        step(&mut state, Event::Spawned { child }, &mut Vec::new());
+        step(&mut state, Event::StopStarted { child }, &mut Vec::new());
+        // Pin the precondition too: without it a `StopStarted` that stopped
+        // transitioning would leave this an ordinary `Active` readiness test
+        // still passing under its own name.
+        assert_eq!(
+            state.child_state(child),
+            Some(ChildState::Resident(IncarnationState::Stopping))
+        );
+        assert!(!state.initial_ready(child));
+
+        step(
+            &mut state,
             Event::Ready {
                 child,
                 removal_latched: false,
             },
-        ] {
-            step(&mut state, event, &mut Vec::new());
-        }
+            &mut Vec::new(),
+        );
 
         assert!(state.initial_ready(child));
         state.check_invariants();

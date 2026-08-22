@@ -248,8 +248,8 @@ impl SharedOffloadState {
         // installed in the incarnation slot. Ledger reclamation consumes this
         // edge with the matching `Acquire` in `finished_published`; weakening
         // either side would let a reclaiming actor observe retirement without
-        // observing the recorded payload. No test pins that pairing — only
-        // this comment does.
+        // observing the recorded payload. The publication-witness unit test
+        // makes this edge the sole synchronization for a wake-side effect.
         self.finished_published.store(true, Ordering::Release);
     }
 
@@ -363,5 +363,84 @@ impl OffloadResource {
         });
         panics.record(retained.take());
         panics.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Poll, Wake, Waker},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use super::{Latch, RawDisposal, SharedOffloadState};
+
+    struct RelaxedWakeWitness(Arc<AtomicBool>);
+
+    impl Wake for RelaxedWakeWitness {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// `finished_published` is the sole synchronizes-with edge between the
+    /// producer's relaxed wake-side witness and this consumer's relaxed read.
+    /// Observing publication must therefore make every effect completed by
+    /// `notify` visible before ledger reclamation can discard the state.
+    #[test]
+    fn finished_publication_releases_wake_effect_to_reclaimer() {
+        const WAIT: Duration = Duration::from_secs(10);
+
+        let finished = Latch::default();
+        let woke = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(RelaxedWakeWitness(Arc::clone(&woke))));
+        let mut waiter = Box::pin(finished.fired());
+        assert_eq!(
+            waiter.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        );
+
+        let state = SharedOffloadState::new(
+            Box::pin(std::future::pending()),
+            RawDisposal::default(),
+            finished.clone(),
+        );
+        let producer = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || state.fire_finished())
+        };
+
+        let deadline = Instant::now() + WAIT;
+        let published = loop {
+            if state.finished_published() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::yield_now();
+        };
+        // Sample before joining: joining the producer would add a second
+        // synchronization edge and let a weakened publication pair pass.
+        let wake_visible_after_acquire = woke.load(Ordering::Relaxed);
+        producer
+            .join()
+            .expect("completion publisher does not panic");
+
+        assert!(published, "completion publication did not arrive");
+        assert!(
+            wake_visible_after_acquire,
+            "publication exposed retirement before the completed wake's effects"
+        );
     }
 }

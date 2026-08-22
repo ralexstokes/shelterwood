@@ -31,12 +31,14 @@
 //! # Quickstart
 //!
 //! A counter actor with a request/reply protocol, spawned under an ordered
-//! tree inside an ambient Tokio runtime:
+//! tree inside an ambient Tokio runtime. The opening glob is
+//! [`prelude`]; every name it brings in also lives at the crate root,
+//! which is where each one is documented.
 //!
 //! ```rust
 //! use std::time::Duration;
 //!
-//! use shelterwood::{Actor, ActorDef, Context, ExitError, ExitResult, Reply, Tree};
+//! use shelterwood::prelude::*;
 //!
 //! struct Counter {
 //!     count: u64,
@@ -80,6 +82,17 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Prelude
+//!
+//! [`prelude`] re-exports the names a program has to write down —
+//! [`Actor`], [`Context`], the handles, the tree types — so a file can
+//! open with one glob. Its submodules ([`prelude::policy`],
+//! [`prelude::observe`], [`prelude::errors`], [`prelude::raw`],
+//! [`prelude::wiring`]) bundle one area each. Neither ring adds surface:
+//! the crate root below is canonical and complete, and it is where every
+//! item is documented. See [`prelude`] for the admission rule, the
+//! [`Context`] name collision, and the standing glob caveat.
 //!
 //! # The API by area
 //!
@@ -250,6 +263,8 @@ pub use tree::{
     DynamicTree, Removal, StartOrShutdownError, Subtree, SubtreeDef, SubtreeOnceDef, SubtreeSlot,
     System, TaskSlot, Tree,
 };
+
+pub mod prelude;
 
 /// Long-form operational guides, rendered with the API reference.
 ///

@@ -1,5 +1,7 @@
-use shelterwood::{ExitError, StopReason, TaskOnceDef, Tree};
+use shelterwood::prelude::{errors::StopReason, *};
 
+/// The prelude is reachable from outside the workspace and carries enough
+/// to declare, spawn, and join a system without naming a crate-root path.
 #[test]
 fn default_feature_consumer_runs_a_supervised_task_to_completion() {
     let runtime = tokio::runtime::Builder::new_current_thread()

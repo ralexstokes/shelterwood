@@ -56,6 +56,26 @@ struct LatestDisplacementMessage {
     displaced: Option<mpsc::Sender<(bool, Option<u8>)>>,
 }
 
+struct PanickingDisplacementMessage {
+    value: u8,
+    mailbox: Weak<MailboxCell<PanickingDisplacementMessage>>,
+    displaced: Option<mpsc::Sender<bool>>,
+}
+
+impl Drop for PanickingDisplacementMessage {
+    fn drop(&mut self) {
+        let Some(displaced) = self.displaced.take() else {
+            return;
+        };
+        let unlocked = self
+            .mailbox
+            .upgrade()
+            .is_none_or(|mailbox| mailbox.state.try_lock().is_ok());
+        let _ = displaced.send(unlocked);
+        panic!("injected displaced-message destructor panic");
+    }
+}
+
 impl Drop for LatestDisplacementMessage {
     fn drop(&mut self) {
         let Some(displaced) = self.displaced.take() else {
@@ -527,7 +547,7 @@ fn accepted_sequence_boundary_is_inclusive_and_live_only_refuses_frozen_input() 
     assert_eq!(
         receiver.try_recv(),
         Some(3),
-        "IncludeFrozen drains the same payload LiveOnly refuses"
+        "Drain receives the same frozen payload LiveThrough refuses"
     );
 
     let (latest_mailbox, latest_actor) = actor();
@@ -965,6 +985,102 @@ fn live_latest_displacement_drops_after_unlock_and_replacement_visibility() {
 }
 
 #[test]
+fn latest_displacement_contains_a_panicking_payload_destructor() {
+    let mailbox = MailboxCell::new(
+        ChildId::from("actor"),
+        crate::mailbox::capability::tests::runtime(),
+    );
+    let token = configure(&mailbox, ResolvedMailbox::Latest);
+    let incarnation = mint_actor_incarnation();
+    bind(&mailbox, token, incarnation);
+    let weak = Arc::downgrade(&mailbox);
+    let (displaced, observed) = mpsc::channel();
+
+    assert!(matches!(
+        mailbox.submit(PanickingDisplacementMessage {
+            value: 1,
+            mailbox: Weak::clone(&weak),
+            displaced: Some(displaced),
+        }),
+        super::Submission::Accepted(bound) if bound == incarnation
+    ));
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _ = mailbox.submit(PanickingDisplacementMessage {
+            value: 2,
+            mailbox: weak,
+            displaced: None,
+        });
+    }));
+    assert!(
+        panic.is_err(),
+        "the hostile destructor panic reaches the caller"
+    );
+    assert!(
+        observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the displaced payload reports its drop context"),
+        "the displaced payload is destroyed after mailbox unlock"
+    );
+
+    let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+    let replacement = receiver
+        .try_recv()
+        .expect("the replacement remains readable after displacement panics");
+    assert_eq!(replacement.value, 2);
+}
+
+#[test]
+fn latest_incarnation_mismatch_uses_the_nonparking_post_unlock_path() {
+    let mailbox = MailboxCell::new(
+        ChildId::from("actor"),
+        crate::mailbox::capability::tests::runtime(),
+    );
+    let token = configure(&mailbox, ResolvedMailbox::Latest);
+    let (bound, mismatched) = two_incarnations();
+    bind(&mailbox, token, bound);
+    let (dropped, observed) = mpsc::channel();
+
+    let mut transaction = super::MailboxTxn::new(&mailbox);
+    let transition = {
+        let (state, effects) = transaction.parts();
+        super::accept_locked(
+            state,
+            mismatched,
+            ThreadRecordingMessage(Some(dropped)),
+            &mailbox.accepted,
+            effects,
+        )
+    };
+    let transition = transaction.finish(transition);
+    let super::AcceptTransition::IncarnationMismatch(message) = transition else {
+        panic!("a Latest mismatch must not use the queue-only Full transition");
+    };
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        super::reject_incarnation_mismatch(&mailbox.runtime, message);
+    }))
+    .expect_err("the invariant diagnostic reaches the caller");
+    assert_eq!(
+        panic.downcast_ref::<&'static str>().copied(),
+        Some("an accepting transition observes its own binding's incarnation")
+    );
+    let destructor_thread = observed
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the rejected message reaches detached disposal");
+    assert_ne!(
+        destructor_thread,
+        std::thread::current().id(),
+        "the rejected user message is isolated before the diagnostic"
+    );
+    drop(
+        mailbox
+            .state
+            .lock()
+            .expect("the mismatch diagnostic does not poison the mailbox"),
+    );
+}
+
+#[test]
 fn bind_observes_waiters_that_remain_parked_beyond_capacity() {
     let (mailbox, _) = actor();
     let token = configure(
@@ -1108,10 +1224,118 @@ fn configuration_mismatch_panics_after_releasing_the_mailbox_lock() {
             .lock()
             .expect("configuration panic occurs after unlocking")
             .kind,
-        Some(super::MailboxKind::Queue(
+        Some(ResolvedMailbox::Queue(
             std::num::NonZeroUsize::new(1).expect("non-zero queue capacity")
         ))
     );
+}
+
+#[test]
+fn bind_after_terminal_is_silently_ignored() {
+    let (mailbox, _) = actor();
+    let token = configure(&mailbox, ResolvedDefaults::default().mailbox());
+    let teardown = prepare_termination(&mailbox).expect("the mailbox terminalizes");
+
+    bind(&mailbox, token, mint_actor_incarnation());
+    assert!(matches!(
+        mailbox.state.lock().expect("mailbox state").binding,
+        super::MailboxBinding::Terminal(None)
+    ));
+    drop(teardown.finish());
+}
+
+#[test]
+fn bind_requires_prior_configuration_without_poisoning_the_mailbox() {
+    let (mailbox, _) = actor();
+    let token = {
+        let state = mailbox.state.lock().expect("mailbox state");
+        crate::mailbox::MailboxBindToken::new(Arc::clone(&state.bind_permit))
+    };
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        bind(&mailbox, token, mint_actor_incarnation());
+    }))
+    .expect_err("an unconfigured mailbox rejects bind");
+    assert_eq!(
+        panic.downcast_ref::<&'static str>().copied(),
+        Some("mailbox must be configured before its first bind")
+    );
+    drop(
+        mailbox
+            .state
+            .lock()
+            .expect("the configuration guard panics after unlock"),
+    );
+}
+
+#[test]
+fn bind_requires_the_prior_incarnation_to_close() {
+    let (mailbox, _) = actor();
+    let token = configure(&mailbox, ResolvedDefaults::default().mailbox());
+    let first = mint_actor_incarnation();
+    bind(&mailbox, token, first);
+    let (foreign, _) = actor();
+    let foreign_token = configure(&foreign, ResolvedDefaults::default().mailbox());
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        bind(&mailbox, foreign_token, mint_actor_incarnation());
+    }))
+    .expect_err("a live incarnation rejects rebinding");
+    assert_eq!(
+        panic.downcast_ref::<&'static str>().copied(),
+        Some("mailbox must close the prior incarnation before rebinding")
+    );
+    assert_eq!(
+        mailbox
+            .state
+            .lock()
+            .expect("the prior-close guard panics after unlock")
+            .status(),
+        super::BindingStatus::Bound(first)
+    );
+}
+
+#[test]
+fn bind_rejects_a_foreign_token_without_consuming_the_valid_one() {
+    let (mailbox, _) = actor();
+    let valid = configure(&mailbox, ResolvedDefaults::default().mailbox());
+    let (foreign, _) = actor();
+    let foreign_token = configure(&foreign, ResolvedDefaults::default().mailbox());
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        bind(&mailbox, foreign_token, mint_actor_incarnation());
+    }))
+    .expect_err("a foreign token cannot bind the mailbox");
+    assert_eq!(
+        panic.downcast_ref::<&'static str>().copied(),
+        Some("mailbox bind token is foreign or was already consumed")
+    );
+
+    bind(&mailbox, valid, mint_actor_incarnation());
+}
+
+#[test]
+fn repeated_configuration_tokens_share_one_consumable_permit() {
+    let (mailbox, _) = actor();
+    let policy = ResolvedDefaults::default().mailbox();
+    let first_token = configure(&mailbox, policy);
+    let alias = configure(&mailbox, policy);
+    let first = mint_actor_incarnation();
+    bind(&mailbox, first_token, first);
+    let closed = close(&mailbox, first).expect("the first incarnation closes");
+    let (next_token, payload) = closed.into_parts();
+    drop(payload);
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        bind(&mailbox, alias, mint_actor_incarnation());
+    }))
+    .expect_err("the alias cannot bind after the shared permit was consumed");
+    assert_eq!(
+        panic.downcast_ref::<&'static str>().copied(),
+        Some("mailbox bind token is foreign or was already consumed")
+    );
+
+    bind(&mailbox, next_token, mint_actor_incarnation());
 }
 
 #[test]
@@ -1540,7 +1764,7 @@ fn accepted_sequence_exhaustion_poison_is_never_minted() {
 }
 
 #[test]
-fn waiter_identity_exhaustion_drops_the_message_after_unlock() {
+fn waiter_identity_exhaustion_disposes_the_message_on_the_detached_lane() {
     let mailbox = MailboxCell::new(
         ChildId::from("actor"),
         crate::mailbox::capability::tests::runtime(),
@@ -1550,33 +1774,28 @@ fn waiter_identity_exhaustion_drops_the_message_after_unlock() {
             ids: crate::identity::PoisonedCounter::near_exhaustion(),
             ..super::WaiterQueue::default()
         });
-    let weak = Arc::downgrade(&mailbox);
     assert!(matches!(
-        mailbox.submit(LockCheckingMessage {
-            mailbox: Weak::clone(&weak),
-            dropped: None,
-        }),
+        mailbox.submit(ThreadRecordingMessage(None)),
         super::Submission::Parked(_)
     ));
     let (dropped, observed) = mpsc::channel();
+    let caller = std::thread::current().id();
 
     let panic = catch_unwind(AssertUnwindSafe(|| {
-        let _ = mailbox.submit(LockCheckingMessage {
-            mailbox: weak,
-            dropped: Some(dropped),
-        });
+        let _ = mailbox.submit(ThreadRecordingMessage(Some(dropped)));
     }));
     assert!(panic.is_err(), "exhaustion is reported to the caller");
-    assert!(
+    assert_ne!(
         observed
             .recv_timeout(Duration::from_secs(5))
             .expect("isolated message destructor reports"),
-        "the exhausted message is destroyed outside the mailbox mutex"
+        caller,
+        "the exhausted message is destroyed on the detached disposal lane"
     );
 }
 
 #[test]
-fn accepted_sequence_exhaustion_drops_the_message_after_unlock() {
+fn accepted_sequence_exhaustion_disposes_the_message_on_the_detached_lane() {
     let mut mailbox = MailboxCell::new(
         ChildId::from("actor"),
         crate::mailbox::capability::tests::runtime(),
@@ -1586,28 +1805,23 @@ fn accepted_sequence_exhaustion_drops_the_message_after_unlock() {
         .accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
     let token = configure(&mailbox, ResolvedMailbox::Latest);
     bind(&mailbox, token, mint_actor_incarnation());
-    let weak = Arc::downgrade(&mailbox);
     assert!(matches!(
-        mailbox.submit(LockCheckingMessage {
-            mailbox: Weak::clone(&weak),
-            dropped: None,
-        }),
+        mailbox.submit(ThreadRecordingMessage(None)),
         super::Submission::Accepted(_)
     ));
     let (dropped, observed) = mpsc::channel();
+    let caller = std::thread::current().id();
 
     let panic = catch_unwind(AssertUnwindSafe(|| {
-        let _ = mailbox.submit(LockCheckingMessage {
-            mailbox: weak,
-            dropped: Some(dropped),
-        });
+        let _ = mailbox.submit(ThreadRecordingMessage(Some(dropped)));
     }));
     assert!(panic.is_err(), "exhaustion is reported to the caller");
-    assert!(
+    assert_ne!(
         observed
             .recv_timeout(Duration::from_secs(5))
             .expect("isolated message destructor reports"),
-        "the exhausted message is destroyed outside the mailbox mutex"
+        caller,
+        "the exhausted message is destroyed on the detached disposal lane"
     );
 }
 
@@ -1729,21 +1943,13 @@ fn bind_sequence_exhaustion_retains_parked_senders_after_unlock() {
         .expect("mailbox is uniquely owned")
         .accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
     let token = configure(&mailbox, ResolvedMailbox::Latest);
-    let weak = Arc::downgrade(&mailbox);
-    let first = match mailbox.submit(LockCheckingMessage {
-        mailbox: Weak::clone(&weak),
-        dropped: None,
-    }) {
+    let first = match mailbox.submit(1_u8) {
         super::Submission::Parked(operation) => operation,
         super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
             panic!("an unbound mailbox parks its send")
         }
     };
-    let (dropped, observed) = mpsc::channel();
-    let second = match mailbox.submit(LockCheckingMessage {
-        mailbox: weak,
-        dropped: Some(dropped),
-    }) {
+    let second = match mailbox.submit(2_u8) {
         super::Submission::Parked(operation) => operation,
         super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
             panic!("an unbound mailbox parks its send")
@@ -1778,11 +1984,5 @@ fn bind_sequence_exhaustion_retains_parked_senders_after_unlock() {
         "the unpromotable sender still owns its message"
     );
     withdrawal.finish();
-    assert!(
-        observed
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the parked message destructor reports"),
-        "the parked message is destroyed outside the mailbox mutex"
-    );
     drop(first);
 }

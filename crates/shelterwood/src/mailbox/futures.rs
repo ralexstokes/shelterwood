@@ -818,7 +818,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
-        task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
+        task::{Context, Poll, Wake, Waker},
         thread::ThreadId,
         time::Duration,
     };
@@ -828,7 +828,7 @@ mod tests {
     use crate::{
         mailbox::{
             CallErrorKind, Incarnation, MailboxControl, MailboxEffectQueue, MailboxReceiver, Reply,
-            test_support::mint_actor_incarnation,
+            test_support::{mint_actor_incarnation, probe_waker},
         },
         policy::ResolvedMailbox,
     };
@@ -1143,39 +1143,6 @@ mod tests {
         }
     }
 
-    unsafe fn clone_operation_lock_probe(data: *const ()) -> RawWaker {
-        // SAFETY: every pointer using this vtable was produced by
-        // `Arc::into_raw` for an `OperationLockProbe`. `ManuallyDrop` preserves
-        // the reference represented by `data`; the returned raw waker owns the
-        // newly cloned reference.
-        let probe = ManuallyDrop::new(unsafe { Arc::<OperationLockProbe>::from_raw(data.cast()) });
-        probe.assert_operation_unlocked("clone");
-        probe.calls.clones.fetch_add(1, Ordering::SeqCst);
-        let cloned = Arc::clone(&probe);
-        RawWaker::new(Arc::into_raw(cloned).cast(), &OPERATION_LOCK_PROBE_VTABLE)
-    }
-
-    unsafe fn wake_operation_lock_probe(data: *const ()) {
-        // SAFETY: `wake` consumes the raw-waker reference represented by data.
-        drop(unsafe { Arc::<OperationLockProbe>::from_raw(data.cast()) });
-    }
-
-    unsafe fn wake_operation_lock_probe_by_ref(_data: *const ()) {}
-
-    unsafe fn drop_operation_lock_probe(data: *const ()) {
-        // SAFETY: `drop` consumes the raw-waker reference represented by data.
-        let probe = unsafe { Arc::<OperationLockProbe>::from_raw(data.cast()) };
-        probe.assert_operation_unlocked("drop");
-        probe.calls.drops.fetch_add(1, Ordering::SeqCst);
-    }
-
-    static OPERATION_LOCK_PROBE_VTABLE: RawWakerVTable = RawWakerVTable::new(
-        clone_operation_lock_probe,
-        wake_operation_lock_probe,
-        wake_operation_lock_probe_by_ref,
-        drop_operation_lock_probe,
-    );
-
     fn operation_lock_probe_waker(
         operation: &Arc<SendOperation<u8>>,
         calls: Arc<WakerVtableCalls>,
@@ -1184,10 +1151,17 @@ mod tests {
             operation: Arc::downgrade(operation),
             calls,
         });
-        let raw = RawWaker::new(Arc::into_raw(probe).cast(), &OPERATION_LOCK_PROBE_VTABLE);
-        // SAFETY: `raw` owns one `OperationLockProbe` reference and its vtable
-        // maintains that reference count for every clone, wake, and drop.
-        unsafe { Waker::from_raw(raw) }
+        let clone_probe = Arc::clone(&probe);
+        probe_waker(
+            move || {
+                clone_probe.assert_operation_unlocked("clone");
+                clone_probe.calls.clones.fetch_add(1, Ordering::SeqCst);
+            },
+            move || {
+                probe.assert_operation_unlocked("drop");
+                probe.calls.drops.fetch_add(1, Ordering::SeqCst);
+            },
+        )
     }
 
     #[test]
@@ -1353,49 +1327,14 @@ mod tests {
         _payload: ThreadRecordingDrop,
     }
 
-    struct EveryWakerDropPanics(DisposalThread);
-
-    unsafe fn clone_panicking_drop_waker(data: *const ()) -> RawWaker {
-        // SAFETY: every pointer using this vtable came from an Arc of the
-        // matching type. ManuallyDrop preserves the reference represented by
-        // `data`; the returned raw waker owns only the new clone.
-        let probe =
-            ManuallyDrop::new(unsafe { Arc::<EveryWakerDropPanics>::from_raw(data.cast()) });
-        RawWaker::new(
-            Arc::into_raw(Arc::clone(&probe)).cast(),
-            &PANICKING_DROP_WAKER_VTABLE,
-        )
-    }
-
-    unsafe fn wake_panicking_drop_waker(data: *const ()) {
-        // SAFETY: wake consumes the reference represented by this raw waker.
-        drop(unsafe { Arc::<EveryWakerDropPanics>::from_raw(data.cast()) });
-    }
-
-    unsafe fn wake_by_ref_panicking_drop_waker(_data: *const ()) {}
-
-    unsafe fn drop_panicking_drop_waker(data: *const ()) {
-        // SAFETY: drop consumes the reference represented by this raw waker.
-        let probe = unsafe { Arc::<EveryWakerDropPanics>::from_raw(data.cast()) };
-        record_disposal(&probe.0);
-        panic!("injected call waker drop panic");
-    }
-
-    static PANICKING_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-        clone_panicking_drop_waker,
-        wake_panicking_drop_waker,
-        wake_by_ref_panicking_drop_waker,
-        drop_panicking_drop_waker,
-    );
-
     fn panicking_drop_waker(recorder: DisposalThread) -> Waker {
-        let raw = RawWaker::new(
-            Arc::into_raw(Arc::new(EveryWakerDropPanics(recorder))).cast(),
-            &PANICKING_DROP_WAKER_VTABLE,
-        );
-        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-        // ownership across clone, wake, and drop.
-        unsafe { Waker::from_raw(raw) }
+        probe_waker(
+            || {},
+            move || {
+                record_disposal(&recorder);
+                panic!("injected call waker drop panic");
+            },
+        )
     }
 
     /// Parks `send` behind a hostile waker and releases the caller's own

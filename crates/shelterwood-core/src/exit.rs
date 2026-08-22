@@ -565,19 +565,21 @@ impl PartialEq for Exit {
 impl Eq for Exit {}
 
 fn exit_kind_eq(left: &ExitKind, right: &ExitKind) -> bool {
-    match (left, right) {
-        (ExitKind::Completed, ExitKind::Completed)
-        | (ExitKind::NeverStarted, ExitKind::NeverStarted) => true,
-        (ExitKind::Failed(left), ExitKind::Failed(right)) => Arc::ptr_eq(&left.0, &right.0),
-        (ExitKind::Panicked { message: left }, ExitKind::Panicked { message: right }) => {
-            left == right
+    match left {
+        ExitKind::Completed => matches!(right, ExitKind::Completed),
+        ExitKind::Failed(left) => {
+            matches!(right, ExitKind::Failed(right) if Arc::ptr_eq(&left.0, &right.0))
         }
-        (
-            ExitKind::ReadinessTimedOut { deadline: left },
-            ExitKind::ReadinessTimedOut { deadline: right },
-        ) => left == right,
-        (ExitKind::Aborted { phase: left }, ExitKind::Aborted { phase: right }) => left == right,
-        _ => false,
+        ExitKind::Panicked { message: left } => {
+            matches!(right, ExitKind::Panicked { message: right } if left == right)
+        }
+        ExitKind::ReadinessTimedOut { deadline: left } => {
+            matches!(right, ExitKind::ReadinessTimedOut { deadline: right } if left == right)
+        }
+        ExitKind::Aborted { phase: left } => {
+            matches!(right, ExitKind::Aborted { phase: right } if left == right)
+        }
+        ExitKind::NeverStarted => matches!(right, ExitKind::NeverStarted),
     }
 }
 
@@ -998,6 +1000,7 @@ mod tests {
                 None,
                 Cancellation::NotObserved,
                 Exit::completed(Cancellation::NotObserved),
+                None,
             ),
             (
                 "cancellation overrides recorded completion",
@@ -1011,6 +1014,7 @@ mod tests {
                     },
                     Cancellation::Observed,
                 ),
+                Some(Exit::completed(Cancellation::Observed)),
             ),
             (
                 "recorded failure",
@@ -1019,6 +1023,7 @@ mod tests {
                 None,
                 Cancellation::NotObserved,
                 Exit::failed(failure.clone(), Cancellation::NotObserved),
+                None,
             ),
             (
                 "late cancellation preserves recorded failure",
@@ -1027,6 +1032,10 @@ mod tests {
                 Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
                 Exit::failed(failure.clone(), Cancellation::Observed),
+                Some(Exit::aborted(
+                    GracePhase::AfterGrace,
+                    Cancellation::Observed,
+                )),
             ),
             (
                 "join panic overrides recorded failure",
@@ -1042,6 +1051,7 @@ mod tests {
                     },
                     Cancellation::NotObserved,
                 ),
+                Some(Exit::failed(failure.clone(), Cancellation::NotObserved)),
             ),
             (
                 "readiness timeout overrides cancellation",
@@ -1053,6 +1063,10 @@ mod tests {
                     ExitKind::ReadinessTimedOut { deadline },
                     Cancellation::Observed,
                 ),
+                Some(Exit::aborted(
+                    GracePhase::AfterGrace,
+                    Cancellation::Observed,
+                )),
             ),
             (
                 "join panic overrides recorded completion",
@@ -1068,6 +1082,7 @@ mod tests {
                     },
                     Cancellation::NotObserved,
                 ),
+                Some(Exit::completed(Cancellation::NotObserved)),
             ),
             (
                 "earlier recorded panic wins a tie",
@@ -1085,6 +1100,10 @@ mod tests {
                     },
                     Cancellation::Observed,
                 ),
+                Some(Exit::panicked(
+                    Some("drop panic".to_owned()),
+                    Cancellation::Observed,
+                )),
             ),
             (
                 "earlier recorded abort wins a tie",
@@ -1098,6 +1117,10 @@ mod tests {
                     },
                     Cancellation::Observed,
                 ),
+                Some(Exit::aborted(
+                    GracePhase::AfterGrace,
+                    Cancellation::Observed,
+                )),
             ),
             (
                 "cancelled join without a hard abort fails closed to within grace",
@@ -1111,6 +1134,7 @@ mod tests {
                     },
                     Cancellation::Observed,
                 ),
+                None,
             ),
             (
                 "hard abort phase is ignored when the join completed normally",
@@ -1119,6 +1143,7 @@ mod tests {
                 Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
                 Exit::completed(Cancellation::Observed),
+                None,
             ),
             (
                 "join cancellation supplies a missing outcome",
@@ -1132,6 +1157,7 @@ mod tests {
                     },
                     Cancellation::Observed,
                 ),
+                None,
             ),
             (
                 "missing outcome fails closed",
@@ -1145,13 +1171,17 @@ mod tests {
                     },
                     Cancellation::NotObserved,
                 ),
+                None,
             ),
         ];
 
-        for (case, recorded, join, hard_abort_phase, cancellation, expected) in cases {
-            let (classified, _discarded) =
+        for (case, recorded, join, hard_abort_phase, cancellation, expected, expected_discarded) in
+            cases
+        {
+            let (classified, discarded) =
                 classify_exit(recorded, join, hard_abort_phase, cancellation);
             assert_eq!(classified, expected, "{case}");
+            assert_eq!(discarded, expected_discarded, "{case}: discarded exit");
         }
     }
 

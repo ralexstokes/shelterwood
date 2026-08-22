@@ -14,7 +14,10 @@ use crate::{
 /// The first poll uses a framework no-op waker, preserving the already-ready
 /// fast path without cloning a caller waker. A pending result installs the
 /// stable proxy, registers the real caller behind it, and immediately polls
-/// again so the external primitive never retains a raw caller waker.
+/// again so the external primitive never retains a raw caller waker. The
+/// target must expose readiness level-wise across that probe and re-poll: a
+/// wake delivered to the no-op probe is recovered only when the immediate
+/// re-poll observes the state change that prompted it.
 ///
 /// Ready retirement is uniform and part of every poll: a ready result may own
 /// a user value (or a panic payload that owns one), so the stored caller
@@ -100,21 +103,17 @@ impl ProxiedPoll {
     /// Retires the current caller registration into a mailbox effects sink.
     #[doc(hidden)]
     pub fn retire(&mut self, action: WakerAction, effects: &mut WakerEffects) {
-        let proxy = self.proxy.take();
-        if let Some(proxy) = &proxy {
+        if let Some(proxy) = self.proxy.take() {
             proxy.retire(action, effects);
         }
-        drop(proxy);
     }
 
     /// Retires the current caller registration through a cross-crate effect.
     #[doc(hidden)]
     pub fn retire_with(&mut self, effect: fn(Waker), panics: &mut PanicAccumulator) {
-        let proxy = self.proxy.take();
-        if let Some(proxy) = &proxy {
+        if let Some(proxy) = self.proxy.take() {
             proxy.retire_with(effect, panics);
         }
-        panics.run(|| drop(proxy));
     }
 }
 
@@ -288,10 +287,16 @@ impl Wake for WakerProxyState {
         let mut effects = WakerEffects::default();
         {
             let mut registration = self.caller.lock().expect("waker proxy mutex poisoned");
-            // Recorded whether or not a caller waker is installed: an empty
-            // slot means the wake landed in `register`'s clone window, and the
-            // flag is the only thing that will carry it to the caller polling
-            // now. See `WakerProxy::register`.
+            // Record every wake, whether or not a caller is installed. An
+            // empty slot can mean the wake landed in `register`'s clone
+            // window; an occupied slot can hold the previous task's waker
+            // after migration. This leaf state cannot distinguish either case
+            // from an ordinary wake of the caller polling now, so it leaves
+            // the flag set after delivering that wake too. The next
+            // registration therefore installs, reads the flag, and takes its
+            // fresh waker straight back out: one extra clone and one spurious
+            // poll per delivered wake, which the `Future` contract permits —
+            // a lost wake is not. See `WakerProxy::register`.
             registration.woken = true;
             registration.caller.take(WakerAction::Wake, &mut effects);
         }
@@ -306,11 +311,14 @@ mod tests {
             Arc, Weak,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
-        task::{RawWaker, RawWakerVTable, Wake, Waker},
+        task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
     };
 
-    use super::{WakerProxy, WakerProxyState};
-    use crate::waker::{WakerAction, WakerEffects};
+    use super::{ProxiedPoll, WakerProxy, WakerProxyState};
+    use crate::{
+        panic::PanicAccumulator,
+        waker::{WakerAction, WakerEffects},
+    };
 
     #[derive(Default)]
     struct CountWake(AtomicUsize);
@@ -465,6 +473,98 @@ mod tests {
         unsafe { Waker::from_raw(raw) }
     }
 
+    #[derive(Default)]
+    struct PanickingDropWaker {
+        drops: AtomicUsize,
+    }
+
+    unsafe fn clone_panicking_drop(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable came from an Arc of the
+        // matching type. ManuallyDrop preserves the reference represented by
+        // `data`; the returned raw waker owns only the new clone.
+        let state = ManuallyDrop::new(unsafe { Arc::<PanickingDropWaker>::from_raw(data.cast()) });
+        RawWaker::new(
+            Arc::into_raw(Arc::clone(&state)).cast(),
+            &PANICKING_DROP_VTABLE,
+        )
+    }
+
+    unsafe fn wake_panicking_drop(data: *const ()) {
+        // SAFETY: wake consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<PanickingDropWaker>::from_raw(data.cast()) });
+    }
+
+    unsafe fn wake_by_ref_panicking_drop(_data: *const ()) {}
+
+    unsafe fn drop_panicking_drop(data: *const ()) {
+        // SAFETY: drop consumes the Arc reference represented by this waker.
+        let state = unsafe { Arc::<PanickingDropWaker>::from_raw(data.cast()) };
+        let first_drop = state.drops.fetch_add(1, Ordering::SeqCst) == 0;
+        drop(state);
+        if first_drop {
+            panic!("hostile caller-waker destructor");
+        }
+    }
+
+    static PANICKING_DROP_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_panicking_drop,
+        wake_panicking_drop,
+        wake_by_ref_panicking_drop,
+        drop_panicking_drop,
+    );
+
+    fn panicking_drop_waker(state: &Arc<PanickingDropWaker>) -> Waker {
+        let raw = RawWaker::new(
+            Arc::into_raw(Arc::clone(state)).cast(),
+            &PANICKING_DROP_VTABLE,
+        );
+        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
+        // ownership across clone, wake, and drop.
+        unsafe { Waker::from_raw(raw) }
+    }
+
+    struct ReadyPayload(Arc<AtomicUsize>);
+
+    impl Drop for ReadyPayload {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct PendingThenPayload {
+        polls: usize,
+        payload_drops: Arc<AtomicUsize>,
+    }
+
+    impl PendingThenPayload {
+        fn poll(&mut self, _context: &mut Context<'_>) -> Poll<ReadyPayload> {
+            self.polls += 1;
+            if self.polls < 3 {
+                Poll::Pending
+            } else {
+                Poll::Ready(ReadyPayload(Arc::clone(&self.payload_drops)))
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct AlwaysPending {
+        polls: usize,
+        registered: Option<Waker>,
+    }
+
+    impl AlwaysPending {
+        fn poll(&mut self, context: &mut Context<'_>) -> Poll<()> {
+            self.polls += 1;
+            self.registered = Some(context.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn forward_wake(waker: Waker) {
+        waker.wake();
+    }
+
     #[test]
     fn registration_keeps_a_stable_proxy_identity_across_replacements() {
         let proxy = WakerProxy::new();
@@ -535,6 +635,33 @@ mod tests {
     }
 
     #[test]
+    fn a_delivered_wake_leaves_its_record_set_for_the_next_registration() {
+        let proxy = WakerProxy::new();
+        let delivered = Arc::new(CountWake::default());
+        proxy.register(&Waker::from(Arc::clone(&delivered)));
+
+        // An ordinary delivered wake: the caller polling now is installed, so
+        // nothing raced the registration and nothing is stale.
+        proxy.waker().wake_by_ref();
+        assert_eq!(delivered.0.load(Ordering::SeqCst), 1);
+
+        let next = Arc::new(CountWake::default());
+        proxy.register(&Waker::from(Arc::clone(&next)));
+
+        // The record is nonetheless left set, because this leaf state cannot
+        // tell that delivery apart from the racing one
+        // `a_window_wake_consuming_the_previous_caller_still_reaches_the_new_one`
+        // covers. That indistinguishability is what forces the spurious wake
+        // onto the ordinary path too, so the common case is pinned beside the
+        // race rather than left to the comment.
+        assert_eq!(
+            next.0.load(Ordering::SeqCst),
+            1,
+            "a delivered wake still wakes the caller that registers after it"
+        );
+    }
+
+    #[test]
     fn retirement_discards_an_unconsumed_wake_record() {
         let proxy = WakerProxy::new();
         proxy.waker().wake_by_ref();
@@ -554,15 +681,20 @@ mod tests {
     }
 
     #[test]
-    fn registration_clones_the_caller_after_unlock() {
+    fn retire_with_runs_its_cross_crate_effect_after_unlock() {
         let proxy = WakerProxy::new();
-        let clones = Arc::new(AtomicUsize::new(0));
-        let caller = reentrant_clone_waker(Arc::downgrade(&proxy.state), Arc::clone(&clones));
-
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let caller = Waker::from(Arc::new(ReentrantWake {
+            proxy: Arc::downgrade(&proxy.state),
+            wakes: Arc::clone(&wakes),
+        }));
         proxy.register(&caller);
-        proxy.register(&caller);
 
-        assert_eq!(clones.load(Ordering::SeqCst), 1);
+        let mut panics = PanicAccumulator::default();
+        proxy.retire_with(forward_wake, &mut panics);
+
+        assert!(panics.take().is_none());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -599,5 +731,107 @@ mod tests {
         drop(caller);
 
         drop(proxy);
+    }
+
+    #[test]
+    fn ready_retirement_contains_a_hostile_waker_drop_and_returns_the_payload() {
+        let waker_state = Arc::new(PanickingDropWaker::default());
+        let mut caller = ManuallyDrop::new(panicking_drop_waker(&waker_state));
+        let mut context = Context::from_waker(&caller);
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let mut target = PendingThenPayload {
+            polls: 0,
+            payload_drops: Arc::clone(&payload_drops),
+        };
+        let mut proxied = ProxiedPoll::new();
+
+        assert!(
+            proxied
+                .poll(
+                    &mut target,
+                    &mut context,
+                    PendingThenPayload::poll,
+                    Poll::is_pending
+                )
+                .is_pending()
+        );
+        let Poll::Ready(payload) = proxied.poll(
+            &mut target,
+            &mut context,
+            PendingThenPayload::poll,
+            Poll::is_pending,
+        ) else {
+            panic!("the third target poll is ready");
+        };
+
+        assert_eq!(
+            waker_state.drops.load(Ordering::SeqCst),
+            1,
+            "ready retirement ran and contained the hostile caller clone's destructor"
+        );
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
+        assert!(!proxied.is_parked());
+        drop(payload);
+        assert_eq!(
+            payload_drops.load(Ordering::SeqCst),
+            1,
+            "the ready payload survived retirement and reached the caller"
+        );
+
+        // The first (proxied) clone was the hostile drop. The original caller
+        // can now be reclaimed without raising a second panic.
+        drop(unsafe { ManuallyDrop::take(&mut caller) });
+    }
+
+    #[test]
+    fn polling_after_retirement_rearms_with_a_fresh_proxy() {
+        let wakes = Arc::new(CountWake::default());
+        let caller = Waker::from(Arc::clone(&wakes));
+        let mut context = Context::from_waker(&caller);
+        let mut target = AlwaysPending::default();
+        let mut proxied = ProxiedPoll::new();
+
+        assert!(
+            proxied
+                .poll(
+                    &mut target,
+                    &mut context,
+                    AlwaysPending::poll,
+                    Poll::is_pending
+                )
+                .is_pending()
+        );
+        let stale = target
+            .registered
+            .as_ref()
+            .expect("the pending target retains the first proxy")
+            .clone();
+
+        let mut effects = WakerEffects::default();
+        proxied.retire(WakerAction::DropInline, &mut effects);
+        drop(effects);
+        assert!(!proxied.is_parked());
+
+        assert!(
+            proxied
+                .poll(
+                    &mut target,
+                    &mut context,
+                    AlwaysPending::poll,
+                    Poll::is_pending
+                )
+                .is_pending()
+        );
+        let rearmed = target
+            .registered
+            .as_ref()
+            .expect("the pending target retains the replacement proxy");
+        assert!(!stale.will_wake(rearmed));
+        assert_eq!(target.polls, 4, "re-arming probes and then proxy-polls");
+
+        stale.wake_by_ref();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        rearmed.wake_by_ref();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
     }
 }

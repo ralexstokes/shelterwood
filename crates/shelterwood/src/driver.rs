@@ -1084,6 +1084,9 @@ async fn run_scope(plan: ScopePlan, role: ScopeRole) -> RetainedStopReason {
     RetainedStopReason::new(run_scope_incarnation(plan, role, epoch).await)
 }
 
+/// Blocks the driver loop until one lane wakes it, returning `Some` only when
+/// the wake staged a scope completion the loop must return.
+#[must_use = "a staged fail-closed completion must end the driver loop"]
 async fn wait_for_scope_wake(
     scope: &mut ScopeRuntime,
     signal: &mut runtime::WatchReceiver<crate::cells::MemberRecord>,

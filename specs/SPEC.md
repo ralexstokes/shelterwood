@@ -900,15 +900,8 @@ notification of §6.5 is the one carve-out in the other direction:
 because its wake panic MUST be retained before the framework may forget
 the work, a completion waiter whose waker *blocks* rather than panicking
 holds that work in the incarnation's resource ledger, and teardown joins
-it — so caller code can delay teardown and exit publication there.
-
-Grace bounds cannot interrupt user destruction already running in the
-incarnation-owned funnel: because that funnel runs inline so a disposal
-panic can become the incarnation's own verdict, a non-panicking destructor
-that blocks pins the Tokio worker running the incarnation until it returns.
-This is a venue cost of the required verdict semantics, not grounds to move
-the value to the detached-disposal lane. Grace bounds drain plus `on_stop`
-together (§11) — including after a local
+it — so caller code can delay teardown and exit publication there. Grace
+bounds drain plus `on_stop` together (§11) — including after a local
 `ctx.stop()`, which arms the child's own configured ladder (§11).
 
 ### 6.3 One timer facility
@@ -1053,6 +1046,12 @@ handlers non-blocking. Contracts:
   is unspecified. Panics in the offloaded future or the continuation
   resume on the actor task, so supervision classifies them as an ordinary
   actor panic.
+- Grace bounds cannot interrupt user destruction already running in the
+  incarnation-owned funnel. That funnel runs inline so a disposal panic can
+  become the incarnation's own verdict; consequently, a non-panicking
+  destructor that blocks pins the Tokio worker executing that disposal until
+  it returns. This is a venue cost of the required verdict semantics, not
+  grounds to move the value to the detached-disposal lane.
 - `run_blocking(f)` hands the closure a cancellation token that is a
   child of the actor's shutdown token and is also cancelled if the
   returned future is dropped. Cancellation is cooperative only; after

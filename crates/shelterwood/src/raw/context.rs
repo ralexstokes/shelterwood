@@ -349,7 +349,7 @@ struct RawResources<M> {
     // Set after returning a continuation and cleared after an external
     // mailbox/offload/timer item. `next_ready` uses it to prohibit two local
     // continuations from leading while an external source remains eligible.
-    continuation_needs_external: bool,
+    last_delivery_was_continuation: bool,
     timers: TimerStore<M>,
     ready_batch: Option<ReadyBatch>,
     events: Arc<EventQueue<M>>,
@@ -368,7 +368,7 @@ impl<M> Default for RawResources<M> {
         Self {
             accepting: true,
             continuations: ContinuationQueue::new(disposal.clone()),
-            continuation_needs_external: false,
+            last_delivery_was_continuation: false,
             timers: TimerStore::new(disposal.clone()),
             ready_batch: None,
             events,
@@ -1044,13 +1044,27 @@ impl<M: Send + 'static> RawContext<M> {
         Ok(guard)
     }
 
+    // The external-work half of §6.1's fairness rule, shared by the
+    // steady-batch refresh and the empty-selection retry: accepted mailbox
+    // traffic past the batch cutoff, an exhausted mailbox budget, or a
+    // pending offload event all count as external work being ready.
+    fn external_work_is_ready(
+        &self,
+        mailbox_budget_exhausted: bool,
+        mailbox_cutoff: AcceptedSequence,
+    ) -> bool {
+        mailbox_budget_exhausted
+            || self.receiver.accepted_sequence() > mailbox_cutoff
+            || self.resources.events.watermark() > 0
+    }
+
     fn pop_continuation(&mut self, batch: &mut ReadyBatch, is_lead_slot: bool) -> Option<M> {
-        if (!is_lead_slot || !self.resources.continuation_needs_external)
+        if (!is_lead_slot || !self.resources.last_delivery_was_continuation)
             && batch.continuation_is_eligible()
             && let Some(message) = self.resources.continuations.pop_front()
         {
             batch.record_continuation_delivery();
-            self.resources.continuation_needs_external = true;
+            self.resources.last_delivery_was_continuation = true;
             return Some(message);
         }
         None
@@ -1107,7 +1121,7 @@ impl<M: Send + 'static> RawContext<M> {
                 let message = self.receiver.try_recv_live_through(batch.mailbox_through);
                 if let Some(message) = message {
                     batch.record_mailbox_delivery();
-                    self.resources.continuation_needs_external = false;
+                    self.resources.last_delivery_was_continuation = false;
                     self.resources.ready_batch = Some(batch);
                     return Some(message);
                 }
@@ -1123,7 +1137,7 @@ impl<M: Send + 'static> RawContext<M> {
                         .with_ready_batch_installed(batch, |this| this.materialize_event(event));
                     batch = restored;
                     if let Some(message) = message {
-                        self.resources.continuation_needs_external = false;
+                        self.resources.last_delivery_was_continuation = false;
                         self.resources.ready_batch = Some(batch);
                         return Some(message);
                     }
@@ -1137,10 +1151,9 @@ impl<M: Send + 'static> RawContext<M> {
             // Fired batches deliberately retain their immutable cutoffs:
             // post-fire arrivals must not jump the already-fired timers.
             if !batch.is_fired()
-                && self.resources.continuation_needs_external
-                && (batch.mailbox_budget_exhausted()
-                    || self.receiver.accepted_sequence() > batch.mailbox_through
-                    || self.resources.events.watermark() > 0)
+                && self.resources.last_delivery_was_continuation
+                && self
+                    .external_work_is_ready(batch.mailbox_budget_exhausted(), batch.mailbox_through)
             {
                 self.resources.ready_batch = None;
                 continue;
@@ -1157,7 +1170,7 @@ impl<M: Send + 'static> RawContext<M> {
                 batch = restored;
                 batch.commit_arming(arming);
                 if let Some(message) = message {
-                    self.resources.continuation_needs_external = false;
+                    self.resources.last_delivery_was_continuation = false;
                     self.resources.ready_batch = Some(batch);
                     return Some(message);
                 }
@@ -1169,9 +1182,7 @@ impl<M: Send + 'static> RawContext<M> {
             let timer_is_due = self
                 .next_timer_deadline()
                 .is_some_and(|deadline| deadline <= runtime::now());
-            if mailbox_may_remain
-                || self.receiver.accepted_sequence() > mailbox_cutoff
-                || self.resources.events.watermark() > 0
+            if self.external_work_is_ready(mailbox_may_remain, mailbox_cutoff)
                 || !self.resources.continuations.is_empty()
                 || timer_is_due
             {

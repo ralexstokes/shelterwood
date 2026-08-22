@@ -21,9 +21,11 @@
 - [The decision core and its effects](internals-reducer.md)
 - [The life of a message](internals-message.md)
 - [The life of a child](internals-child.md)
+- [Time, timers, and offloads](internals-time.md)
 - [Shutdown from the inside](internals-shutdown.md)
 - [Observation from the inside](internals-observation.md)
 - [Locks, effects, and disposal](internals-concurrency.md)
+- [How it stays correct](internals-testing.md)
 
 # Appendices
 

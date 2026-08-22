@@ -110,6 +110,44 @@ intensity budget instead, the scope enters drain with
 `StopReason::IntensityTripped`, which escalates to its parent as an
 ordinary child exit.
 
+## Runtime admission
+
+A dynamic scope admits children at runtime through the same machinery,
+with a control-plane protocol in front of it
+(`crates/shelterwood/src/driver/admission_control.rs`). The public
+surface on `DynamicScopeRef` — `add_actor`, `reserve_actor`, and their
+kind siblings — splits into a synchronous *reservation* that claims the
+child id immediately (so a handle can exist before admission resolves,
+and a duplicate id fails fast with a `ReserveError`) and an
+`Admission` future that resolves when the driver actually admits.
+
+The driver samples admission requests as its lowest-arbitration-class
+pending work. `handle_admission` first re-checks liveness — a draining
+scope, a failed startup, or a superseded scope incarnation rejects with
+the matching `NotAdmittingCause` — then builds the `ChildRuntime`
+*outside* the control-plane lock, because conversion can unwind while
+acquiring identity or configuring the mailbox, and driver teardown must
+still be able to close reservations. The install itself is one
+observation-gate transaction holding the dynamic-state mutex: the
+reservation is re-matched, arena insertion and entry promotion happen as
+a single transition (so an exact remover sees either the reservation or
+a resident, never an unindexed intermediate), and
+`admit_child_locked` pushes the incoming projection into residency
+*before* any remaining fallible step. If bookkeeping panics after that
+push, the graph is owned by residency and retires at scope clear as an
+*unannounced* resident — the same rule that keeps snapshots'
+`Added`/`Removed` pairing exact
+([Observation from the inside](internals-observation.md)). Every
+rejection path routes the definition or built child through detached
+disposal rather than dropping it in place.
+
+Admitting a *subtree* adds the gate handoff: the adoptee's observation
+gate is taken while the parent's is held, the one sanctioned doubled
+gate section and the deepest point of that exemption
+([Locks, effects, and disposal](internals-concurrency.md)). Removal —
+the other half of dynamic membership — is covered with the rest of
+teardown in [Shutdown from the inside](internals-shutdown.md).
+
 ## Terminal
 
 A terminal exit first retains the exit (`RetainedExit`) and hands the

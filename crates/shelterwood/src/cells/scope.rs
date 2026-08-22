@@ -1663,9 +1663,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        cells::test_support::{TEST_WAIT, ThreadProbe, child_member, child_scope, isolated_scope},
-        observe::{LifecycleItem, LifecycleTryRecvError},
+    use crate::cells::{
+        LifecycleItem, LifecycleTryRecvError,
+        test_support::{TEST_WAIT, ThreadProbe, child_member, child_scope, isolated_scope},
     };
 
     struct GateCheckingWake {

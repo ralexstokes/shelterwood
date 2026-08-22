@@ -16,7 +16,8 @@ const SUPPORTED_FORMAT_VERSION: u64 = 61;
 // directly. Rustdoc JSON still does not inline the remaining cross-crate core
 // re-exports: they appear only as `use` items whose target signatures are
 // invisible here. Core's runtime-free dependency graph is the structural proof
-// for that opaque residue; see the `runtime-api-check` recipe and SPEC §16.13.
+// for that opaque residue, and `tools/check-core-manifest.sh` asserts it in
+// the same `runtime-api-check` lane; see that recipe and SPEC §16.13.
 
 fn main() -> Result<(), Box<dyn Error>> {
     let path = env::args_os()

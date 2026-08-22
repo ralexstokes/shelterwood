@@ -95,8 +95,8 @@ impl crate::mailbox::MailboxRuntime for BindOrderingRuntime {
     fn oneshot(
         &self,
     ) -> (
-        Box<dyn crate::mailbox::ErasedOneShotSender>,
-        Pin<Box<dyn crate::mailbox::ErasedOneShotReceiver>>,
+        Box<dyn shelterwood_core::ErasedOneShotSender>,
+        Pin<Box<dyn shelterwood_core::ErasedOneShotReceiver>>,
     ) {
         self.inner.oneshot()
     }
@@ -120,7 +120,7 @@ impl crate::mailbox::MailboxRuntime for BindOrderingRuntime {
         self.inner.now()
     }
 
-    fn sleep_until(&self, deadline: Option<Instant>) -> crate::mailbox::BoxedSleep {
+    fn sleep_until(&self, deadline: Option<Instant>) -> shelterwood_core::BoxedSleep {
         self.inner.sleep_until(deadline)
     }
 }
@@ -137,8 +137,8 @@ impl crate::mailbox::MailboxRuntime for PanickingPulseRuntime {
     fn oneshot(
         &self,
     ) -> (
-        Box<dyn crate::mailbox::ErasedOneShotSender>,
-        Pin<Box<dyn crate::mailbox::ErasedOneShotReceiver>>,
+        Box<dyn shelterwood_core::ErasedOneShotSender>,
+        Pin<Box<dyn shelterwood_core::ErasedOneShotReceiver>>,
     ) {
         self.inner.oneshot()
     }
@@ -159,7 +159,7 @@ impl crate::mailbox::MailboxRuntime for PanickingPulseRuntime {
         self.inner.now()
     }
 
-    fn sleep_until(&self, deadline: Option<Instant>) -> crate::mailbox::BoxedSleep {
+    fn sleep_until(&self, deadline: Option<Instant>) -> shelterwood_core::BoxedSleep {
         self.inner.sleep_until(deadline)
     }
 }

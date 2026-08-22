@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    admission::{RemoveOutcome, ReserveError},
+    cells::{RemoveOutcome, ReserveError},
     driver::DynamicReservation,
     runtime::Latch,
 };

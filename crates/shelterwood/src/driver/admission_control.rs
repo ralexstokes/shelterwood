@@ -8,8 +8,10 @@ use std::{
 
 use crate::{
     ChildId, Membership, ScopeState,
-    admission::{NotAdmittingCause, RemoveOutcome, ReserveError},
-    cells::{DynamicRoute, MemberStage, ObservationTxn, ScopeCell},
+    cells::{
+        DynamicRoute, MemberStage, NotAdmittingCause, ObservationTxn, RemoveOutcome, ReserveError,
+        ScopeCell,
+    },
     plan::{ChildConstruction, SlotCell, checked_id, mint_reserved_slot},
     policy::ScopeFlavor,
     runtime::{self, Latch},

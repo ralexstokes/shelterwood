@@ -43,19 +43,35 @@ if cargo check --locked --manifest-path "$manifest" --features installable-seams
     echo "the supported façade exports private installation seams" >&2
     exit 1
 fi
+# Match each seam in the E0432 header (`unresolved imports ...`), not the
+# per-span "no `X` in the root" labels: rustc caps rendered span labels, so
+# a list this long leaves later names labelless while the header stays
+# complete. The trailing backtick keeps prefixes distinct (e.g.
+# `MailboxSignal` vs `MailboxSignalWatcher`).
 for seam in \
     ActorIdentity \
     DynamicRoute \
+    ErasedOneShotClose \
+    ErasedOneShotReceiver \
+    ErasedOneShotSender \
     MailboxCell \
     MailboxControl \
     MailboxRuntime \
+    MailboxSignal \
+    MailboxSignalWatcher \
     MailboxTermination \
     MemberCell \
     ParentCancellationToken \
+    ProxiedPoll \
+    ProxiedSleep \
     ScopeCell \
+    WakerAction \
+    WakerEffects \
+    WakerProxy \
+    WakerSlot \
     actor_ref_from_parts
 do
-    if ! grep -Fq "no \`$seam\` in the root" "$diagnostics"; then
+    if ! grep -Fq "\`shelterwood::$seam\`" "$diagnostics"; then
         cat "$diagnostics" >&2
         echo "installable-seam probe failed for an unexpected reason" >&2
         exit 1

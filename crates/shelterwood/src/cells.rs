@@ -20,8 +20,13 @@ pub use observe::*;
 pub(crate) use retained::*;
 pub(crate) use scope::*;
 
+/// Shared test constructors for the restart-stable cell graph.
+///
+/// `pub(crate)` because the driver tests build the same isolated fixtures:
+/// keeping one construction path means a change to construction invariants
+/// cannot silently leave one suite exercising a path production never takes.
 #[cfg(test)]
-mod test_support {
+pub(crate) mod test_support {
     use std::{
         fmt,
         sync::{Arc, mpsc},
@@ -49,7 +54,14 @@ mod test_support {
         ));
     }
 
-    pub(super) fn isolated_scope(id: &str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
+    /// The one isolated-scope construction path. `configure` runs on the root
+    /// member before the scope cell wraps it; the cells tests resolve options
+    /// there, while the driver fixtures pass a no-op.
+    pub(crate) fn isolated_scope_with(
+        id: &str,
+        flavor: ScopeFlavor,
+        configure: impl FnOnce(&MemberCell),
+    ) -> Arc<ScopeCell> {
         let id = ChildId::from(id);
         let mut identity = ScopeIdentity::new();
         let member = MemberCell::new(
@@ -58,8 +70,12 @@ mod test_support {
                 .mint_membership(&id)
                 .expect("scope membership is available"),
         );
-        resolve_options(&member);
+        configure(&member);
         ScopeCell::new(member, flavor, ScopeIdentity::new())
+    }
+
+    pub(super) fn isolated_scope(id: &str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
+        isolated_scope_with(id, flavor, resolve_options)
     }
 
     pub(super) fn child_member(parent: &ScopeCell, id: &str) -> Arc<MemberCell> {
@@ -78,7 +94,13 @@ mod test_support {
         ScopeCell::new(child_member(parent, id), flavor, ScopeIdentity::new())
     }
 
-    pub(super) struct ThreadProbe(pub(super) mpsc::SyncSender<std::thread::ThreadId>);
+    /// A user error payload that reports the thread its destructor ran on.
+    ///
+    /// Shared with the driver tests as their venue probe for a *losing*
+    /// application error: the framework selects a different verdict, so the
+    /// loser is never published and its destruction thread is the only
+    /// observable it leaves behind.
+    pub(crate) struct ThreadProbe(pub(crate) mpsc::SyncSender<std::thread::ThreadId>);
 
     impl fmt::Debug for ThreadProbe {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

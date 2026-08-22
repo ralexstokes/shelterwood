@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     ActorRef, ChildId, DeadlineBudget, Incarnation, MailboxShutdown, Readiness,
-    cancellation::{CancellationToken, ParentCancellationToken},
+    cells::{CancellationToken, ParentCancellationToken},
     mailbox::{AcceptedSequence, MailboxCell, MailboxReceiver},
     runtime::{
         self, CompletionGatedLatch, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher,

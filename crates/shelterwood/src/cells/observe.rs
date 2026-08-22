@@ -18,7 +18,6 @@ use shelterwood_core::{
 use crate::cells::RetainedExit;
 
 /// Number of lifecycle events retained independently for each subscriber.
-#[doc(hidden)]
 pub(crate) const LIFECYCLE_EVENT_CAPACITY: usize = 128;
 
 // Tokio rounds broadcast capacity up to a power of two. `try_recv` compares
@@ -1048,7 +1047,7 @@ mod tests {
         policy::ScopeFlavor,
     };
 
-    use crate::observe::{
+    use crate::cells::{
         LifecycleEvent, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, ScopeSnapshot,
     };
     use shelterwood_core::{ScopeState, StopReason};

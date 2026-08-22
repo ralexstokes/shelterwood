@@ -449,13 +449,7 @@ pub(super) const CAPTURE_PROBE_WAIT: Duration = Duration::from_secs(10);
 pub(super) const DRIVER_PROGRESS_WAIT: Duration = Duration::from_secs(10);
 
 pub(super) fn isolated_scope(id: &'static str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
-    let mut identity = ScopeIdentity::new();
-    let id = ChildId::from(id);
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
-    ScopeCell::new(member, flavor, ScopeIdentity::new())
+    crate::cells::test_support::isolated_scope_with(id, flavor, |_| {})
 }
 
 pub(super) fn running_dynamic_fixture() -> (
@@ -623,38 +617,19 @@ impl Drop for GateProbeError {
     }
 }
 
-/// A user error payload that reports the thread its destructor ran on.
+/// Builds an application error paired with the receiver of its drop thread.
 ///
 /// The venue probe for a *losing* application error: the framework selects a
 /// different verdict, so the loser is never published and its destruction
-/// thread is the only observable it leaves behind.
-pub(super) struct ThreadReportingError(std::sync::mpsc::SyncSender<std::thread::ThreadId>);
-
-/// Builds an application error paired with the receiver of its drop thread.
+/// thread is the only observable it leaves behind. The payload is the cells
+/// tests' shared [`crate::cells::test_support::ThreadProbe`].
 pub(super) fn thread_reporting_error()
 -> (ExitError, std::sync::mpsc::Receiver<std::thread::ThreadId>) {
     let (dropped, observed) = std::sync::mpsc::sync_channel(1);
-    (ExitError::from(ThreadReportingError(dropped)), observed)
-}
-
-impl std::fmt::Debug for ThreadReportingError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ThreadReportingError")
-    }
-}
-
-impl std::fmt::Display for ThreadReportingError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("thread reporting error")
-    }
-}
-
-impl std::error::Error for ThreadReportingError {}
-
-impl Drop for ThreadReportingError {
-    fn drop(&mut self) {
-        let _ = self.0.send(std::thread::current().id());
-    }
+    (
+        ExitError::from(crate::cells::test_support::ThreadProbe(dropped)),
+        observed,
+    )
 }
 
 pub(super) struct SnapshotReentryWake {

@@ -11,15 +11,14 @@ use std::{
 };
 
 use crate::{
-    identity::{AtomicPoisonedCounter, PoisonedCounter},
+    identity::{AtomicPoisonedCounter, ChildId, Incarnation, PoisonedCounter},
     mailbox::{
-        ChildId, Incarnation, MailboxBindToken, MailboxClose, MailboxControl, MailboxDisposal,
-        MailboxEffectQueue, MailboxEffectSink, MailboxRuntime, MailboxSignal, MailboxSignalWatcher,
-        MailboxTermination,
+        MailboxBindToken, MailboxClose, MailboxControl, MailboxDisposal, MailboxEffectQueue,
+        MailboxEffectSink, MailboxRuntime, MailboxSignal, MailboxSignalWatcher, MailboxTermination,
         capability::{dispose, dispose_value},
-        panic::{PanicAccumulator, PanicPayload, resume_panic},
     },
     policy::ResolvedMailbox,
+    runtime::{PanicAccumulator, PanicPayload, resume_panic},
 };
 use shelterwood_core::waker::{WakerAction, WakerEffects, WakerSlot};
 

@@ -4,14 +4,25 @@ use crate::{MailboxRuntime, panic::PanicAccumulator};
 
 /// The only storage surface for a caller-owned waker.
 ///
-/// Its value is private even from the parent mailbox module, and every
-/// mutating operation requires an effects sink, so replacing or taking an
+/// Its value is private even from the rest of this crate, and every mutating
+/// operation requires an effects sink, so replacing or taking an
 /// `Option<Waker>` and accidentally dropping it beside a guard does not
 /// type-check.
+///
+/// # Implementation boundary
+///
+/// `WakerSlot`, [`WakerAction`], and [`WakerEffects`] are doc-hidden
+/// cross-crate seams for the façade's mailbox and proxy code, not user
+/// extension points. A direct `shelterwood-core` dependent that constructs
+/// them is outside the supported façade contract, and the supported façade
+/// re-exports none of them.
 #[derive(Default)]
 #[doc(hidden)]
 pub struct WakerSlot(Option<Waker>);
 
+/// Post-unlock disposition for a waker leaving a [`WakerSlot`].
+///
+/// See [`WakerSlot`]'s implementation boundary.
 #[doc(hidden)]
 pub enum WakerAction {
     Wake,
@@ -27,6 +38,10 @@ enum WakerEffect {
     Run(fn(Waker), Waker),
 }
 
+/// Deferred waker effects, flushed only with no framework mutex held.
+///
+/// See [`WakerSlot`]'s implementation boundary. `is_empty` is `pub` because
+/// the façade's mailbox effect batches probe their collected sinks.
 #[derive(Default)]
 #[doc(hidden)]
 pub struct WakerEffects(Vec<WakerEffect>);

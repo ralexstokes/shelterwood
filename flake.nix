@@ -53,6 +53,7 @@
                   cargo rustdoc --locked -p shelterwood --all-features --lib
                 cargo run --locked -p shelterwood-api-reachability -- \
                   target/doc/shelterwood.json
+                ${pkgs.bash}/bin/bash ./tools/check-core-manifest.sh
                 ${pkgs.bash}/bin/bash ./tools/check-external-consumer.sh
                 ${pkgs.bash}/bin/bash ./tools/sync-packaged-docs.sh --check
               '';

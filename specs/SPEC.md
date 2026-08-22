@@ -3192,7 +3192,9 @@ fixtures for the driver shell and end-to-end invariants.
     one façade document exposes their signatures to the walk. Cross-crate
     core re-exports remain opaque to it, but the core's runtime-free manifest
     is the structural proof that those hidden signatures cannot name a
-    concrete adapter. The core/runtime capability traits are outside the
+    concrete adapter — and an automated check MUST assert that manifest's
+    dependency allowlist rather than assume it. The core/runtime capability
+    traits are outside the
     supported boundary, every façade installer is crate-private, and an
     external-consumer probe MUST reject their façade reachability. A public
     re-export of a runtime-typed seam is a hard failure — compile-time where

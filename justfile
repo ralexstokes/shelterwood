@@ -31,10 +31,11 @@ doc-check:
 # Mailbox and cell items are defined inside the façade, so one rustdoc document
 # now covers their full public signatures. `shelterwood-core` needs no separate
 # walk because it has no adapter, tokio, or fastrand dependency for an item to
-# name.
+# name — an assumption check-core-manifest.sh asserts rather than assumes.
 runtime-api-check:
     RUSTDOCFLAGS="-Z unstable-options --output-format json" cargo +nightly rustdoc --locked -p shelterwood --all-features --lib
     cargo run --locked -p shelterwood-api-reachability -- target/doc/shelterwood.json
+    ./tools/check-core-manifest.sh
 
 packaged-docs-sync:
     ./tools/sync-packaged-docs.sh --write

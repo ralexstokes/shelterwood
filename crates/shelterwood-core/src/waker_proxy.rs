@@ -91,6 +91,12 @@ impl ProxiedPoll {
         crate::panic::discard_panic(panics.take());
     }
 
+    /// Test-only visibility: whether a pending poll has a proxy installed.
+    #[cfg(test)]
+    pub(crate) fn is_parked(&self) -> bool {
+        self.proxy.is_some()
+    }
+
     /// Retires the current caller registration into a mailbox effects sink.
     #[doc(hidden)]
     pub fn retire(&mut self, action: WakerAction, effects: &mut WakerEffects) {

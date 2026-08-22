@@ -35,7 +35,6 @@ impl CancellationToken {
 
 /// Internal capability that alone may derive a locally cancellable token.
 #[derive(Clone, Debug)]
-#[doc(hidden)]
 pub(crate) struct ParentCancellationToken {
     primary: Latch,
 }

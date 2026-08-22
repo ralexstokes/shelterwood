@@ -1,6 +1,6 @@
 use crate::{
     ActorDef, ActorOnceDef, ActorRef, ChildId,
-    admission::ReserveError,
+    cells::ReserveError,
     raw::{RawDef, RawOnceDef},
     runtime,
     scope::{DynamicScopeRef, ScopeRef},

@@ -164,9 +164,9 @@ mod tests {
         time::Duration,
     };
 
-    use crate::mailbox::{
+    use crate::mailbox::capability::{DisposingReceiver, OneShotClose, oneshot};
+    use shelterwood_core::{
         ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
-        capability::{DisposingReceiver, OneShotClose, oneshot},
     };
 
     use super::super::cell::tests::{actor, actor_for_with_runtime};

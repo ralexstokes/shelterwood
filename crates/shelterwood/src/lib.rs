@@ -5,8 +5,6 @@
 #[macro_use]
 mod definition;
 mod actor;
-mod admission;
-mod cancellation;
 mod cells;
 mod deadline;
 mod driver;
@@ -14,7 +12,6 @@ mod engine;
 mod exit;
 mod identity;
 mod mailbox;
-mod observe;
 mod plan;
 mod policy;
 mod raw;
@@ -24,8 +21,11 @@ mod task;
 mod tree;
 
 pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
-pub use admission::{NotAdmittingCause, RemoveOutcome, ReserveError};
-pub use cancellation::CancellationToken;
+pub use cells::{
+    CancellationToken, ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind,
+    LifecycleEvents, LifecycleItem, LifecycleSeq, LifecycleTryRecvError, NotAdmittingCause,
+    RemoveOutcome, ReserveError, ScopeSnapshot, SnapshotClosed, SnapshotReceiver, WaitError,
+};
 pub use deadline::DeadlineBudget;
 pub use engine::{MembershipStatus, ScopeState};
 pub use exit::{
@@ -37,11 +37,6 @@ pub use identity::{ChildId, Incarnation, Membership};
 pub use mailbox::{
     ActorRef, CallError, CallErrorKind, CallFuture, Replied, Reply, ReplyError, ReplyReceive,
     ReplyReceiver, SendError, SendErrorKind, SendFuture, SendTimeout,
-};
-pub use observe::{
-    ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem,
-    LifecycleSeq, LifecycleTryRecvError, ScopeSnapshot, SnapshotClosed, SnapshotReceiver,
-    WaitError,
 };
 pub use policy::{
     Backoff, BackoffFactor, DefaultsInheritance, ExponentialBackoff, FixedBackoff, Intensity,

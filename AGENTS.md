@@ -29,9 +29,9 @@ Two types implement the rule and are the shapes to reach for:
   displaced payloads and isolated-disposal requests; its `Drop` empties the
   guard field before Rust drops the sink, so the flush necessarily runs with no
   mailbox mutex held, unwind included. `WakerSlot` makes the waker half
-  structural rather than conventional: its storage is private even from the
-  parent module, and no operation returns or replaces a `Waker` without an
-  effects sink. `Withdrawal`, `Termination` and `MailboxPayload` are its
+  structural rather than conventional: its storage is private to
+  `shelterwood-core`'s waker module, and no operation returns or replaces a
+  `Waker` without an effects sink. `Withdrawal`, `Termination` and `MailboxPayload` are its
   single-purpose siblings.
 
 What the rule does *not* forbid — the exemptions every remaining lock site
@@ -110,8 +110,12 @@ rests on:
   now crate-private, so an unsupported direct dependent can neither construct
   a sink nor supply its own. The same construction-held boundary covers
   `MailboxControl`, `MailboxTermination`, `ActorIdentity`, and `DynamicRoute`;
-  only the core-to-runtime capability family retains a conventional
-  cross-crate seam.
+  what remains conventional is the core-to-runtime capability family plus the
+  waker machinery that moved to core beside the proxy — `WakerSlot`,
+  `WakerAction`, and `WakerEffects` are public doc-hidden core items a direct
+  core dependent could construct. They ride under the same framework-only
+  ruling; the supported façade re-exports none of them, and the
+  external-consumer probe rejects façade reachability for the whole family.
   `MailboxRuntime`
   is nonetheless kept off every locked path: its disposal capability hands
   work to a blocking worker, so it belongs to the effects flush like the user

@@ -11,14 +11,10 @@ use std::{
     },
 };
 
+use crate::identity::{ChildId, Incarnation, Membership};
 use shelterwood_core::policy::ResolvedMailbox;
-#[cfg(test)]
 pub(crate) use shelterwood_core::{
-    BoxedSleep, ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
-};
-pub(crate) use shelterwood_core::{
-    ChildId, Incarnation, MailboxRuntime, MailboxSignal, MailboxSignalWatcher, Membership,
-    ProxiedSleep,
+    MailboxRuntime, MailboxSignal, MailboxSignalWatcher, ProxiedSleep,
 };
 
 mod capability;
@@ -35,10 +31,6 @@ pub(crate) use cell::*;
 pub use errors::*;
 pub use futures::*;
 pub use reply::*;
-
-mod panic {
-    pub(crate) use shelterwood_core::panic::*;
-}
 
 /// Isolated payload returned after mailbox termination has synchronously
 /// published all waiter outcomes.
@@ -140,7 +132,7 @@ impl MailboxEffectSink for MailboxEffectQueue {
 
 impl Drop for MailboxEffectQueue {
     fn drop(&mut self) {
-        let mut panics = panic::PanicAccumulator::default();
+        let mut panics = crate::runtime::PanicAccumulator::default();
         for effect in self.0.drain(..) {
             panics.run(effect);
         }

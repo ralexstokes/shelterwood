@@ -133,3 +133,221 @@ impl Drop for ProxiedSleep {
         self.retire_disposing(&mut panics);
     }
 }
+
+/// White-box pins beside the type: these tests reach the private `timer` and
+/// `timer_poll` slots to hold the retirement contract — the wheel entry is
+/// gone and the proxy uninstalled when retirement returns — which black-box
+/// waker counting alone cannot distinguish from deferred cleanup. The test
+/// that needs a real disposal lane lives in the façade's mailbox timer
+/// module, so this crate keeps no dev-dependencies.
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        mem::ManuallyDrop,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+        time::Instant,
+    };
+
+    use super::ProxiedSleep;
+    use crate::{
+        BoxedSleep, ErasedOneShotReceiver, ErasedOneShotSender, MailboxRuntime, MailboxSignal,
+    };
+
+    /// Stub capability object: `ProxiedSleep` itself touches the runtime only
+    /// through `dispose`, and every path these tests drive retires the caller
+    /// slot inline, so every capability is unreachable by construction.
+    struct InertRuntime;
+
+    impl MailboxRuntime for InertRuntime {
+        fn oneshot(
+            &self,
+        ) -> (
+            Box<dyn ErasedOneShotSender>,
+            Pin<Box<dyn ErasedOneShotReceiver>>,
+        ) {
+            unreachable!("proxied-sleep tests never open a one-shot");
+        }
+
+        fn signal(&self) -> Arc<dyn MailboxSignal> {
+            unreachable!("proxied-sleep tests never mint a signal");
+        }
+
+        fn dispose(&self, _value: Box<dyn Send + 'static>) {
+            unreachable!("inline retirement leaves drop glue nothing to dispose");
+        }
+
+        fn now(&self) -> Instant {
+            unreachable!("proxied-sleep tests never read the clock");
+        }
+
+        fn sleep_until(&self, _deadline: Option<Instant>) -> BoxedSleep {
+            unreachable!("proxied-sleep tests supply their raw timer directly");
+        }
+    }
+
+    fn runtime() -> Arc<dyn MailboxRuntime> {
+        Arc::new(InertRuntime)
+    }
+
+    #[derive(Default)]
+    struct WakerCounts {
+        clones: AtomicUsize,
+        drops: AtomicUsize,
+    }
+
+    unsafe fn clone_counting(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable came from an Arc of the
+        // matching type. ManuallyDrop preserves the reference represented by
+        // `data`; the returned raw waker owns only the new clone.
+        let state = ManuallyDrop::new(unsafe { Arc::<WakerCounts>::from_raw(data.cast()) });
+        state.clones.fetch_add(1, Ordering::SeqCst);
+        RawWaker::new(Arc::into_raw(Arc::clone(&state)).cast(), &COUNTING_VTABLE)
+    }
+
+    unsafe fn wake_counting(data: *const ()) {
+        // SAFETY: wake consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<WakerCounts>::from_raw(data.cast()) });
+    }
+
+    unsafe fn wake_by_ref_counting(_data: *const ()) {}
+
+    unsafe fn drop_counting(data: *const ()) {
+        // SAFETY: drop consumes the Arc reference represented by this waker.
+        let state = unsafe { Arc::<WakerCounts>::from_raw(data.cast()) };
+        state.drops.fetch_add(1, Ordering::SeqCst);
+    }
+
+    static COUNTING_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_counting,
+        wake_counting,
+        wake_by_ref_counting,
+        drop_counting,
+    );
+
+    fn counting_waker(state: &Arc<WakerCounts>) -> Waker {
+        let raw = RawWaker::new(Arc::into_raw(Arc::clone(state)).cast(), &COUNTING_VTABLE);
+        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
+        // ownership across clone, wake, and drop.
+        unsafe { Waker::from_raw(raw) }
+    }
+
+    struct ParkThenReady {
+        polls: usize,
+        registered: Option<Waker>,
+    }
+
+    impl Future for ParkThenReady {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+            self.polls += 1;
+            self.registered = Some(context.waker().clone());
+            if self.polls < 3 {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }
+    }
+
+    #[test]
+    fn immediately_ready_timer_never_clones_the_caller_waker() {
+        let state = Arc::new(WakerCounts::default());
+        let waker = ManuallyDrop::new(counting_waker(&state));
+        let mut context = Context::from_waker(&waker);
+        let raw: BoxedSleep = Box::pin(std::future::ready(()));
+        let mut timer = Box::pin(ProxiedSleep::new(raw, runtime()));
+
+        assert!(timer.as_mut().poll(&mut context).is_ready());
+        assert_eq!(state.clones.load(Ordering::SeqCst), 0);
+        assert_eq!(state.drops.load(Ordering::SeqCst), 0);
+        assert!(
+            timer.timer.is_none(),
+            "the already-ready raw timer leaves no wheel entry to cancel"
+        );
+        assert!(
+            !timer.timer_poll.is_parked(),
+            "the no-op probe allocates no proxy on the ready path"
+        );
+
+        assert!(
+            timer.as_mut().poll(&mut context).is_ready(),
+            "a completed proxied timer is fused"
+        );
+        assert_eq!(
+            state.clones.load(Ordering::SeqCst),
+            0,
+            "repolling a completed timer never reaches the caller vtable"
+        );
+    }
+
+    #[test]
+    fn ready_poll_retires_the_caller_waker_inline_before_returning() {
+        let state = Arc::new(WakerCounts::default());
+        let waker = ManuallyDrop::new(counting_waker(&state));
+        let mut context = Context::from_waker(&waker);
+        let raw: BoxedSleep = Box::pin(ParkThenReady {
+            polls: 0,
+            registered: None,
+        });
+        let mut timer = Box::pin(ProxiedSleep::new(raw, runtime()));
+
+        assert!(timer.as_mut().poll(&mut context).is_pending());
+        assert_eq!(state.clones.load(Ordering::SeqCst), 1);
+        assert_eq!(state.drops.load(Ordering::SeqCst), 0);
+        assert!(
+            timer.timer_poll.is_parked(),
+            "a pending poll parks the caller behind the installed proxy"
+        );
+
+        assert!(timer.as_mut().poll(&mut context).is_ready());
+        assert_eq!(
+            state.drops.load(Ordering::SeqCst),
+            1,
+            "the caller clone is gone synchronously when the ready poll returns"
+        );
+        assert!(
+            timer.timer.is_none(),
+            "the wheel entry is gone when ready retirement returns"
+        );
+        assert!(!timer.timer_poll.is_parked());
+    }
+
+    #[test]
+    fn containing_ready_path_cancels_the_losing_timer_inline() {
+        let state = Arc::new(WakerCounts::default());
+        let waker = ManuallyDrop::new(counting_waker(&state));
+        let mut context = Context::from_waker(&waker);
+        let raw: BoxedSleep = Box::pin(std::future::pending());
+        let mut timer = ProxiedSleep::new(raw, runtime());
+
+        assert!(Pin::new(&mut timer).poll(&mut context).is_pending());
+        assert_eq!(state.clones.load(Ordering::SeqCst), 1);
+
+        timer.cancel_inline();
+
+        assert_eq!(
+            state.drops.load(Ordering::SeqCst),
+            1,
+            "a sibling branch returning Ready retires the timer caller before handing its value back"
+        );
+        assert!(timer.timer.is_none());
+        assert!(!timer.timer_poll.is_parked());
+
+        assert!(
+            Pin::new(&mut timer).poll(&mut context).is_ready(),
+            "a cancelled proxied timer is fused rather than reaching for its emptied slots"
+        );
+        assert_eq!(
+            state.clones.load(Ordering::SeqCst),
+            1,
+            "repolling a cancelled timer never reaches the caller vtable"
+        );
+    }
+}

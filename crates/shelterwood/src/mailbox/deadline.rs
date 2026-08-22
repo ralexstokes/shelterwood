@@ -7,7 +7,10 @@ use std::{
 
 use shelterwood_core::DeadlineBudget;
 
-use crate::mailbox::{MailboxRuntime, ProxiedSleep, panic::PanicAccumulator};
+use crate::{
+    mailbox::{MailboxRuntime, ProxiedSleep},
+    runtime::PanicAccumulator,
+};
 
 /// Which of the two passes an operation is being polled in.
 ///
@@ -191,7 +194,7 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             // delivery seam.
             let mut panics = PanicAccumulator::default();
             this.retire_timer_inline(&mut panics);
-            crate::mailbox::panic::discard_panic(panics.take());
+            crate::runtime::discard_panic(panics.take());
             return Poll::Ready(result);
         }
         if this.phase == DeadlinePhase::InitialAttempt {
@@ -211,7 +214,7 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             // this seam exists to remove.
             let mut panics = PanicAccumulator::default();
             this.retire_timer_inline(&mut panics);
-            crate::mailbox::panic::discard_panic(panics.take());
+            crate::runtime::discard_panic(panics.take());
         }
         this.operation
             .poll_deadlined(context, budget, DeadlinePhase::TimeoutArbitration)

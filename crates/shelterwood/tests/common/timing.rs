@@ -18,6 +18,12 @@ pub(crate) fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
 }
 
 /// Spin-polls a pinned future with a supplied test waker until it is ready.
+///
+/// The spinning thread never yields to an async runtime, so readiness must
+/// arrive from outside it — another worker or a blocking-pool thread. On a
+/// `current_thread` flavor whose readiness needs same-thread task progress,
+/// this helper spins out the full deadline and fails instead; use an
+/// `await`-based wait there.
 pub(crate) fn poll_until_ready<F: Future>(mut future: Pin<&mut F>, waker: &Waker) -> F::Output {
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {

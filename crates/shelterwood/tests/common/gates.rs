@@ -83,13 +83,25 @@ impl DestructorGate {
     }
 
     /// Blocks the calling test thread until the destructor has started.
+    ///
+    /// Bounded by `POLL_TIMEOUT`: a regression that never runs the destructor
+    /// fails here with a diagnosis pointing at the entry handshake, instead
+    /// of hanging until the harness's slow-timeout kill.
+    #[track_caller]
     pub(crate) fn wait_entered(&self) {
         let (state, changed) = &*self.0;
+        let deadline = Instant::now() + super::timing::POLL_TIMEOUT;
         let mut state = state.lock().expect("destructor gate mutex poisoned");
         while !state.entered {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the gated destructor starts before the test deadline"
+            );
             state = changed
-                .wait(state)
-                .expect("destructor gate mutex poisoned while waiting");
+                .wait_timeout(state, remaining)
+                .expect("destructor gate mutex poisoned while waiting")
+                .0;
         }
     }
 

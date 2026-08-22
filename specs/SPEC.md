@@ -1046,6 +1046,12 @@ handlers non-blocking. Contracts:
   is unspecified. Panics in the offloaded future or the continuation
   resume on the actor task, so supervision classifies them as an ordinary
   actor panic.
+- Grace bounds cannot interrupt user destruction already running in the
+  incarnation-owned funnel. That funnel runs inline so a disposal panic can
+  become the incarnation's own verdict; consequently, a non-panicking
+  destructor that blocks pins the Tokio worker executing that disposal until
+  it returns. This is a venue cost of the required verdict semantics, not
+  grounds to move the value to the detached-disposal lane.
 - `run_blocking(f)` hands the closure a cancellation token that is a
   child of the actor's shutdown token and is also cancelled if the
   returned future is dropped. Cancellation is cooperative only; after

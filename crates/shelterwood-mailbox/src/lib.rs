@@ -2,10 +2,11 @@
 
 //! Mailbox state machines and public messaging primitives.
 //!
-//! Tokio details remain behind `shelterwood-runtime`: this crate declares the
-//! runtime capabilities its futures need and never names an executor, in tests
-//! as well as in production. Cross-crate lifecycle and identity capabilities
-//! are public implementation seams, not supported façade API.
+//! Tokio details remain behind `shelterwood-runtime`: this crate consumes the
+//! runtime capabilities declared by `shelterwood-core` and never names an
+//! executor, in tests as well as in production. Cross-crate lifecycle and
+//! identity capabilities are public implementation seams, not supported
+//! façade API.
 //!
 //! Direct dependencies on this crate are unsupported. Its public capability
 //! traits and their installation helpers exist only so sibling Shelterwood
@@ -24,6 +25,11 @@ use std::{
 };
 
 use shelterwood_core::policy::ResolvedMailbox;
+#[doc(hidden)]
+pub use shelterwood_core::{
+    BoxedSleep, ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
+    MailboxRuntime, MailboxSignal, MailboxSignalWatcher, ProxiedPoll, ProxiedSleep, WakerProxy,
+};
 pub use shelterwood_core::{ChildId, Incarnation, Membership};
 
 mod capability;
@@ -34,21 +40,12 @@ mod futures;
 mod reply;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
 mod timer;
-mod waker_proxy;
-
-#[doc(hidden)]
-pub use capability::{
-    BoxedSleep, ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
-    MailboxRuntime, MailboxSignal, MailboxSignalWatcher,
-};
 pub use cell::*;
 pub use errors::*;
 pub use futures::*;
 pub use reply::*;
-#[doc(hidden)]
-pub use timer::ProxiedSleep;
-pub use waker_proxy::{ProxiedPoll, WakerProxy};
 
 mod identity {
     pub(crate) use shelterwood_core::identity::*;

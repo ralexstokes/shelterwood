@@ -1,13 +1,14 @@
 use std::task::{Context, Waker};
 
-use shelterwood_mailbox::ProxiedPoll as MailboxProxiedPoll;
+use shelterwood_core::ProxiedPoll as CoreProxiedPoll;
 
 use crate::{PanicAccumulator, discard_panic, dispose_detached};
 
 /// Runtime-facing proxied-poll protocol for an external primitive.
 ///
-/// The runtime-neutral implementation lives beside the mailbox state machines,
-/// which already need the same lost-wake and post-unlock-effect guarantees.
+/// The runtime-neutral implementation lives in `shelterwood-core`, shared with
+/// the mailbox state machines that need the same lost-wake and post-unlock
+/// effect guarantees.
 /// Ready retirement is part of every poll there: a ready result may own a user
 /// value (or a panic payload that owns one), so a hostile caller-waker
 /// destructor is contained inline, subordinate to returning that result
@@ -24,11 +25,11 @@ use crate::{PanicAccumulator, discard_panic, dispose_detached};
 /// submission per abandoned pending registration buys drop glue that cannot
 /// block or stall the holder's thread. A hot cancellation path added here
 /// should revisit the reply receiver's ruling rather than inherit this one.
-pub(crate) struct ProxiedPoll(MailboxProxiedPoll);
+pub(crate) struct ProxiedPoll(CoreProxiedPoll);
 
 impl ProxiedPoll {
     pub(crate) fn new() -> Self {
-        Self(MailboxProxiedPoll::new())
+        Self(CoreProxiedPoll::new())
     }
 
     /// Probes, proxy-polls, and retires a ready caller registration inline.

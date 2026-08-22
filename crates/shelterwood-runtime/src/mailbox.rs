@@ -6,7 +6,7 @@ use std::{
     time::Instant,
 };
 
-use shelterwood_mailbox::{
+use shelterwood_core::{
     BoxedSleep, ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
     MailboxRuntime, MailboxSignal, MailboxSignalWatcher,
 };
@@ -130,7 +130,7 @@ mod tests {
         time::Duration,
     };
 
-    use shelterwood_mailbox::{ErasedOneShotClose, ErasedOneShotReceiver, ErasedValue};
+    use shelterwood_core::{ErasedOneShotClose, ErasedOneShotReceiver, ErasedValue};
 
     use super::{TokioOneShotReceiver, mailbox_runtime};
 

@@ -2,9 +2,8 @@ use std::{future::Future, time::Duration};
 
 use tokio::time;
 
-use shelterwood_core::deadline::Deadline;
-pub use shelterwood_mailbox::BoxedSleep;
-use shelterwood_mailbox::ProxiedSleep;
+pub use shelterwood_core::BoxedSleep;
+use shelterwood_core::{ProxiedSleep, deadline::Deadline};
 
 use crate::mailbox_runtime;
 
@@ -57,7 +56,7 @@ fn proxied_sleep_until(deadline: std::time::Instant) -> ProxiedSleep {
     ProxiedSleep::new(raw_sleep_until(deadline), mailbox_runtime())
 }
 
-/// Raw timer capability supplied to `shelterwood-mailbox`.
+/// Raw timer capability supplied to the façade mailbox module.
 ///
 /// Public only as a sibling-crate implementation seam. User-polled façade
 /// futures must use [`sleep_until`] or [`sleep_until_std`], which install the

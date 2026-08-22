@@ -19,6 +19,7 @@ use crate::{
     panic::{PanicAccumulator, PanicPayload, resume_panic},
     policy::ResolvedMailbox,
 };
+use shelterwood_core::waker::{WakerAction, WakerEffects, WakerSlot};
 
 use super::{SendError, SendErrorKind};
 
@@ -107,10 +108,6 @@ pub(super) struct OperationState<M> {
     waker: WakerSlot,
     registration: Option<WaiterId>,
 }
-
-pub(crate) mod waker_slot;
-
-use waker_slot::{WakerAction, WakerEffects, WakerSlot};
 
 pub(super) struct SendOperation<M> {
     pub(super) state: Mutex<OperationState<M>>,

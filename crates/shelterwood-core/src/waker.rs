@@ -1,6 +1,6 @@
 use std::{sync::Arc, task::Waker};
 
-use crate::{MailboxRuntime, capability::dispose, panic::PanicAccumulator};
+use crate::{MailboxRuntime, panic::PanicAccumulator};
 
 /// The only storage surface for a caller-owned waker.
 ///
@@ -9,9 +9,11 @@ use crate::{MailboxRuntime, capability::dispose, panic::PanicAccumulator};
 /// `Option<Waker>` and accidentally dropping it beside a guard does not
 /// type-check.
 #[derive(Default)]
-pub(crate) struct WakerSlot(Option<Waker>);
+#[doc(hidden)]
+pub struct WakerSlot(Option<Waker>);
 
-pub(crate) enum WakerAction {
+#[doc(hidden)]
+pub enum WakerAction {
     Wake,
     DropInline,
     Dispose(Arc<dyn MailboxRuntime>),
@@ -26,22 +28,23 @@ enum WakerEffect {
 }
 
 #[derive(Default)]
-pub(crate) struct WakerEffects(Vec<WakerEffect>);
+#[doc(hidden)]
+pub struct WakerEffects(Vec<WakerEffect>);
 
 impl WakerSlot {
-    pub(crate) fn will_wake(&self, waker: &Waker) -> bool {
+    pub fn will_wake(&self, waker: &Waker) -> bool {
         self.0
             .as_ref()
             .is_some_and(|registered| registered.will_wake(waker))
     }
 
-    pub(crate) fn replace(&mut self, waker: Waker, effects: &mut WakerEffects) {
+    pub fn replace(&mut self, waker: Waker, effects: &mut WakerEffects) {
         if let Some(displaced) = self.0.replace(waker) {
             effects.push(displaced, WakerAction::DropInline);
         }
     }
 
-    pub(crate) fn take(&mut self, action: WakerAction, effects: &mut WakerEffects) {
+    pub fn take(&mut self, action: WakerAction, effects: &mut WakerEffects) {
         if let Some(waker) = self.0.take() {
             effects.push(waker, action);
         }
@@ -49,7 +52,7 @@ impl WakerSlot {
 }
 
 impl WakerEffects {
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
@@ -62,13 +65,13 @@ impl WakerEffects {
         });
     }
 
-    pub(crate) fn flush(&mut self, panics: &mut PanicAccumulator) {
+    pub fn flush(&mut self, panics: &mut PanicAccumulator) {
         for effect in self.0.drain(..) {
             match effect {
                 WakerEffect::Wake(waker) => panics.run(|| waker.wake()),
                 WakerEffect::DropInline(waker) => panics.run(|| drop(waker)),
                 WakerEffect::Dispose(runtime, waker) => {
-                    panics.run(|| dispose(&runtime, waker));
+                    panics.run(|| runtime.dispose(Box::new(waker)));
                 }
                 WakerEffect::Run(effect, waker) => panics.run(|| effect(waker)),
             }

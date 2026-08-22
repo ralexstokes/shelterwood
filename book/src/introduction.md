@@ -17,5 +17,9 @@ catalog, and the operational guides live in the
 specification lives in the repository's `specs/SPEC.md`. The final appendix,
 [Where the prose lives](appendix-where-prose-lives.md), maps that division.
 
+A closing part, [For maintainers](internals-shape.md), turns inward: it
+maps how the implementation itself is constructed and how data flows
+through it, for readers changing Shelterwood rather than building on it.
+
 If you want to skip straight to code, [A first system](first-system.md) has
 you running in a page.

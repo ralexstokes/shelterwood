@@ -34,9 +34,18 @@ impl Actor for IdleActor {
     }
 }
 
+/// The ordinal `Deadlined::poll` hands the timer proxy's stored caller waker.
+/// The operation registers its own clone first, so the timer's is second; the
+/// timer itself only ever sees the stable framework-owned proxy and mints no
+/// further clone through this vtable.
+const TIMER_CALLER_WAKER_ORDINAL: usize = 2;
+
+/// A caller waker whose timer-proxy clone blocks when the framework retires
+/// it. Naming the ordinal rather than blocking on whichever clone retires
+/// first keeps the fixture aimed at the timer seam the tests below describe.
 fn blocking_drop_waker(gate: &DestructorGate, entered: mpsc::Sender<ThreadId>) -> Waker {
     let blocker = gate.blocker();
-    action_ordinal_drop_waker(1, move || {
+    action_ordinal_drop_waker(TIMER_CALLER_WAKER_ORDINAL, move || {
         let _ = entered.send(thread::current().id());
         drop(blocker);
     })

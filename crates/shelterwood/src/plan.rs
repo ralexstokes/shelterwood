@@ -349,10 +349,7 @@ impl BuilderCore {
         id: impl Into<ChildId>,
         scope: Option<ScopeFlavor>,
     ) -> Result<Arc<SlotCell>, StaticReserveError> {
-        let id = id.into();
-        if id.as_str().is_empty() {
-            return Err(StaticReserveError::EmptyId);
-        }
+        let id = non_empty_id(id).ok_or(StaticReserveError::EmptyId)?;
         if self.ids.contains(&id) {
             return Err(StaticReserveError::DuplicateId(id));
         }
@@ -581,13 +578,15 @@ impl ScopeConstruction {
     }
 }
 
-pub(crate) fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError> {
+/// The one place the id-emptiness rule lives; each reservation error type
+/// names its own `EmptyId` on top of it.
+pub(crate) fn non_empty_id(id: impl Into<ChildId>) -> Option<ChildId> {
     let id = id.into();
-    if id.as_str().is_empty() {
-        Err(ReserveError::EmptyId)
-    } else {
-        Ok(id)
-    }
+    (!id.as_str().is_empty()).then_some(id)
+}
+
+pub(crate) fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError> {
+    non_empty_id(id).ok_or(ReserveError::EmptyId)
 }
 
 #[cfg(test)]

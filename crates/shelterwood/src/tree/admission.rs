@@ -151,7 +151,13 @@ impl<H> Admission<H> {
     }
 }
 
-impl<H: Unpin> Future for Admission<H> {
+// `Admission` never pins its contents: `poll` opens with `get_mut` and every
+// await point goes through an owned wait. The unconditional impl keeps that
+// structural fact from surfacing as a semantically empty `H: Unpin` bound on
+// the public `Future` impl.
+impl<H> Unpin for Admission<H> {}
+
+impl<H> Future for Admission<H> {
     type Output = Result<H, ReserveError>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {

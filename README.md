@@ -82,14 +82,16 @@ shutdown order. Use `DynamicTree` for concurrently started membership that can
 be added and removed at runtime. Actors and tasks are peers in either kind of
 scope, and subtrees compose both recursively.
 
-## Operational guides
+## Documentation
 
-- [Calls, retries, and message ordering](crates/shelterwood/docs/retry-and-ordering.md)
-  (rendered as a rustdoc guide page)
-- [Shutdown and resource ownership](crates/shelterwood/docs/shutdown-and-resources.md)
-  (rendered as a rustdoc guide page)
-- [Snapshots and lifecycle events](docs/observation.md)
-- [Embedding Shelterwood in a host process](docs/embedding.md)
+- **The book** ([`book/`](book/), `just book` to build): the narrative
+  on-ramp — from a first system through supervision, shutdown, dynamic
+  scopes, observation, and embedding in a host. Every code block is
+  included from the runnable examples.
+- **Rustdoc guide pages** (rendered with the API reference):
+  [calls, retries, and message ordering](crates/shelterwood/docs/retry-and-ordering.md),
+  [shutdown and resource ownership](crates/shelterwood/docs/shutdown-and-resources.md),
+  and [the error catalog](crates/shelterwood/docs/errors.md).
 
 The executable application-scale examples live in the M5 acceptance tests:
 [shard store](crates/shelterwood/tests/acceptance_shard_store.rs),

@@ -264,17 +264,3 @@ pub mod guides {
     #[doc = include_str!("../docs/errors.md")]
     pub mod errors {}
 }
-
-// Keep the repository-root narrative documents in the doctest compilation lane
-// so their examples stay compiled against the current API. The paths reach
-// outside the package directory, which is fine here: `cfg(doctest)` is active
-// only for repository-local `cargo test --doc`, so packaged builds and docs.rs
-// never resolve them.
-#[cfg(doctest)]
-mod repository_docs {
-    #[doc = include_str!("../../../docs/embedding.md")]
-    mod embedding {}
-
-    #[doc = include_str!("../../../docs/observation.md")]
-    mod observation {}
-}

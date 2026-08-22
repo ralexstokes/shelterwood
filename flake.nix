@@ -11,9 +11,9 @@
     { rust-env, ... }:
     rust-env.lib.mkRustProject {
       src = ./.;
-      # Markdown rides along for `include_str!` doc pages and the repo-root
-      # doctest lane; scripts under tools/ run in the clean build sandbox, and
-      # nextest reads its timeout config.
+      # Markdown rides along for `include_str!` doc pages and the book;
+      # scripts under tools/ run in the clean build sandbox, nextest reads
+      # its timeout config, and book.toml configures the mdbook check.
       extraSourceFilter =
         path: type:
         type == "regular"
@@ -21,7 +21,9 @@
           builtins.match ".*\\.md" (toString path) != null
           || builtins.match ".*\\.sh" (toString path) != null
           || builtins.match ".*/\\.config/nextest\\.toml" (toString path) != null
+          || builtins.match ".*/book\\.toml" (toString path) != null
         );
+      extraShellPackages = pkgs: [ pkgs.mdbook ];
       extraChecks =
         {
           pkgs,
@@ -37,6 +39,21 @@
               cargoArtifacts = cargoArtifactsNightly;
               cargoExtraArgs = "--locked";
               cargoClippyExtraArgs = "--workspace --lib -- -D warnings";
+              doInstallCargoArtifacts = false;
+            }
+          );
+
+          # The book's code blocks are includes of anchored regions from
+          # examples/, so a successful build proves the include paths and
+          # anchors resolve; the compile/run half lives in examples-run.
+          book-build = craneLibNightly.mkCargoDerivation (
+            commonArgs
+            // {
+              cargoArtifacts = cargoArtifactsNightly;
+              nativeBuildInputs = [ pkgs.mdbook ];
+              buildPhaseCargoCommand = ''
+                mdbook build book
+              '';
               doInstallCargoArtifacts = false;
             }
           );

@@ -37,6 +37,12 @@ runtime-api-check:
     cargo run --locked -p shelterwood-api-reachability -- target/doc/shelterwood.json
     ./tools/check-core-manifest.sh
 
+# A successful build proves the chapter include paths and example anchors
+# resolve; the included code compiles and runs in the `examples` recipe, so
+# the book needs no test lane of its own.
+book:
+    mdbook build book
+
 # Examples are smoke tests: each ends in assertions and a nonzero exit fails
 # the recipe. Keep the list in sync with crates/shelterwood/examples/ and the
 # flake's examples-run check.
@@ -59,7 +65,7 @@ nixfmt-check:
 
 # Fast local CI mirror — reuses the local cargo cache and incremental builds.
 # The clean Nix lane retains the explicit all-target build for non-test codegen coverage.
-ci: fmt lint lint-default test examples doc-check runtime-api-check external-consumer-check nixfmt-check
+ci: fmt lint lint-default test examples doc-check book runtime-api-check external-consumer-check nixfmt-check
 
 # Full clean Nix CI lane; use before pushing or when touching Nix files.
 ci-nix:

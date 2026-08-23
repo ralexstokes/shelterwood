@@ -1,6 +1,49 @@
 use super::{super::AdmissionInstall, support::*};
 use crate::plan::ChildPlan;
 
+#[derive(Debug)]
+struct PanicTerminationMailbox;
+
+impl crate::mailbox::MailboxControl for PanicTerminationMailbox {
+    fn configure(
+        &self,
+        _mailbox: shelterwood_core::policy::ResolvedMailbox,
+        _effects: &mut dyn crate::mailbox::MailboxEffectSink,
+    ) -> crate::mailbox::MailboxBindToken {
+        crate::mailbox::MailboxBindToken::new(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn bind(
+        &self,
+        _token: crate::mailbox::MailboxBindToken,
+        _incarnation: Incarnation,
+        _effects: &mut dyn crate::mailbox::MailboxEffectSink,
+    ) {
+    }
+
+    fn freeze(
+        &self,
+        _incarnation: Incarnation,
+        _effects: &mut dyn crate::mailbox::MailboxEffectSink,
+    ) {
+    }
+
+    fn close(
+        &self,
+        _incarnation: Incarnation,
+        _effects: &mut dyn crate::mailbox::MailboxEffectSink,
+    ) -> Option<crate::mailbox::MailboxClose> {
+        None
+    }
+
+    fn prepare_termination(
+        &self,
+        _effects: &mut dyn crate::mailbox::MailboxEffectSink,
+    ) -> Option<Box<dyn crate::mailbox::MailboxTermination>> {
+        panic!("injected locked admission terminalization panic")
+    }
+}
+
 #[crate::runtime::test]
 async fn refused_dynamic_admission_panics_after_control_plane_unlock() {
     let (mut scope, _events, mut dynamic_events, control) = running_dynamic_fixture();
@@ -104,6 +147,55 @@ async fn dropping_admission_install_completes_the_lost_response() {
     assert!(
         !root.observation_gate().is_poisoned(),
         "ledger fallback runs without the observation gate"
+    );
+}
+
+#[crate::runtime::test]
+async fn rejected_admission_retains_its_child_across_locked_terminalization() {
+    let (mut scope, _events, mut dynamic_events, control) = running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    let member = Arc::clone(&reservation.slot.member);
+    member.attach_mailbox(Arc::new(PanicTerminationMailbox));
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
+    let (mut response, request) = begin_admission(&reservation, &mut dynamic_events, None).await;
+
+    // Make the post-conversion, under-lock reservation recheck reject. Its
+    // never-started terminalization then invokes the hostile framework seam
+    // above while the observation gate is held.
+    let removed = control
+        .state
+        .lock()
+        .expect("dynamic-state mutex starts healthy")
+        .entries_mut()
+        .remove(member.id())
+        .expect("the fixture removes its exact reserved entry");
+    drop(removed);
+
+    let (finished, completion) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request)));
+        let _ = finished.send(result.is_err());
+    });
+
+    assert_eq!(
+        completion.recv_timeout(DRIVER_PROGRESS_WAIT),
+        Ok(true),
+        "the rejected child stays in AdmissionInstall until the gate-unlocking unwind; \
+         its terminality fallback must not re-enter the still-held gate"
+    );
+    assert!(matches!(
+        response.try_receive(),
+        Some(Err(ReserveError::NotAdmitting(
+            crate::NotAdmittingCause::Terminal
+        )))
+    ));
+    assert!(
+        !control.state.is_poisoned(),
+        "locked terminalization begins only after dynamic state is released"
     );
 }
 

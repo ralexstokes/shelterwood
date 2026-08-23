@@ -167,6 +167,10 @@ impl AdmissionInstall {
             .expect("an admission install inserts its child once")
     }
 
+    fn restore_child(&mut self, child: Box<ChildRuntime>) {
+        self.child = Some(child);
+    }
+
     fn claim_entry(&mut self, entry: DynamicEntry) {
         self.entry = Some(entry);
     }
@@ -1067,12 +1071,11 @@ impl ScopeRuntime {
                 if matches_reservation && let Some(entry) = state.remove(&id, txn) {
                     install.claim_entry(entry);
                 }
-                let child = install.take_child();
                 let slot = Arc::clone(install.slot());
                 drop(state);
                 slot.terminalize_never_started_locked(&root, txn);
                 return Err(AdmissionRejection {
-                    child,
+                    child: install.take_child(),
                     error: ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
                 });
             }
@@ -1089,11 +1092,16 @@ impl ScopeRuntime {
             let key = match self.insert_child(*child, false) {
                 Ok(key) => key,
                 Err(child) => {
+                    // Keep the rejected runtime in the outer ledger across
+                    // locked terminalization. If publication panics, dropping
+                    // the runtime here could re-enter this observation gate
+                    // through its terminality obligation.
+                    install.restore_child(child);
                     let slot = Arc::clone(install.slot());
                     drop(state);
                     slot.terminalize_never_started_locked(&root, txn);
                     return Err(AdmissionRejection {
-                        child,
+                        child: install.take_child(),
                         error: ReserveError::IdentityExhausted,
                     });
                 }

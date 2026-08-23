@@ -28,10 +28,19 @@
         {
           pkgs,
           craneLibNightly,
+          cargoSrc,
           commonArgs,
           cargoArtifactsNightly,
           ...
         }:
+        let
+          benchmarkLock = cargoSrc + "/tools/benchmarks/Cargo.lock";
+          benchmarkArgs = commonArgs // {
+            cargoLock = benchmarkLock;
+            cargoVendorDir = craneLibNightly.vendorCargoDeps { cargoLock = benchmarkLock; };
+            pname = "shelterwood-benchmark-check";
+          };
+        in
         {
           cargo-clippy-default = craneLibNightly.cargoClippy (
             commonArgs
@@ -88,6 +97,22 @@
                   target/doc/shelterwood.json
                 ${pkgs.bash}/bin/bash ./tools/check-core-manifest.sh
                 ${pkgs.bash}/bin/bash ./tools/check-external-consumer.sh
+              '';
+              doInstallCargoArtifacts = false;
+            }
+          );
+
+          # The Criterion harness has its own workspace and lockfile so its
+          # dependencies stay out of ordinary production builds. Compile it
+          # explicitly in the authoritative clean lane to prevent drift.
+          benchmark-check = craneLibNightly.mkCargoDerivation (
+            benchmarkArgs
+            // {
+              cargoArtifacts = null;
+              buildPhaseCargoCommand = ''
+                cargo clippy --locked --manifest-path tools/benchmarks/Cargo.toml \
+                  --all-targets -- -D warnings
+                cargo bench --locked --manifest-path tools/benchmarks/Cargo.toml --no-run
               '';
               doInstallCargoArtifacts = false;
             }

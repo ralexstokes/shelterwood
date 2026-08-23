@@ -211,13 +211,17 @@ impl<M> SendOperation<M> {
         let result = loop {
             let mut state = self.state.lock().expect("send operation mutex poisoned");
             let result = match &mut state.outcome {
-                // The replacement was cloned outside this lock. Completion can
-                // win that window, leaving a caller waker which must be retired
-                // before a terminal message is moved into the return value. A
-                // hostile destructor is contained at this ready seam for the
-                // same reason as reply and timer retirement: after the handoff,
-                // unwinding would destroy a user value in the poll frame.
-                OperationOutcome::Accepted(_) | OperationOutcome::Terminated { .. }
+                // The replacement was cloned outside this lock. Every outcome
+                // but `Waiting` refuses it, so it must be retired before this
+                // frame either moves a terminal message into the return value
+                // or raises one of the defensive diagnostics below. Both would
+                // otherwise destroy the caller waker mid-unwind -- beside a
+                // user value in the first case, inside an existing panic in the
+                // second. A hostile destructor is contained at this ready seam
+                // for the same reason as reply and timer retirement.
+                OperationOutcome::Accepted(_)
+                | OperationOutcome::Terminated { .. }
+                | OperationOutcome::Withdrawn
                     if replacement.is_some() =>
                 {
                     None
@@ -256,14 +260,14 @@ impl<M> SendOperation<M> {
 
             // Stage the clone through the structural waker sink, then drain it
             // with no operation lock held and before re-reading the stable
-            // completing outcome. `flush` catches its vtable panic; taking and
+            // non-waiting outcome. `flush` catches its vtable panic; taking and
             // discarding the payload prevents `PanicAccumulator::drop` from
             // resuming it over the eventual by-value result.
             let mut staged = WakerSlot::default();
             staged.replace(
                 replacement
                     .take()
-                    .expect("a completing clone window retains its replacement waker"),
+                    .expect("a refused clone window retains its replacement waker"),
                 &mut effects,
             );
             staged.take(WakerAction::DropInline, &mut effects);

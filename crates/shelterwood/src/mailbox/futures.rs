@@ -1202,6 +1202,19 @@ mod tests {
         assert_eq!(first, incarnation);
     }
 
+    /// Reaches the operation a parked send registered, so a regression can
+    /// drive or observe it directly.
+    fn parked_operation<M: Send + 'static>(
+        send: &Pin<Box<SendFuture<M>>>,
+    ) -> Arc<SendOperation<M>> {
+        match &send.as_ref().get_ref().state {
+            SendFutureState::Parked(operation) => Arc::clone(operation),
+            SendFutureState::Immediate(_) | SendFutureState::Sent(_) | SendFutureState::Done => {
+                panic!("an unbound mailbox parks its send")
+            }
+        }
+    }
+
     #[test]
     fn replacing_a_send_waker_runs_its_vtable_outside_the_operation_lock() {
         let (_, actor) = actor();
@@ -1211,12 +1224,7 @@ mod tests {
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        let operation = match &send.as_ref().get_ref().state {
-            SendFutureState::Parked(operation) => operation.clone(),
-            SendFutureState::Immediate(_) | SendFutureState::Sent(_) | SendFutureState::Done => {
-                panic!("an unbound mailbox parks its send")
-            }
-        };
+        let operation = parked_operation(&send);
         let calls = Arc::new(WakerVtableCalls::default());
         let hostile = operation_lock_probe_waker(&operation, Arc::clone(&calls));
 
@@ -1617,12 +1625,7 @@ mod tests {
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        let operation = match &send.as_ref().get_ref().state {
-            SendFutureState::Parked(operation) => operation.clone(),
-            SendFutureState::Immediate(_) | SendFutureState::Sent(_) | SendFutureState::Done => {
-                panic!("an unbound mailbox parks its send")
-            }
-        };
+        let operation = parked_operation(&send);
         let mut effects = MailboxEffectQueue::default();
         let teardown = MailboxControl::prepare_termination(&*mailbox, &mut effects)
             .expect("the mailbox terminates once");
@@ -1653,12 +1656,7 @@ mod tests {
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        let operation = match &send.as_ref().get_ref().state {
-            SendFutureState::Parked(operation) => operation.clone(),
-            SendFutureState::Immediate(_) | SendFutureState::Sent(_) | SendFutureState::Done => {
-                panic!("an unbound mailbox parks its send")
-            }
-        };
+        let operation = parked_operation(&send);
         let calls = Arc::new(WakerVtableCalls::default());
         let hostile = operation_lock_probe_waker(&operation, Arc::clone(&calls));
 
@@ -1790,12 +1788,7 @@ mod tests {
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        let operation = match &send.as_ref().get_ref().state {
-            SendFutureState::Parked(operation) => Arc::clone(operation),
-            SendFutureState::Immediate(_) | SendFutureState::Sent(_) | SendFutureState::Done => {
-                panic!("an unbound mailbox parks its send")
-            }
-        };
+        let operation = parked_operation(&send);
         let teardown = prepare_termination(&mailbox).expect("the mailbox terminates once");
         drop(teardown.finish());
         let retained = {
@@ -1816,5 +1809,108 @@ mod tests {
             Some("primary unwind")
         );
         assert_eq!(retained, 7);
+    }
+
+    #[test]
+    fn retiring_a_clone_window_replacement_runs_outside_the_operation_lock() {
+        let (mailbox, actor): (Arc<MailboxCell<u8>>, ActorRef<u8>) = actor_for();
+        let mut send = Box::pin(actor.send(7));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let operation = parked_operation(&send);
+        let completing = Arc::new(Mutex::new(Some(Arc::clone(&mailbox))));
+        let unlocked = Arc::new(Mutex::new(None));
+        let hostile = ManuallyDrop::new(probe_waker(
+            {
+                let completing = Arc::clone(&completing);
+                move || {
+                    let mailbox = completing
+                        .lock()
+                        .expect("completion probe mutex")
+                        .take()
+                        .expect("the replacement waker is cloned once");
+                    let teardown = prepare_termination(&mailbox)
+                        .expect("the clone-window probe terminates once");
+                    drop(teardown.finish());
+                }
+            },
+            {
+                let unlocked = Arc::clone(&unlocked);
+                let operation = Arc::downgrade(&operation);
+                move || {
+                    // Publish the observation instead of asserting it: this
+                    // destructor runs inside the retirement's own containment,
+                    // which would swallow a panic raised here. The test body
+                    // below is the only place that can fail.
+                    let operation = operation
+                        .upgrade()
+                        .expect("the polled operation outlives its replacement waker");
+                    let observed = operation.state.try_lock().is_ok();
+                    *unlocked.lock().expect("lock observation mutex") = Some(observed);
+                }
+            },
+        ));
+
+        let Poll::Ready(Err(error)) = send.as_mut().poll(&mut Context::from_waker(&hostile)) else {
+            panic!("termination in the clone window returns the message")
+        };
+        assert_eq!(error.kind, crate::SendErrorKind::Terminated);
+        assert_eq!(
+            *unlocked.lock().expect("lock observation mutex"),
+            Some(true),
+            "a refused replacement waker retires with no operation lock held"
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_clone_window_retires_its_replacement_before_the_diagnostic() {
+        let (_mailbox, actor): (Arc<MailboxCell<u8>>, ActorRef<u8>) = actor_for();
+        let mut send = Box::pin(actor.send(7));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let operation = parked_operation(&send);
+        let waker_thread = disposal_thread();
+        let hostile = ManuallyDrop::new(probe_waker(
+            {
+                let operation = Arc::downgrade(&operation);
+                move || {
+                    // Only the defensive diagnostic is reachable from a
+                    // withdrawn outcome, and the replacement must not ride its
+                    // unwind. No product path reaches this state -- the send
+                    // future's own state machine refuses a second poll -- so
+                    // the outcome is installed directly.
+                    let operation = operation
+                        .upgrade()
+                        .expect("the polled operation outlives its replacement waker");
+                    let mut state = operation.state.lock().expect("send operation mutex");
+                    state.outcome = OperationOutcome::Withdrawn;
+                }
+            },
+            {
+                let waker_thread = waker_thread.clone();
+                move || {
+                    record_disposal(&waker_thread);
+                    panic!("injected withdrawn-window waker drop panic");
+                }
+            },
+        ));
+        let polling_thread = std::thread::current().id();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut send = send;
+            let _ = send.as_mut().poll(&mut Context::from_waker(&hostile));
+        }))
+        .expect_err("a withdrawn operation raises its defensive diagnostic");
+        assert_eq!(
+            panic.downcast_ref::<String>().map(String::as_str),
+            Some("a withdrawn send future was polled")
+        );
+        assert_eq!(await_disposal(&waker_thread), polling_thread);
     }
 }

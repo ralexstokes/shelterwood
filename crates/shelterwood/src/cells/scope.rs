@@ -2204,71 +2204,119 @@ mod tests {
         );
     }
 
+    /// The venues that withdraw a resident from its scope. Every one of them
+    /// severs, so each pin below runs against all three.
+    #[derive(Clone, Copy, Debug)]
+    enum Retirement {
+        Prune,
+        Clear,
+        Replace,
+    }
+
+    impl Retirement {
+        fn retire(self, root: &Arc<ScopeCell>, member: &MemberCell) {
+            match self {
+                Self::Prune => assert!(root.prune_child(member)),
+                Self::Clear => root.clear_residents(),
+                Self::Replace => assert!(root.set_admitted_children(Vec::new())),
+            }
+        }
+    }
+
     #[test]
-    fn clearing_unannounced_nested_resident_severs_its_parent_link() {
+    fn retiring_an_unannounced_nested_resident_severs_its_parent_link() {
+        for retirement in [Retirement::Prune, Retirement::Clear, Retirement::Replace] {
+            let root = isolated_scope("root", ScopeFlavor::Ordered);
+            let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
+            let mut root_lifecycle = root.subscribe_lifecycle();
+            let mut nested_lifecycle = nested.subscribe_lifecycle();
+
+            // `set_parent` installs the back-link before this poisoned control
+            // lock unwinds the admission, leaving an unannounced resident behind.
+            let poisoned = Arc::clone(&nested);
+            assert!(
+                catch_unwind(AssertUnwindSafe(move || {
+                    let _control = poisoned.control.lock().expect("control starts healthy");
+                    panic!("inject admission bookkeeping panic");
+                }))
+                .is_err()
+            );
+            catch_unwind(AssertUnwindSafe(|| {
+                let _ = root.admit_child(ResidentProjection::new(
+                    Arc::clone(&nested.member),
+                    Some(Arc::clone(&nested)),
+                ));
+            }))
+            .expect_err("poisoned parent wiring unwinds admission");
+
+            assert!(Arc::ptr_eq(
+                &nested
+                    .parent()
+                    .expect("the failed admission installed its link"),
+                &root
+            ));
+            retirement.retire(&root, &nested.member);
+            assert!(
+                nested.parent().is_none(),
+                "{retirement:?} severs an unannounced resident's parent link"
+            );
+            assert_eq!(
+                root_lifecycle.try_recv(),
+                Err(LifecycleTryRecvError::Empty),
+                "the failed admission published neither membership edge"
+            );
+
+            nested.set_state(ScopeState::Stopped {
+                reason: StopReason::Finished,
+            });
+            assert!(matches!(
+                nested_lifecycle.try_recv(),
+                Ok(LifecycleItem::Event(_))
+            ));
+            assert_eq!(
+                root_lifecycle.try_recv(),
+                Err(LifecycleTryRecvError::Empty),
+                "post-retirement events stay local to the removed subtree ({retirement:?})"
+            );
+        }
+    }
+
+    /// Retirement severs; destroying a resident child does not.
+    ///
+    /// A refused duplicate admission temporarily owns a second `ResidentChild`
+    /// for an already-resident subtree and then disposes it, so a sever in
+    /// `Drop` would detach a subtree that is still resident under its original
+    /// parent. `rejected_nested_admission_preserves_original_parent_and_gate`
+    /// walks that refusal path, but it retires the duplicate through *detached*
+    /// disposal — the assertion outruns the drop, so only this synchronous
+    /// destruction pins the venue.
+    #[test]
+    fn destroying_a_resident_child_leaves_the_subtree_parent_link_installed() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
-        let mut root_lifecycle = root.subscribe_lifecycle();
-        let mut nested_lifecycle = nested.subscribe_lifecycle();
+        assert!(root.admit_child(ResidentProjection::new(
+            Arc::clone(&nested.member),
+            Some(Arc::clone(&nested)),
+        )));
 
-        // `set_parent` installs the back-link before this poisoned control
-        // lock unwinds the admission, leaving an unannounced resident behind.
-        let poisoned = Arc::clone(&nested);
+        drop(ResidentChild::new(ResidentProjection::new(
+            Arc::clone(&nested.member),
+            Some(Arc::clone(&nested)),
+        )));
+
         assert!(
-            catch_unwind(AssertUnwindSafe(move || {
-                let _control = poisoned.control.lock().expect("control starts healthy");
-                panic!("inject admission bookkeeping panic");
-            }))
-            .is_err()
-        );
-        catch_unwind(AssertUnwindSafe(|| {
-            let _ = root.admit_child(ResidentProjection::new(
-                Arc::clone(&nested.member),
-                Some(Arc::clone(&nested)),
-            ));
-        }))
-        .expect_err("poisoned parent wiring unwinds admission");
-
-        assert!(Arc::ptr_eq(
-            &nested
-                .parent()
-                .expect("the failed admission installed its link"),
-            &root
-        ));
-        root.clear_residents();
-        assert!(
-            nested.parent().is_none(),
-            "retiring an unannounced resident severs its parent link"
-        );
-        assert_eq!(
-            root_lifecycle.try_recv(),
-            Err(LifecycleTryRecvError::Empty),
-            "the failed admission published neither membership edge"
-        );
-
-        nested.set_state(ScopeState::Stopped {
-            reason: StopReason::Finished,
-        });
-        assert!(matches!(
-            nested_lifecycle.try_recv(),
-            Ok(LifecycleItem::Event(_))
-        ));
-        assert_eq!(
-            root_lifecycle.try_recv(),
-            Err(LifecycleTryRecvError::Empty),
-            "post-retirement events stay local to the removed subtree"
+            Arc::ptr_eq(
+                &nested
+                    .parent()
+                    .expect("residency still owns the upward observation edge"),
+                &root
+            ),
+            "a duplicate resident's destruction must not sever the original"
         );
     }
 
     #[test]
     fn announced_nested_retirement_makes_removed_the_last_parent_event() {
-        #[derive(Clone, Copy, Debug)]
-        enum Retirement {
-            Prune,
-            Clear,
-            Replace,
-        }
-
         for retirement in [Retirement::Prune, Retirement::Clear, Retirement::Replace] {
             let root = isolated_scope("root", ScopeFlavor::Ordered);
             let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
@@ -2291,11 +2339,7 @@ mod tests {
                 })) if added == membership
             ));
 
-            match retirement {
-                Retirement::Prune => assert!(root.prune_child(&nested.member)),
-                Retirement::Clear => root.clear_residents(),
-                Retirement::Replace => assert!(root.set_admitted_children(Vec::new())),
-            }
+            retirement.retire(&root, &nested.member);
             assert!(matches!(
                 root_lifecycle.try_recv(),
                 Ok(LifecycleItem::Event(LifecycleEvent {

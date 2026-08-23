@@ -28,13 +28,16 @@
         {
           pkgs,
           craneLibNightly,
-          cargoSrc,
           commonArgs,
           cargoArtifactsNightly,
           ...
         }:
         let
-          benchmarkLock = cargoSrc + "/tools/benchmarks/Cargo.lock";
+          # Vendor evaluation happens during `nix flake check --no-build`,
+          # before the filtered cargo source has necessarily been realised.
+          # Point at the checked-in lockfile directly so evaluation remains
+          # independent of that build ordering.
+          benchmarkLock = ./tools/benchmarks/Cargo.lock;
           benchmarkArgs = commonArgs // {
             cargoLock = benchmarkLock;
             cargoVendorDir = craneLibNightly.vendorCargoDeps { cargoLock = benchmarkLock; };

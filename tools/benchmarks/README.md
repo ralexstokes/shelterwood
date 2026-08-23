@@ -23,6 +23,12 @@ Criterion accepts a name filter after `--`. For example:
   --manifest-path tools/benchmarks/Cargo.toml -- core/deadline
 ```
 
+The core supervisor `startup` and `drain` cases apply one child's transition
+sequence and then settle before advancing to the next child. They deliberately
+stress incremental, level-triggered settlement; they do not model the driver's
+event-batch distribution. End-to-end lifecycle benchmarks build on this
+harness in the stacked series.
+
 ## Measurement contract
 
 - Each benchmark name identifies the exact work inside the timed region.

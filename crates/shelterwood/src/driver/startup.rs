@@ -114,17 +114,19 @@ impl ScopeRuntime {
         self.record_storage();
     }
 
-    pub(super) fn fail_startup(&mut self, key: ChildKey, exit: Exit) {
+    pub(super) fn fail_startup(&mut self, key: ChildKey, exit: &RetainedExit) {
         // Several initial children can fail in one arbitration batch. The
         // first failure owns the startup verdict and its sole lifecycle edge;
         // later exits are still terminalized, but cannot republish the scope
-        // transition or replace the authoritative cause.
+        // transition or replace the authoritative cause. Keep the caller's
+        // retained owner alive while this raw structured copy crosses the
+        // child lookup, reducer verdict and publication paths.
         let child = &self.children[key];
         let failure = StartupFailure {
             cause: StartupFailureCause::Child {
                 id: child.slot.member.id().clone(),
                 membership: child.slot.member.membership(),
-                exit,
+                exit: exit.as_exit().clone(),
             },
         };
         let Some(state) = supervisor_fail_startup(&mut self.supervisor) else {
@@ -139,7 +141,7 @@ impl ScopeRuntime {
                 {
                     self.begin_terminal_disposal(
                         later,
-                        Exit::never_started(),
+                        RetainedExit::new(Exit::never_started()),
                         None,
                         StartupDisposition::NotAborted,
                     );

@@ -1,4 +1,5 @@
 use super::support::*;
+use crate::cells::RetainedExit;
 
 struct BlockingFactoryDrop(Arc<FactoryGate>);
 
@@ -294,9 +295,11 @@ async fn refused_terminal_disposal_retires_its_exit_off_the_driver() {
     let (error, disposed) = thread_reporting_error();
     let driver_thread = std::thread::current().id();
 
+    // The carrier makes retention structural; the destructor-thread probe
+    // still pins the refusal's disposal artifact to the blocking pool.
     scope.begin_terminal_disposal(
         ChildKey::fixture(999),
-        Exit::failed(error, Cancellation::NotObserved),
+        RetainedExit::new(Exit::failed(error, Cancellation::NotObserved)),
         None,
         StartupDisposition::NotAborted,
     );

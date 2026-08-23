@@ -208,6 +208,7 @@ impl MailboxEffectSink for ObservationTxn<'_> {
 #[cfg(test)]
 mod tests {
     use std::{
+        fmt,
         future::Future,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
@@ -264,6 +265,33 @@ mod tests {
     impl Drop for DropSignal {
         fn drop(&mut self) {
             let _ = self.0.send(());
+        }
+    }
+
+    /// A user error payload that reports whether the gate was held when its
+    /// destructor ran.
+    struct GatePresenceProbe {
+        gate: ObservationGate,
+        observed: mpsc::SyncSender<bool>,
+    }
+
+    impl fmt::Debug for GatePresenceProbe {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("GatePresenceProbe")
+        }
+    }
+
+    impl fmt::Display for GatePresenceProbe {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("gate presence probe")
+        }
+    }
+
+    impl std::error::Error for GatePresenceProbe {}
+
+    impl Drop for GatePresenceProbe {
+        fn drop(&mut self) {
+            let _ = self.observed.send(self.gate.is_held());
         }
     }
 
@@ -326,6 +354,40 @@ mod tests {
                 .expect("the failed payload is eventually destroyed"),
             retiring_thread,
             "surrender must precede a queued owner's concurrent disposal"
+        );
+    }
+
+    /// Production surrenders always have a co-owner, so their raw release is
+    /// refcount traffic and the venue is invisible. This one is deliberately
+    /// the sole owner: its destructor then runs at the exact moment the
+    /// surrender releases the raw exit, which is the only way to pin that the
+    /// release is queued rather than performed at the call site.
+    #[test]
+    fn observation_txn_surrender_releases_the_raw_exit_after_unlock() {
+        let gate = ObservationGate::new();
+        let (released, observed) = mpsc::sync_channel(1);
+        let retained = RetainedExit::new(Exit::failed(
+            ExitError::from(GatePresenceProbe {
+                gate: gate.clone(),
+                observed: released,
+            }),
+            Cancellation::NotObserved,
+        ));
+        let mut txn = ObservationTxn::new(&gate, gate.lock());
+
+        txn.surrender([retained]);
+        assert!(
+            observed.try_recv().is_err(),
+            "a surrender under the gate queues the release rather than running it"
+        );
+
+        drop(txn);
+
+        assert!(
+            !observed
+                .recv_timeout(TEST_WAIT)
+                .expect("the surrendered exit is released"),
+            "surrender must release its raw exit only after the gate is unlocked"
         );
     }
 

@@ -34,7 +34,10 @@ impl RetainedExit {
     /// Framework-internal copies must instead go through
     /// [`ObservationTxn::surrender`], which makes their pre-commit co-owner
     /// proof structural and releases them only after the observation gate.
-    pub(crate) fn into_user_owned(mut self) -> Exit {
+    /// `pub(in crate::cells)` is what keeps that structural: no driver-layer
+    /// caller can reach the raw exit at all, so a framework carrier crossing
+    /// a driver seam has to stay a carrier.
+    pub(super) fn into_user_owned(mut self) -> Exit {
         self.0.take().expect("retained exit was already taken")
     }
 

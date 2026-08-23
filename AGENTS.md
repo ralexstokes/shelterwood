@@ -71,11 +71,15 @@ rests on:
   `reconcile_recorded_outcomes_retaining` and
   `classify_disposal_panic_retaining`; the raw `shelterwood-core` folds hand
   both halves back and are for core's own tests.
-  `RetainedExit::into_user_owned` is deliberately narrower than surrender: it
-  appears only at the three genuine public-ownership handoffs
-  (`RetainedStopReason::into_public`, `RetainedLifecycleEvent::into_public`,
-  and the root completion handoff in `driver.rs`). Framework-internal raw
-  refcount drops go through `ObservationTxn::surrender` instead.
+  `RetainedExit::into_user_owned` is deliberately narrower than surrender, and
+  `pub(in crate::cells)` is what keeps it narrow: no driver-layer caller can
+  extract a raw `Exit` from a carrier at all, so a carrier crossing a driver
+  seam stays a carrier. Its two remaining users are
+  `RetainedLifecycleEvent::into_public`, the one genuine hand-off to a
+  user-owned value, and `RetainedStopReason::into_public`, whose two call
+  sites release a framework copy beside an installed co-owner and therefore
+  still rest on the older conventional proof. Every other framework-internal
+  raw refcount drop goes through `ObservationTxn::surrender`.
   `RetainedExitResult` closes the earlier raw-incarnation window: the completed
   callback result stays in that carrier across the fallible teardown epilogue,
   so an epilogue panic transfers a failed result to critical disposal instead

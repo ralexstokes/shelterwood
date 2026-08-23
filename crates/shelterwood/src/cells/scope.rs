@@ -627,7 +627,6 @@ impl ScopeCell {
         }
         let mut state = Some(state);
         let mut startup = startup;
-        let mut startup_installed = false;
         let published = self.with_observation_gate(|txn| {
             if !terminal_disposals.iter().all(|member| {
                 self.current_observation_gate()
@@ -635,13 +634,12 @@ impl ScopeCell {
             }) {
                 return false;
             }
-            if let Some(startup) = startup.take() {
-                startup_installed = self.set_startup_locked(startup, txn);
-                if startup_installed {
-                    // The record now owns the diagnostic guards' raw peer.
-                    // Queue their surrender before this transaction commits.
-                    txn.surrender(std::mem::take(&mut retained_startup));
-                }
+            if let Some(startup) = startup.take()
+                && self.set_startup_locked(startup, txn)
+            {
+                // The record now owns the diagnostic guards' raw peer.
+                // Queue their surrender before this transaction commits.
+                txn.surrender(std::mem::take(&mut retained_startup));
             }
             self.set_state_locked(
                 state
@@ -656,13 +654,12 @@ impl ScopeCell {
             published,
             "a drain entry may mark only a resident member on its observation gate"
         );
-        if !startup_installed {
-            // A record that already held a startup result rejected this one,
-            // and the rejected raw result retired through the transaction's
-            // own guards — into isolated disposal, which is still running.
-            // These guards therefore retire through critical disposal too.
-            drop(retained_startup);
-        }
+        // Empty once the transaction surrendered them above. Otherwise a
+        // record that already held a startup result rejected this one, and the
+        // rejected raw result retired through the transaction's own guards —
+        // into isolated disposal, which is still running. These guards
+        // therefore retire through critical disposal too.
+        drop(retained_startup);
     }
 
     fn set_state_locked(
@@ -1031,13 +1028,19 @@ impl ScopeCell {
         self.finish_incarnation_with_terminal(epoch, RetainedStopReason::new(reason), None);
     }
 
+    /// Takes the terminal exit as a carrier so a root completion never
+    /// extracts a raw `Exit` between framework layers. Wrapping before the
+    /// stop reason keeps a failed payload guarded across every step of this
+    /// call, including the reason's own retention walk.
     #[cfg(test)]
-    pub(crate) fn finish_root_incarnation(&self, epoch: Epoch, reason: StopReason, exit: Exit) {
-        self.finish_incarnation_with_terminal(
-            epoch,
-            RetainedStopReason::new(reason),
-            Some(RetainedExit::new(exit)),
-        );
+    pub(crate) fn finish_root_incarnation(
+        &self,
+        epoch: Epoch,
+        reason: StopReason,
+        exit: impl Into<RetainedExit>,
+    ) {
+        let exit = exit.into();
+        self.finish_incarnation_with_terminal(epoch, RetainedStopReason::new(reason), Some(exit));
     }
 
     fn finish_incarnation_with_terminal(

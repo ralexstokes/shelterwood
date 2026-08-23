@@ -733,7 +733,7 @@ impl ScopeRuntime {
             // Exhaustion is a terminal outcome, not an exceptional cleanup
             // path. Join retained-definition disposal before terminality,
             // retention, removal completion, or ordered-scope progression.
-            self.begin_terminal_disposal(key, exit, None, startup);
+            self.begin_terminal_disposal(key, RetainedExit::new(exit), None, startup);
             return;
         };
 
@@ -914,7 +914,12 @@ impl ScopeRuntime {
             // A never-ran child and a child stopped between restart
             // incarnations share the same post-disposal terminal route. Hard
             // shutdown still detaches disposal through `hard_forced` below.
-            self.begin_terminal_disposal(key, exit, None, StartupDisposition::NotAborted);
+            self.begin_terminal_disposal(
+                key,
+                RetainedExit::new(exit),
+                None,
+                StartupDisposition::NotAborted,
+            );
         }
     }
 
@@ -1108,7 +1113,7 @@ impl ScopeRuntime {
             membership_status,
         ) {
             ExitDispatch::Terminal => {
-                self.begin_terminal_disposal(key, exit.into_exit(), Some(incarnation), startup);
+                self.begin_terminal_disposal(key, exit, Some(incarnation), startup);
             }
             ExitDispatch::ScheduleRestart => {
                 let sample =
@@ -1220,14 +1225,15 @@ impl ScopeRuntime {
     pub(super) fn begin_terminal_disposal(
         &mut self,
         key: ChildKey,
-        exit: Exit,
+        exit: RetainedExit,
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) {
-        // Retain before every refusal and invariant verdict. A failed Exit can
-        // own hostile user error drop glue, so no path may unwind or return it
-        // directly on the driver thread.
-        let mut exit = Some(RetainedExit::new(exit));
+        // Keep the caller's guard through every refusal and invariant verdict.
+        // A failed Exit can own hostile user error drop glue, so no call-site
+        // argument window or local path may unwind or return it directly on
+        // the driver thread.
+        let mut exit = Some(exit);
         if !self.supervisor.contains(key)
             || self.supervisor.is_disposing(key)
             || self.supervisor.joined(key)
@@ -1322,8 +1328,12 @@ impl ScopeRuntime {
         } else {
             StartupDisposition::NotAborted
         };
-        let exit = exit.into_exit();
-        self.terminalize_child(key, exit.clone(), terminal.exited_incarnation, startup);
+        let terminalized = self.terminalize_child(
+            key,
+            exit.as_exit().clone(),
+            terminal.exited_incarnation,
+            startup,
+        );
         // Keep the marker installed until terminal publication has committed.
         // A concurrent shutdown sampler then sees either pending cleanup or a
         // terminal member, never the gap between those two representations.
@@ -1334,15 +1344,27 @@ impl ScopeRuntime {
         member.set_terminal_disposal_pending(false);
         if self.supervisor.membership_status(key) == MembershipStatus::Removing {
             self.flush_supervisor_effects();
+            if terminalized {
+                // The retained member record outlives this early return.
+                drop(exit.into_exit());
+            }
             return;
         }
         if terminal.startup == StartupDisposition::Aborted
             && !self.supervisor.lifecycle().is_draining()
         {
-            self.fail_startup(key, exit);
+            self.fail_startup(key, &exit);
         }
         if self.children[key].options.retention == crate::Retention::Remove {
             self.prune_terminal(key);
+        }
+        if terminalized {
+            // The terminal member record owns an equivalent retained copy.
+            // Keep the guard through every later fallible operation above,
+            // then surrender it as raw refcount traffic. A losing publication
+            // leaves the guard intact so its drop retires the exit through
+            // critical disposal.
+            drop(exit.into_exit());
         }
     }
 }

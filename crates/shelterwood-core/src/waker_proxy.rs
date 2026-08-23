@@ -127,8 +127,9 @@ impl ProxiedPoll {
 /// The proxy mutex is a **leaf**: [`Wake::wake_by_ref`] takes it from whatever
 /// thread drives the external primitive, so nothing this type does under it may
 /// take another framework lock. Its guard acquisition deliberately recovers
-/// poison: the registration contains only framework-owned bookkeeping, and a
-/// poisoned leaf must not introduce a panic into unwind-reachable retirement.
+/// poison: nothing the leaf guards carries an invariant a panic could tear
+/// (see [`WakerProxyState::registration`]), and a poisoned leaf must not
+/// introduce a panic into unwind-reachable retirement.
 #[doc(hidden)]
 pub struct WakerProxy {
     proxy: Waker,
@@ -152,10 +153,20 @@ impl WakerProxyState {
     /// Acquires the leaf registration without turning an earlier bookkeeping
     /// panic into a second panic at a later proxy operation.
     ///
-    /// No user code runs under this mutex and `Registration` contains only
-    /// framework-owned state, so poison marks no application invariant that
-    /// callers could rely on. Every acquisition goes through this helper so
-    /// the non-panicking policy is structural, including drop-glue retirement.
+    /// No user code runs under this mutex: every critical section here only
+    /// compares waker pointers, sets a `bool`, or moves a `Waker` between the
+    /// slot and an effects sink that was built before the guard. Nothing the
+    /// pair holds is therefore mid-update at a panic point, and what a
+    /// recovered guard can expose is bounded to an unconsumed `woken` record,
+    /// which costs the next caller one spurious poll. The converse — a
+    /// cleared record beside an already-removed waker, the lost wake this
+    /// proxy exists to prevent — is not producible: [`Wake::wake_by_ref`]
+    /// sets the record and empties the slot in one critical section with no
+    /// panic point between them.
+    ///
+    /// Every acquisition goes through this helper so the non-panicking policy
+    /// is structural, including drop-glue retirement, where an `.expect` on a
+    /// poisoned leaf during an unwind aborts rather than fails.
     fn registration(&self) -> MutexGuard<'_, Registration> {
         self.caller.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -337,6 +348,19 @@ mod tests {
         }
     }
 
+    /// Fails the calling test when the proxy mutex is still held.
+    ///
+    /// Only `WouldBlock` means user code is running under the guard:
+    /// `try_lock` also reports a *free* mutex as an error once it is poisoned,
+    /// which the poison-recovery test injects deliberately. Treating that as a
+    /// held lock would turn every reentrancy probe into a false failure.
+    fn assert_proxy_released(state: &Weak<WakerProxyState>, held: &'static str) {
+        let state = state.upgrade().expect("the proxy remains live");
+        if let Err(TryLockError::WouldBlock) = state.caller.try_lock() {
+            panic!("{held}");
+        }
+    }
+
     struct ReentrantWake {
         proxy: Weak<WakerProxyState>,
         wakes: Arc<AtomicUsize>,
@@ -344,11 +368,10 @@ mod tests {
 
     impl Wake for ReentrantWake {
         fn wake(self: Arc<Self>) {
-            let state = self.proxy.upgrade().expect("the proxy remains live");
-            let _guard = state
-                .caller
-                .try_lock()
-                .expect("a forwarded wake runs after the proxy mutex is released");
+            assert_proxy_released(
+                &self.proxy,
+                "a forwarded wake runs after the proxy mutex is released",
+            );
             self.wakes.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -363,14 +386,10 @@ mod tests {
 
     impl Drop for ReentrantDrop {
         fn drop(&mut self) {
-            let state = self.0.upgrade().expect("the proxy remains live");
-            let _guard = match state.caller.try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::Poisoned(error)) => error.into_inner(),
-                Err(TryLockError::WouldBlock) => {
-                    panic!("a displaced waker drops after the proxy mutex is released")
-                }
-            };
+            assert_proxy_released(
+                &self.0,
+                "a displaced waker drops after the proxy mutex is released",
+            );
         }
     }
 
@@ -384,11 +403,10 @@ mod tests {
         // matching type. ManuallyDrop preserves the reference represented by
         // `data`; the returned raw waker owns only the new clone.
         let probe = ManuallyDrop::new(unsafe { Arc::<ReentrantClone>::from_raw(data.cast()) });
-        let state = probe.proxy.upgrade().expect("the proxy remains live");
-        let _guard = state
-            .caller
-            .try_lock()
-            .expect("a caller waker clones after the proxy mutex is released");
+        assert_proxy_released(
+            &probe.proxy,
+            "a caller waker clones after the proxy mutex is released",
+        );
         probe.clones.fetch_add(1, Ordering::SeqCst);
         RawWaker::new(
             Arc::into_raw(Arc::clone(&probe)).cast(),
@@ -694,7 +712,7 @@ mod tests {
     #[test]
     fn poisoned_proxy_leaf_remains_usable_across_every_transition() {
         let proxy = WakerProxy::new();
-        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+        let injected = catch_unwind(AssertUnwindSafe(|| {
             let _registration = proxy
                 .state
                 .caller
@@ -702,19 +720,34 @@ mod tests {
                 .expect("the fresh proxy mutex is not poisoned");
             panic!("poison the framework-only proxy leaf");
         }));
-        assert!(poisoned.is_err());
+        assert!(injected.is_err());
+        // Every step below would also pass on an unpoisoned proxy, so the
+        // premise is asserted rather than assumed: a panic escaping before the
+        // guard was acquired would leave nothing to recover from.
+        assert!(
+            proxy.state.caller.is_poisoned(),
+            "the injected panic has to leave the leaf poisoned for recovery to be under test"
+        );
 
         let first = Arc::new(CountWake::default());
         proxy.register(&Waker::from(Arc::clone(&first)));
         proxy.waker().wake_by_ref();
-        assert_eq!(first.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first.0.load(Ordering::SeqCst),
+            1,
+            "registration and wake delivery both recover the poisoned leaf"
+        );
 
-        // Clear the wake record before installing a caller that explicit
-        // retirement must actually remove from the poisoned registration.
+        // Clear the wake record that delivery leaves set, so the callers
+        // installed below are not woken by an event predating them.
         let mut effects = WakerEffects::default();
         proxy.retire(WakerAction::DropInline, &mut effects);
         drop(effects);
 
+        // Then each retirement seam in turn, because every one of them is
+        // reachable from drop glue, where a panicking acquisition during an
+        // unwind is an abort rather than a failure. First the mailbox seam:
+        // `retire` into an effects sink (`DisposingReceiver::drop`).
         let retired = Waker::from(Arc::new(ReentrantDrop(Arc::downgrade(&proxy.state))));
         proxy.register(&retired);
         drop(retired);
@@ -722,9 +755,26 @@ mod tests {
         proxy.retire(WakerAction::DropInline, &mut effects);
         drop(effects);
 
-        // Leave a caller installed so drop glue both acquires the poisoned
-        // leaf and drains a real user waker. Its reentrant destructor proves
-        // that the recovered guard was released before the effect ran.
+        // Then the cross-crate seam `shelterwood-runtime`'s `ProxiedPoll::drop`
+        // uses, which both takes the caller and runs the chosen effect.
+        let wakes = Arc::new(AtomicUsize::new(0));
+        proxy.register(&Waker::from(Arc::new(ReentrantWake {
+            proxy: Arc::downgrade(&proxy.state),
+            wakes: Arc::clone(&wakes),
+        })));
+        let mut panics = PanicAccumulator::default();
+        proxy.retire_with(forward_wake, &mut panics);
+        assert!(panics.take().is_none());
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "retire_with still takes the caller and forwards it after unlock"
+        );
+
+        // Finally the fallback: leave a caller installed so drop glue both
+        // acquires the poisoned leaf and drains a real user waker. Its
+        // reentrant destructor proves the recovered guard was released before
+        // the effect ran.
         let dropped = Waker::from(Arc::new(ReentrantDrop(Arc::downgrade(&proxy.state))));
         proxy.register(&dropped);
         drop(dropped);

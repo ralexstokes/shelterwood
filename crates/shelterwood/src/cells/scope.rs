@@ -395,6 +395,18 @@ impl ScopeCell {
         })
     }
 
+    /// Diagnostic for the dynamic admission install exemption.
+    ///
+    /// A reservation is adopted onto this scope's gate before publication and
+    /// the live dynamic route prevents the root from being re-homed. The
+    /// driver asserts that invariant when it creates the install ledger, so
+    /// the later handoff check cannot acquire another gate under dynamic
+    /// state.
+    pub(crate) fn shares_observation_gate_with(&self, member: &MemberCell) -> bool {
+        self.current_observation_gate()
+            .shares_gate(&member.current_observation_gate())
+    }
+
     fn current_children(&self) -> MutexGuard<'_, Vec<ResidentChild>> {
         self.observation
             .current_children

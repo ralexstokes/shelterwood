@@ -1,4 +1,5 @@
-use super::support::*;
+use super::{super::AdmissionInstall, support::*};
+use crate::plan::ChildPlan;
 
 #[crate::runtime::test]
 async fn refused_dynamic_admission_panics_after_control_plane_unlock() {
@@ -29,8 +30,12 @@ async fn refused_dynamic_admission_panics_after_control_plane_unlock() {
     member.update(|record| record.stage = MemberStage::Running);
     let refusal = catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request)))
         .expect_err("a refused dynamic admission fails closed in every profile");
+    let invariant = refusal
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| refusal.downcast_ref::<&str>().copied());
     assert_eq!(
-        refusal.downcast_ref::<String>().map(String::as_str),
+        invariant,
         Some("a promoted reservation is admitted from `Reserved` exactly once"),
         "the framework invariant stays primary over the hostile response wake"
     );
@@ -69,6 +74,37 @@ async fn refused_dynamic_admission_panics_after_control_plane_unlock() {
     // fail-closed epilogue can discharge this deliberately corrupted fixture.
     member.update(|record| record.stage = MemberStage::Reserved);
     assert!(root.admit_child(resident_projection(&reservation.slot)));
+}
+
+#[crate::runtime::test]
+async fn dropping_admission_install_completes_the_lost_response() {
+    let (scope, _events, mut dynamic_events, _control) = running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
+    let (mut response, request) = begin_admission(&reservation, &mut dynamic_events, None).await;
+    let (definition, resolved) = request
+        .slot
+        .resolve_and_take_defined(&scope.defaults)
+        .expect("the defined reservation resolves once");
+    let plan = ChildPlan::with_options(Arc::clone(&request.slot), definition, resolved);
+    let child = ChildRuntime::from_plan(plan, &root);
+
+    drop(AdmissionInstall::new(&root, request, child));
+
+    assert!(matches!(
+        response.try_receive(),
+        Some(Err(ReserveError::NotAdmitting(
+            crate::NotAdmittingCause::Terminal
+        )))
+    ));
+    assert!(
+        !root.observation_gate().is_poisoned(),
+        "ledger fallback runs without the observation gate"
+    );
 }
 
 #[crate::runtime::test(start_paused = true)]

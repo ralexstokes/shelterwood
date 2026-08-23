@@ -17,12 +17,15 @@ use std::{
     mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context as TaskContext, Poll, Waker},
     time::Duration,
 };
 
-use common::{ordinal_drop_waker, probe_waker};
+use common::{ordinal_drop_waker, probe_waker_with_wake};
 use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Reply, Tree};
 
 const OUTER_PANIC: &str = "injected outer panic";
@@ -53,11 +56,12 @@ impl Actor for HoldingActor {
 }
 
 fn panicking_drop_waker() -> Waker {
-    let first = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    probe_waker(
+    let first = Arc::new(AtomicBool::new(false));
+    probe_waker_with_wake(
         || {},
+        || panic!("injected waker wake panic"),
         move || {
-            if !first.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if !first.swap(true, Ordering::SeqCst) {
                 panic!("injected waker drop panic");
             }
         },

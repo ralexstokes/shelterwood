@@ -398,7 +398,7 @@ impl BuilderCore {
             // not this builder's throwaway root.
             self.adopting_root = Some(Arc::clone(&root));
             for slot in &self.slots {
-                match root.adopt_or_mint_membership(slot.member.id(), slot.member.membership()) {
+                match root.adopt_or_mint_membership(slot.member.take_provisional_membership()) {
                     MembershipReconciliation::Adopted => {}
                     MembershipReconciliation::Minted(identity) => {
                         slot.member.rebase_membership(identity);

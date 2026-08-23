@@ -15,7 +15,10 @@ use shelterwood_core::{
     ChildId, Exit, Incarnation, Membership, TotalRestarts,
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{StartupError, StopReason, stop_reason_precedence},
-    identity::{AtomicPoisonedCounter, MembershipReconciliation, MintedMembership, ScopeIdentity},
+    identity::{
+        AtomicPoisonedCounter, MembershipReconciliation, MintedMembership, ProvisionalMembership,
+        ScopeIdentity,
+    },
     panic::{catch_panic, discard_panic},
     policy::ScopeFlavor,
 };
@@ -244,13 +247,12 @@ impl ScopeCell {
 
     pub(crate) fn adopt_or_mint_membership(
         &self,
-        id: &ChildId,
-        provisional: Membership,
+        provisional: ProvisionalMembership,
     ) -> MembershipReconciliation {
         self.child_identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .adopt_or_mint_membership(id, provisional)
+            .adopt_or_mint_membership(provisional)
     }
 
     pub(crate) fn evict_child_identity(&self, member: &MemberCell) {

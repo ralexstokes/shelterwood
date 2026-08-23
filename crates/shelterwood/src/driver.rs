@@ -176,20 +176,88 @@ fn monitor_root_driver(
     monitor_root: Arc<ScopeCell>,
     driver: runtime::JoinHandle<RetainedStopReason>,
 ) -> runtime::JoinHandle<RetainedStopReason> {
+    // Constructed before the future so it is an upvar of the `async move`
+    // block rather than a local of its body: an `async` block owns its
+    // captures from creation, so the fence retires even for a monitor task
+    // that is dropped without ever being polled.
+    let mut fence = MonitorFence::armed(monitor_root);
     runtime::spawn(async move {
         match classify_retained_root_driver_join(runtime::join(driver).await) {
             Ok(reason) => {
                 let public_reason = reason.as_reason().clone();
                 let exit = stop_reason_root_exit(&public_reason);
-                finish_monitored_root(&monitor_root, public_reason, exit);
+                fence.publish(public_reason, exit);
                 reason
             }
             Err(exit) => {
-                finish_monitored_root(&monitor_root, StopReason::ShutdownRequested, exit);
+                fence.publish(StopReason::ShutdownRequested, exit);
                 RetainedStopReason::new(StopReason::ShutdownRequested)
             }
         }
     })
+}
+
+/// The monitor body's root-terminality duty, held across the driver join.
+///
+/// Invariant: **the monitor future never completes or is dropped without root
+/// membership terminality having been published.** Since `ScopeRuntime::drop`
+/// deliberately leaves root terminality to this monitor, an unpublished fence
+/// would strand every retained `wait_stopped()` observer forever and leave the
+/// observation streams open — the guard is what makes that unrepresentable.
+///
+/// The only way to reach `drop` still armed is cancellation of the monitor
+/// task itself: dropping the monitor's `JoinHandle` merely detaches, and no
+/// framework path aborts it. Runtime teardown is the reachable case, where
+/// every spawned task future is dropped, polled or not. Cancellation is also why the fallback
+/// verdict is not speculative: the driver's own `JoinHandle` lives inside the
+/// dropped join future, so the driver's real outcome becomes unobservable to
+/// everyone at exactly this moment, and the one join anyone can still observe
+/// — the monitor handle — resolves `Cancelled`. Publishing that outcome's
+/// classification is therefore a statement about the join that did settle, and
+/// it is bit-for-bit the verdict `SystemRun::join_driver`'s self-heal computes
+/// for the same cancellation. Should both run, member terminalization is
+/// first-writer-wins and the record lattice treats an equal verdict as an
+/// idempotent repeat, so neither can outrank or race the other.
+///
+/// Teardown drops the two tasks in an unspecified order, so the fence can
+/// precede the driver's own epilogue and close observation ahead of its final
+/// `Removed` edges. That truncation is confined to a runtime that is going
+/// away underneath its subscribers, and it is strictly the better half of the
+/// trade against an observer that never resolves at all.
+///
+/// Publication goes through [`finish_monitored_root`], which contains any
+/// hostile terminal-wake panic: this `drop` runs in task drop glue on a
+/// teardown thread that may already be unwinding, where a second panic would
+/// abort the process. The cancellation exit owns no user error, so the guard
+/// adds no user-value destruction and no lock site of its own.
+struct MonitorFence {
+    root: Arc<ScopeCell>,
+    armed: bool,
+}
+
+impl MonitorFence {
+    fn armed(root: Arc<ScopeCell>) -> Self {
+        Self { root, armed: true }
+    }
+
+    fn publish(&mut self, reason: StopReason, exit: Exit) {
+        finish_monitored_root(&self.root, reason, exit);
+        self.armed = false;
+    }
+}
+
+impl Drop for MonitorFence {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // A cancelled join never classifies as a completed reason, so the
+        // `Ok` half is unreachable; matching rather than unwrapping keeps a
+        // panic out of drop glue regardless.
+        if let Err(exit) = classify_retained_root_driver_join(runtime::JoinOutcome::Cancelled) {
+            finish_monitored_root(&self.root, StopReason::ShutdownRequested, exit);
+        }
+    }
 }
 
 /// Publishes the join monitor's final root verdict without letting a hostile

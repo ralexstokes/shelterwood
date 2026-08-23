@@ -1344,26 +1344,29 @@ impl ScopeRuntime {
         member.set_terminal_disposal_pending(false);
         if self.supervisor.membership_status(key) == MembershipStatus::Removing {
             self.flush_supervisor_effects();
-            if terminalized {
-                // The retained member record outlives this early return.
-                drop(exit.into_exit());
+        } else {
+            if terminal.startup == StartupDisposition::Aborted
+                && !self.supervisor.lifecycle().is_draining()
+            {
+                self.fail_startup(key, &exit);
             }
-            return;
+            if self.children[key].options.retention == crate::Retention::Remove {
+                self.prune_terminal(key);
+            }
         }
-        if terminal.startup == StartupDisposition::Aborted
-            && !self.supervisor.lifecycle().is_draining()
-        {
-            self.fail_startup(key, &exit);
-        }
-        if self.children[key].options.retention == crate::Retention::Remove {
-            self.prune_terminal(key);
-        }
+        // Both routes above are fallible, so the guard is released once, here.
+        // A winning publication installed an equivalent retained copy in the
+        // terminal member record, which the `member` handle keeps alive past
+        // this statement, so surrendering the raw copy is refcount traffic.
+        //
+        // A losing publication is unreachable today: #458 established that by
+        // whole-workspace enumeration rather than by any local guard, so no
+        // test pins the other branch and a probe for it would be a
+        // strong-count race by construction. It is retained defensively — the
+        // guard simply falls out of scope, and `RetainedExit::drop` retires
+        // the user error through critical disposal at the cost of one extra
+        // blocking-pool job.
         if terminalized {
-            // The terminal member record owns an equivalent retained copy.
-            // Keep the guard through every later fallible operation above,
-            // then surrender it as raw refcount traffic. A losing publication
-            // leaves the guard intact so its drop retires the exit through
-            // critical disposal.
             drop(exit.into_exit());
         }
     }

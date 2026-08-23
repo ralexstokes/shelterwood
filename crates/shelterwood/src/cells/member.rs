@@ -113,7 +113,7 @@ impl MemberRecord {
     /// drop inside the watch mutation is refcount work, and the retired guard
     /// set transfers any failed payload to isolated disposal once its last
     /// record clone dies.
-    pub(super) fn refresh_retained_exits(&mut self) {
+    pub(super) fn refresh_retained_exits(&mut self, surrendered: &mut Vec<RetainedExit>) {
         let mut retained = Vec::new();
         if let MemberStage::Terminal(exit) = &self.stage {
             RetainedExit::retain_exit(&mut retained, exit);
@@ -121,7 +121,7 @@ impl MemberRecord {
         if let Some(exit) = &self.last_exit {
             RetainedExit::retain_exit(&mut retained, exit);
         }
-        RetainedExit::install(&mut self.retained_exits, retained);
+        RetainedExit::install(&mut self.retained_exits, retained, surrendered);
     }
 
     /// Applies one driver-requested transition.
@@ -561,10 +561,12 @@ impl MemberCell {
         // Refreshing here rather than in each writer keeps the guard-set
         // invariant on every record mutation, including the test-only escape
         // hatch that writes fields directly.
+        let mut surrendered = Vec::new();
         self.record.modify_silently(|record| {
             update(record);
-            record.refresh_retained_exits();
+            record.refresh_retained_exits(&mut surrendered);
         });
+        txn.surrender(surrendered);
         txn.pulse(&self.record);
     }
 
@@ -606,26 +608,28 @@ impl MemberCell {
             | MemberTransition::Stopping => None,
         };
         let mut rejected = None;
+        let mut surrendered = Vec::new();
         self.record
             .modify_silently(|record| match record.apply_transition(transition) {
-                Ok(()) => record.refresh_retained_exits(),
+                Ok(()) => record.refresh_retained_exits(&mut surrendered),
                 Err(transition) => rejected = Some(transition),
             });
         if let Some(rejected) = rejected {
             // Rejection leaves this cell exactly as it was. The rejected event
             // may own a failed exit, so retire it with the transaction rather
             // than under the observation gate or watch lock.
-            txn.defer(move || runtime::dispose_detached(rejected));
             if let Some(retained_exit) = retained_exit {
                 // The deferred transition proves this clone cannot be last.
-                drop(retained_exit.into_exit());
+                txn.surrender([retained_exit]);
             }
+            txn.defer(move || runtime::dispose_detached(rejected));
             return false;
         }
+        txn.surrender(surrendered);
         txn.pulse(&self.record);
         if let Some(retained_exit) = retained_exit {
             // The record now owns an equivalent retained copy.
-            drop(retained_exit.into_exit());
+            txn.surrender([retained_exit]);
         }
         true
     }
@@ -764,6 +768,7 @@ impl MemberCell {
             txn.defer(move || drop(losing_exit));
         }
         let mut published = false;
+        let mut surrendered = Vec::new();
         self.record.modify_silently(|record| {
             if !matches!(record.stage, MemberStage::Terminal(_)) {
                 match startup {
@@ -780,8 +785,9 @@ impl MemberCell {
             // The guard set displaced above still covers whatever this
             // mutation overwrote, so refreshing after the writes is what
             // keeps the inline drops refcount-only.
-            record.refresh_retained_exits();
+            record.refresh_retained_exits(&mut surrendered);
         });
+        txn.surrender(surrendered);
         // Store before discharge so reentrant mailbox wakers observe the
         // winning exit. Notification-driven readers still see
         // discharge-before-pulse; tree-scoped publication defers both until

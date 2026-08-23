@@ -35,13 +35,13 @@ pub(crate) struct ScopeRecord {
 }
 
 impl ScopeRecord {
-    pub(super) fn refresh_retained_exits(&mut self) {
+    pub(super) fn refresh_retained_exits(&mut self, surrendered: &mut Vec<RetainedExit>) {
         let mut retained = Vec::new();
         RetainedExit::retain_scope_state(&mut retained, &self.state);
         if let Some(startup) = &self.startup {
             RetainedExit::retain_startup_result(&mut retained, startup);
         }
-        RetainedExit::install(&mut self.retained_exits, retained);
+        RetainedExit::install(&mut self.retained_exits, retained, surrendered);
     }
 }
 
@@ -78,7 +78,12 @@ impl ScopeCell {
     }
 
     pub(crate) fn snapshot(&self) -> Arc<ScopeSnapshot> {
-        self.with_observation_gate(|_| self.snapshot_locked().into_public())
+        self.with_observation_gate(|txn| {
+            let mut surrendered = Vec::new();
+            let snapshot = self.snapshot_locked(&mut surrendered);
+            txn.surrender(surrendered);
+            snapshot.into_public(txn)
+        })
     }
 
     pub(crate) fn subscribe_snapshots(&self) -> SnapshotReceiver {
@@ -88,10 +93,10 @@ impl ScopeCell {
         // Only a `*_locked` writer that receives someone else's transaction has
         // an identity left to verify.
         let (receiver, closed_consistent) = self.with_observation_gate(|wakes| {
-            let receiver = self
-                .observation
-                .snapshots
-                .subscribe(self.snapshot_locked(), wakes);
+            let mut surrendered = Vec::new();
+            let initial = self.snapshot_locked(&mut surrendered);
+            wakes.surrender(surrendered);
+            let receiver = self.observation.snapshots.subscribe(initial, wakes);
             let closed_consistent = !self.observation.closed.load(Ordering::Acquire)
                 || receiver.borrow_latest_and_closed().1;
             (receiver, closed_consistent)
@@ -117,7 +122,7 @@ impl ScopeCell {
         events
     }
 
-    fn snapshot_locked(&self) -> RetainedScopeSnapshot {
+    fn snapshot_locked(&self, surrendered: &mut Vec<RetainedExit>) -> RetainedScopeSnapshot {
         let record = self.record();
         let config = *self
             .observation
@@ -135,10 +140,10 @@ impl ScopeCell {
         // terminality lookup and straggler collection still see it: it is
         // owned residency, just not yet public.
         for resident in children.iter().filter(|resident| resident.announced) {
-            let (child, exits) = self.child_snapshot_locked(resident.projection());
+            let (child, exits) = self.child_snapshot_locked(resident.projection(), surrendered);
             projected.push(child);
             for exit in exits {
-                RetainedExit::retain_owned(&mut retained_exits, exit);
+                RetainedExit::retain_owned(&mut retained_exits, exit, surrendered);
             }
         }
         let snapshot = Arc::new(ScopeSnapshot {
@@ -158,6 +163,7 @@ impl ScopeCell {
     fn child_snapshot_locked(
         &self,
         child: &ResidentProjection,
+        surrendered: &mut Vec<RetainedExit>,
     ) -> (ChildSnapshot, Vec<RetainedExit>) {
         let MemberRecord {
             stage,
@@ -179,11 +185,13 @@ impl ScopeCell {
         let nested = child
             .scope
             .as_ref()
-            .and_then(|scope| (incarnation.is_some() || terminal).then(|| scope.snapshot_locked()))
+            .and_then(|scope| {
+                (incarnation.is_some() || terminal).then(|| scope.snapshot_locked(surrendered))
+            })
             .map(|nested| {
                 let (snapshot, exits) = nested.into_parts();
                 for exit in exits {
-                    RetainedExit::retain_owned(&mut retained_exits, exit);
+                    RetainedExit::retain_owned(&mut retained_exits, exit, surrendered);
                 }
                 snapshot
             });
@@ -251,7 +259,7 @@ impl ScopeCell {
         let scope = self.owned();
         self.observation
             .snapshots
-            .publish(wakes, move || scope.snapshot_locked());
+            .publish(wakes, move |surrendered| scope.snapshot_locked(surrendered));
         for ancestor in ancestors {
             #[cfg(debug_assertions)]
             wakes.debug_assert_gate(&ancestor.current_observation_gate());
@@ -259,7 +267,7 @@ impl ScopeCell {
             ancestor
                 .observation
                 .snapshots
-                .publish(wakes, move || scope.snapshot_locked());
+                .publish(wakes, move |surrendered| scope.snapshot_locked(surrendered));
         }
     }
 
@@ -332,7 +340,7 @@ impl ScopeCell {
         let scope = self.owned();
         self.observation
             .snapshots
-            .close(wakes, move || scope.snapshot_locked());
+            .close(wakes, move |surrendered| scope.snapshot_locked(surrendered));
         self.observation.lifecycle.close(wakes);
         // Both hub closures are idempotent. Set the aggregate marker last so
         // an unexpected panic leaves the operation retryable.
@@ -416,10 +424,13 @@ mod tests {
             let probe = Arc::clone(&under_gate);
             let gate = gate.clone();
             let cell = Arc::clone(&scope);
-            scope.observation.snapshots.publish(txn, move || {
-                probe.store(gate.is_held(), Ordering::Relaxed);
-                cell.snapshot_locked()
-            });
+            scope
+                .observation
+                .snapshots
+                .publish(txn, move |surrendered| {
+                    probe.store(gate.is_held(), Ordering::Relaxed);
+                    cell.snapshot_locked(surrendered)
+                });
         });
 
         assert!(

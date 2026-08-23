@@ -72,6 +72,7 @@ pub(crate) struct ObservationTxn<'a> {
     #[cfg(debug_assertions)]
     gate: Option<&'a ObservationGate>,
     effects: Vec<Box<dyn FnOnce()>>,
+    surrender_effects: usize,
     snapshots: Vec<SnapshotPublication>,
 }
 
@@ -84,6 +85,7 @@ impl<'a> ObservationTxn<'a> {
             #[cfg(debug_assertions)]
             gate: Some(gate),
             effects: Vec::new(),
+            surrender_effects: 0,
             snapshots: Vec::new(),
         }
     }
@@ -95,6 +97,7 @@ impl<'a> ObservationTxn<'a> {
             #[cfg(debug_assertions)]
             gate: None,
             effects: Vec::new(),
+            surrender_effects: 0,
             snapshots: Vec::new(),
         }
     }
@@ -116,6 +119,18 @@ impl<'a> ObservationTxn<'a> {
 
     pub(crate) fn defer(&mut self, operation: impl FnOnce() + 'static) {
         self.effects.push(Box::new(operation));
+    }
+
+    /// Places a structural surrender ahead of ordinary deferred effects.
+    ///
+    /// [`crate::cells::RetainedExit`] owns the public entry point because it
+    /// alone may extract the guarded raw exit. Keeping surrender effects at
+    /// the front is load-bearing: a later ordinary effect may hand the
+    /// surrender's co-owner to a concurrent disposal worker.
+    pub(super) fn defer_surrender(&mut self, operation: impl FnOnce() + 'static) {
+        self.effects
+            .insert(self.surrender_effects, Box::new(operation));
+        self.surrender_effects += 1;
     }
 
     /// Defers a watch-channel wake. The driver reaches its own senders
@@ -161,8 +176,8 @@ impl<'a> ObservationTxn<'a> {
         // invariant assertions inside the accumulator. A broken installation
         // must not strand the remaining committed cuts or their queued effects,
         // and its panic resumes only after the guard is gone.
-        for mut publication in self.snapshots.drain(..) {
-            panics.run(|| publication.install(&mut self.effects));
+        for mut publication in std::mem::take(&mut self.snapshots) {
+            panics.run(|| publication.install(self));
             // The projection captures its publishing scope. Transfer the
             // whole attempted publication to the post-unlock list whether
             // installation succeeded or panicked.
@@ -174,6 +189,7 @@ impl<'a> ObservationTxn<'a> {
             // observation edges from notifying their waiters.
             panics.run(effect);
         }
+        self.surrender_effects = 0;
     }
 }
 
@@ -197,11 +213,20 @@ mod tests {
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
         },
         task::{Context, Wake, Waker},
     };
 
-    use crate::runtime;
+    use shelterwood_core::{Cancellation, Exit, ExitError};
+
+    use crate::{
+        cells::{
+            RetainedExit,
+            test_support::{TEST_WAIT, ThreadProbe},
+        },
+        runtime,
+    };
 
     use super::*;
 
@@ -234,6 +259,14 @@ mod tests {
         }
     }
 
+    struct DropSignal(mpsc::SyncSender<()>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
     #[test]
     fn observation_txn_commit_unlocks_before_effects_and_drains_once() {
         let gate = ObservationGate::new();
@@ -258,6 +291,41 @@ mod tests {
             *order.lock().expect("probe mutex remains healthy"),
             [1, 2],
             "a second commit from Drop is a no-op"
+        );
+    }
+
+    #[test]
+    fn observation_txn_surrenders_before_ordinary_deferred_disposal() {
+        let gate = ObservationGate::new();
+        let retiring_thread = std::thread::current().id();
+        let (payload_dropped, payload_observed) = mpsc::sync_channel(1);
+        let exit = Exit::failed(
+            ExitError::from(ThreadProbe(payload_dropped)),
+            Cancellation::NotObserved,
+        );
+        let retained = RetainedExit::new(exit.clone());
+        let (owner_dropped, owner_observed) = mpsc::sync_channel(1);
+        let mut txn = ObservationTxn::new(&gate, gate.lock());
+
+        // Queue the owner first on purpose. A surrender appended behind this
+        // effect would let its disposal worker release the raw owner before
+        // the guard, making the transaction thread run the final destructor.
+        txn.defer(move || {
+            runtime::dispose_detached((exit, DropSignal(owner_dropped)));
+            owner_observed
+                .recv_timeout(TEST_WAIT)
+                .expect("the queued raw owner is disposed");
+        });
+        txn.surrender([retained]);
+
+        drop(txn);
+
+        assert_ne!(
+            payload_observed
+                .recv_timeout(TEST_WAIT)
+                .expect("the failed payload is eventually destroyed"),
+            retiring_thread,
+            "surrender must precede a queued owner's concurrent disposal"
         );
     }
 

@@ -637,6 +637,11 @@ impl ScopeCell {
             }
             if let Some(startup) = startup.take() {
                 startup_installed = self.set_startup_locked(startup, txn);
+                if startup_installed {
+                    // The record now owns the diagnostic guards' raw peer.
+                    // Queue their surrender before this transaction commits.
+                    txn.surrender(std::mem::take(&mut retained_startup));
+                }
             }
             self.set_state_locked(
                 state
@@ -651,18 +656,11 @@ impl ScopeCell {
             published,
             "a drain entry may mark only a resident member on its observation gate"
         );
-        if startup_installed {
-            // The record installed its own retained copy, so the diagnostic
-            // guards are surrendered as raw refcount traffic.
-            for exit in retained_startup {
-                drop(exit.into_exit());
-            }
-        } else {
+        if !startup_installed {
             // A record that already held a startup result rejected this one,
             // and the rejected raw result retired through the transaction's
             // own guards — into isolated disposal, which is still running.
-            // Surrendering these guards raw would race that job for the last
-            // owner, so they retire the same way instead.
+            // These guards therefore retire through critical disposal too.
             drop(retained_startup);
         }
     }
@@ -689,10 +687,12 @@ impl ScopeCell {
         {
             route.close_admission(txn);
         }
+        let mut surrendered = Vec::new();
         self.observation.record.modify_silently(|record| {
             record.state = state.clone();
-            record.refresh_retained_exits();
+            record.refresh_retained_exits(&mut surrendered);
         });
+        txn.surrender(surrendered);
         txn.pulse(&self.observation.record);
         txn.pulse(&self.member.record);
         self.emit_locked(txn, LifecycleEventKind::ScopeState { state });
@@ -769,15 +769,21 @@ impl ScopeCell {
         &self,
         member: &MemberCell,
         total_restarts: TotalRestarts,
+        exit_guard: RetainedExit,
         transition: MemberTransition,
         exited: LifecycleEventKind,
         scheduled: LifecycleEventKind,
     ) -> bool {
         self.with_observation_gate(|wakes| {
             if !member.transition_locked(wakes, transition) {
+                wakes.defer(move || drop(exit_guard));
                 wakes.defer(move || runtime::dispose_detached((exited, scheduled)));
                 return false;
             }
+            // The member record now owns the exit used by both public edges.
+            // Surrender while its transaction is still open; the prioritized
+            // effect runs before any queued owner can enter disposal.
+            wakes.surrender([exit_guard]);
             self.observation.record.modify_silently(|scope| {
                 scope.total_restarts = total_restarts;
             });
@@ -791,14 +797,14 @@ impl ScopeCell {
     pub(crate) fn terminalize_child(
         &self,
         member: &MemberCell,
-        exit: Exit,
+        exit: impl Into<RetainedExit>,
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
         // Keep a retained owner across the residency assertion and every
         // fallible cell lookup. If an invariant fails, the raw argument can
         // unwind under the gate only as refcount traffic.
-        let exit = RetainedExit::new(exit);
+        let exit = exit.into();
         let terminalized = self.with_observation_gate(move |wakes| {
             let record = member.record();
             if matches!(record.stage, MemberStage::Terminal(_)) {
@@ -835,7 +841,7 @@ impl ScopeCell {
             let terminal_exit = member.terminalize_locked(exit.as_exit().clone(), startup, wakes);
             // The terminal member record now owns the equivalent retained
             // copy, so surrender this transient guard as refcount traffic.
-            drop(exit.into_exit());
+            wakes.surrender([exit]);
             self.evict_child_identity(member);
             if record.last_incarnation.is_none()
                 && let Some(scope) = &nested
@@ -950,22 +956,20 @@ impl ScopeCell {
         RetainedExit::retain_startup_result(&mut retained, &startup);
         let mut incoming = Some((startup, retained));
         let mut published = false;
+        let mut surrendered = Vec::new();
         self.observation.record.modify_silently(|record| {
             if record.startup.is_none() {
                 let (startup, retained) = incoming
                     .take()
                     .expect("startup result is installed at most once");
                 record.startup = Some(startup);
-                record.refresh_retained_exits();
-                // The record now owns an equivalent retained copy. Convert
-                // these transient guards back to raw refcount traffic rather
-                // than submitting duplicate disposal jobs under the gate.
-                for exit in retained {
-                    drop(exit.into_exit());
-                }
+                record.refresh_retained_exits(&mut surrendered);
+                // The record now owns an equivalent retained copy.
+                surrendered.extend(retained);
                 published = true;
             }
         });
+        txn.surrender(surrendered);
         // Tuple field order is intentional: a rejected raw startup result is
         // released while its retained guards still exist, then those guards
         // transfer failed destruction to isolated disposal.
@@ -999,12 +1003,14 @@ impl ScopeCell {
             // pairing is what lets `settled` treat terminal membership
             // plus a settled projection as final without stranding a scope
             // that still owns a live incarnation.
+            let mut surrendered = Vec::new();
             self.observation.record.modify_silently(|record| {
                 record.total_restarts = TotalRestarts::ZERO;
                 record.startup = None;
                 record.state = state.clone();
-                record.refresh_retained_exits();
+                record.refresh_retained_exits(&mut surrendered);
             });
+            wakes.surrender(surrendered);
             // Hold epoch ownership through its observation projection. A
             // stale finish and a newer begin can no longer cross these two
             // state planes in opposite orders.
@@ -1055,7 +1061,7 @@ impl ScopeCell {
                         StartupDisposition::Unchanged,
                         wakes,
                     );
-                    drop(exit.into_exit());
+                    wakes.surrender([exit]);
                     wakes.pulse(&self.member.record);
                     wakes.pulse(&self.observation.record);
                     self.close_observation_locked(wakes);
@@ -1096,7 +1102,7 @@ impl ScopeCell {
             }
             drop(reason.into_public());
             if let Some(exit) = terminal_exit.take() {
-                drop(exit.into_exit());
+                wakes.surrender([exit]);
             }
         });
     }
@@ -1122,7 +1128,7 @@ impl ScopeCell {
                 );
                 self.close_observation_locked(wakes);
                 drop(reason.into_public());
-                drop(exit.into_exit());
+                wakes.surrender([exit]);
             });
         }
     }
@@ -1614,6 +1620,7 @@ impl ScopeCell {
         let mut transient_retained = Vec::new();
         RetainedExit::retain_scope_state(&mut transient_retained, &state);
         let mut published = false;
+        let mut surrendered = Vec::new();
         self.observation.record.modify_silently(|record| {
             if let ScopeState::Stopped { reason: recorded } = &record.state
                 && incoming <= stop_reason_precedence(recorded)
@@ -1624,9 +1631,10 @@ impl ScopeCell {
                 record.startup = Some(Err(StartupError::ShutdownRequested));
             }
             record.state = state.clone();
-            record.refresh_retained_exits();
+            record.refresh_retained_exits(&mut surrendered);
             published = true;
         });
+        wakes.surrender(surrendered);
         if let Some(exit) = terminal_exit {
             self.member
                 .terminalize_locked(exit, StartupDisposition::Unchanged, wakes);
@@ -1639,9 +1647,7 @@ impl ScopeCell {
             // The record and lifecycle event now retain the raw projection.
             // Surrender the transient guards without scheduling duplicate
             // disposal jobs.
-            for exit in transient_retained {
-                drop(exit.into_exit());
-            }
+            wakes.surrender(transient_retained);
             wakes.pulse(&self.observation.record);
             self.emit_locked(wakes, LifecycleEventKind::ScopeState { state });
         } else {
@@ -2279,11 +2285,16 @@ mod tests {
             .expect("incarnation available");
         let (dropped, observed) = mpsc::sync_channel(1);
         let retiring_thread = std::thread::current().id();
+        let exit = Exit::failed(
+            ExitError::from(ThreadProbe(dropped)),
+            Cancellation::NotObserved,
+        );
 
         assert!(
             !root.publish_child_restart(
                 &member,
                 TotalRestarts::ZERO,
+                RetainedExit::new(exit.clone()),
                 MemberTransition::RestartScheduled {
                     exit: Exit::completed(Cancellation::NotObserved),
                     restart_count: RestartCount::ZERO.bump(),
@@ -2293,10 +2304,7 @@ mod tests {
                     id: member.id().clone(),
                     membership: member.membership(),
                     incarnation,
-                    exit: Exit::failed(
-                        ExitError::from(ThreadProbe(dropped)),
-                        Cancellation::NotObserved,
-                    ),
+                    exit,
                 },
                 LifecycleEventKind::RestartScheduled {
                     id: member.id().clone(),

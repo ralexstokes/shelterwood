@@ -164,7 +164,7 @@ impl RetainedLifecycleEvent {
         // user error through isolated disposal for nothing.
         let guards = Arc::unwrap_or_clone(guards);
         for guard in guards {
-            drop(guard.into_exit());
+            drop(guard.into_user_owned());
         }
         event
     }
@@ -400,14 +400,13 @@ impl RetainedScopeSnapshot {
         Arc::clone(&self.snapshot)
     }
 
-    pub(crate) fn into_public(self) -> Arc<ScopeSnapshot> {
+    pub(crate) fn into_public(self, txn: &mut ObservationTxn<'_>) -> Arc<ScopeSnapshot> {
         let (snapshot, exits) = self.into_parts();
         // The public projection owns a raw clone corresponding to every
-        // guard, so releasing these copies inline is provably refcount-only.
-        // The caller's eventual last drop keeps ordinary user semantics.
-        for exit in exits {
-            drop(exit.into_exit());
-        }
+        // guard. The transaction surrenders those framework-internal copies
+        // after unlock; the caller's eventual last drop keeps ordinary user
+        // semantics.
+        txn.surrender(exits);
         snapshot
     }
 
@@ -581,19 +580,25 @@ fn install_snapshot(
 ///
 /// The producer is `FnMut` rather than `FnOnce` so that running it does not
 /// also destroy it: it captures an `Arc<ScopeCell>` whose release belongs
-/// after the gate is unlocked, like every other user-bearing drop. The
-/// transaction hands the whole spent publication to its effect list after
-/// each attempted install, including one that trips an invariant.
-pub(crate) struct SnapshotProjection(Box<dyn FnMut() -> Option<RetainedScopeSnapshot>>);
+/// after the gate is unlocked, like every other user-bearing drop. Its
+/// argument collects deduplicated retained-exit guards for structural
+/// surrender by the installing transaction. The transaction hands the whole
+/// spent publication to its effect list after each attempted install,
+/// including one that trips an invariant.
+type SnapshotProducer = dyn FnMut(&mut Vec<RetainedExit>) -> Option<RetainedScopeSnapshot>;
+
+pub(crate) struct SnapshotProjection(Box<SnapshotProducer>);
 
 impl SnapshotProjection {
-    fn new(build: impl FnOnce() -> RetainedScopeSnapshot + 'static) -> Self {
+    fn new(build: impl FnOnce(&mut Vec<RetainedExit>) -> RetainedScopeSnapshot + 'static) -> Self {
         let mut build = Some(build);
-        Self(Box::new(move || build.take().map(|build| build())))
+        Self(Box::new(move |surrendered| {
+            build.take().map(|build| build(surrendered))
+        }))
     }
 
-    fn build(&mut self) -> RetainedScopeSnapshot {
-        (self.0)().expect("a staged projection is built exactly once")
+    fn build(&mut self, surrendered: &mut Vec<RetainedExit>) -> RetainedScopeSnapshot {
+        (self.0)(surrendered).expect("a staged projection is built exactly once")
     }
 }
 
@@ -659,12 +664,14 @@ impl SnapshotPublication {
     /// displaces, and the generation-exhaustion panic. The producer runs
     /// before the watch's own lock is taken, so building a cut — which walks
     /// the resident tree — never nests that tree's locks inside the watch.
-    pub(crate) fn install(&mut self, effects: &mut Vec<Box<dyn FnOnce()>>) {
+    pub(crate) fn install(&mut self, txn: &mut ObservationTxn<'_>) {
         // A hub closed by an earlier transaction keeps the authoritative
         // terminal projection `close` installed; this cut is never built.
-        let snapshot =
-            (!self.sender.read_with(|state| state.closed)).then(|| self.projection.build());
-        effects.extend(install_snapshot(
+        let mut surrendered = Vec::new();
+        let snapshot = (!self.sender.read_with(|state| state.closed))
+            .then(|| self.projection.build(&mut surrendered));
+        txn.surrender(surrendered);
+        for effect in install_snapshot(
             &self.sender,
             snapshot,
             self.closed,
@@ -672,7 +679,9 @@ impl SnapshotPublication {
                 mint_generation: self.published,
                 pulse: true,
             },
-        ));
+        ) {
+            txn.defer(effect);
+        }
     }
 }
 
@@ -742,7 +751,7 @@ impl SnapshotHub {
     pub(crate) fn publish(
         &self,
         txn: &mut ObservationTxn<'_>,
-        snapshot: impl FnOnce() -> RetainedScopeSnapshot + 'static,
+        snapshot: impl FnOnce(&mut Vec<RetainedExit>) -> RetainedScopeSnapshot + 'static,
     ) {
         let Some(sender) = self.sender.get() else {
             return;
@@ -768,20 +777,24 @@ impl SnapshotHub {
     pub(crate) fn close(
         &self,
         txn: &mut ObservationTxn<'_>,
-        final_snapshot: impl FnOnce() -> RetainedScopeSnapshot + 'static,
+        final_snapshot: impl FnOnce(&mut Vec<RetainedExit>) -> RetainedScopeSnapshot + 'static,
     ) {
         let mut final_snapshot = Some(final_snapshot);
         let mut initialized = false;
+        let mut surrendered = Vec::new();
         let sender = self.sender.get_or_init(|| {
             initialized = true;
             runtime::watch(SnapshotHubState::new(
                 final_snapshot
                     .take()
-                    .expect("final snapshot is built exactly once")(),
+                    .expect("final snapshot is built exactly once")(
+                    &mut surrendered
+                ),
                 true,
             ))
             .0
         });
+        txn.surrender(surrendered);
         if initialized {
             return;
         }
@@ -799,10 +812,10 @@ impl SnapshotHub {
         // this final one.
         txn.stage_snapshot(SnapshotPublication::closed(
             sender.clone(),
-            SnapshotProjection::new(move || {
+            SnapshotProjection::new(move |surrendered| {
                 final_snapshot
                     .take()
-                    .expect("final snapshot is built exactly once")()
+                    .expect("final snapshot is built exactly once")(surrendered)
             }),
         ));
     }
@@ -1101,7 +1114,7 @@ mod tests {
     fn snapshot_projection_is_skipped_without_subscribers() {
         let hub = SnapshotHub::default();
         let mut txn = ObservationTxn::detached();
-        hub.publish(&mut txn, || {
+        hub.publish(&mut txn, |_| {
             panic!("projection must be lazy when no receiver exists")
         });
     }
@@ -1165,7 +1178,7 @@ mod tests {
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
                 let mut txn = ObservationTxn::detached();
-                hub.publish(&mut txn, || snapshot(ScopeState::Running));
+                hub.publish(&mut txn, |_| snapshot(ScopeState::Running));
                 mid_txn = Some(receiver.borrow_latest().state.clone());
                 panic!("inject transaction unwind");
             }))
@@ -1193,8 +1206,8 @@ mod tests {
             let effects = Arc::clone(&effects);
             move || {
                 let mut txn = ObservationTxn::detached();
-                failing.publish(&mut txn, || panic!("injected snapshot installation panic"));
-                succeeding.publish(&mut txn, || snapshot(ScopeState::Running));
+                failing.publish(&mut txn, |_| panic!("injected snapshot installation panic"));
+                succeeding.publish(&mut txn, |_| snapshot(ScopeState::Running));
                 txn.defer(move || {
                     effects.fetch_add(1, Ordering::SeqCst);
                 });
@@ -1232,7 +1245,7 @@ mod tests {
             ScopeState::Draining,
         ] {
             let builds = Arc::clone(&builds);
-            hub.publish(&mut txn, move || {
+            hub.publish(&mut txn, move |_| {
                 builds.fetch_add(1, Ordering::Relaxed);
                 snapshot(state)
             });
@@ -1261,7 +1274,7 @@ mod tests {
         drop(txn);
 
         let mut txn = ObservationTxn::detached();
-        hub.close(&mut txn, || {
+        hub.close(&mut txn, |_| {
             snapshot(ScopeState::Stopped {
                 reason: StopReason::Finished,
             })
@@ -1271,7 +1284,7 @@ mod tests {
             "the close is still staged, so the publication below is declined \
              by the transaction rather than by an installed terminal state"
         );
-        hub.publish(&mut txn, || {
+        hub.publish(&mut txn, |_| {
             panic!("publication after a staged close must remain lazy")
         });
         drop(txn);
@@ -1298,7 +1311,7 @@ mod tests {
         drop(txn);
 
         let mut txn = ObservationTxn::detached();
-        hub.publish(&mut txn, || snapshot(ScopeState::Running));
+        hub.publish(&mut txn, |_| snapshot(ScopeState::Running));
         drop(txn);
 
         assert_eq!(
@@ -1311,12 +1324,12 @@ mod tests {
         );
 
         let mut txn = ObservationTxn::detached();
-        hub.publish(&mut txn, || {
+        hub.publish(&mut txn, |_| {
             snapshot(ScopeState::Stopped {
                 reason: StopReason::Finished,
             })
         });
-        hub.close(&mut txn, || {
+        hub.close(&mut txn, |_| {
             snapshot(ScopeState::Stopped {
                 reason: StopReason::Finished,
             })
@@ -1335,7 +1348,7 @@ mod tests {
         ));
         assert!(snapshots.changed().await.is_err());
         let mut txn = ObservationTxn::detached();
-        hub.publish(&mut txn, || {
+        hub.publish(&mut txn, |_| {
             panic!("publication after close must remain lazy")
         });
         drop(txn);
@@ -1361,7 +1374,7 @@ mod tests {
     async fn receiverless_snapshot_close_installs_the_terminal_state() {
         let hub = SnapshotHub::default();
         let mut txn = ObservationTxn::detached();
-        hub.close(&mut txn, || {
+        hub.close(&mut txn, |_| {
             snapshot(ScopeState::Stopped {
                 reason: StopReason::NeverStarted,
             })
@@ -1389,7 +1402,7 @@ mod tests {
         drop(receiver);
 
         let mut txn = ObservationTxn::detached();
-        hub.close(&mut txn, || {
+        hub.close(&mut txn, |_| {
             snapshot(ScopeState::Stopped {
                 reason: StopReason::Finished,
             })
@@ -1420,7 +1433,7 @@ mod tests {
         drop(txn);
 
         let mut txn = ObservationTxn::detached();
-        hub.close(&mut txn, || {
+        hub.close(&mut txn, |_| {
             snapshot(ScopeState::Stopped {
                 reason: StopReason::Finished,
             })

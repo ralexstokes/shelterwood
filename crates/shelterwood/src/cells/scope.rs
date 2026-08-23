@@ -101,6 +101,41 @@ impl ResidentChild {
     }
 }
 
+/// The exact residency slot installed by one in-flight admission.
+///
+/// The observation gate prevents a production admission from interleaving a
+/// second residency mutation, but the slot still carries its own index and
+/// membership. That makes the later announcement structurally address the
+/// resident whose `Added` edge is about to be published instead of relying on
+/// whichever child happens to be last.
+#[must_use = "an installed resident slot must be announced or withdrawn"]
+struct ResidentSlot<'a> {
+    children: &'a Mutex<Vec<ResidentChild>>,
+    index: usize,
+    membership: Membership,
+}
+
+impl ResidentSlot<'_> {
+    /// Marks this admission's exact resident as announced.
+    ///
+    /// The token and everything inspected under the residency mutex are plain
+    /// framework-owned data, so this adds no effect to the doubled observation
+    /// gate section's lock-rule accounting.
+    fn announce(self) -> bool {
+        let mut children = self
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        children
+            .get_mut(self.index)
+            .filter(|resident| resident.projection().member.membership() == self.membership)
+            .is_some_and(|resident| {
+                resident.announced = true;
+                true
+            })
+    }
+}
+
 impl Drop for ResidentChild {
     fn drop(&mut self) {
         let Some(projection) = self.projection.take() else {
@@ -332,6 +367,18 @@ impl ScopeCell {
             .current_children
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn push_unannounced(&self, child: ResidentProjection) -> ResidentSlot<'_> {
+        let membership = child.member.membership();
+        let mut children = self.current_children();
+        let index = children.len();
+        children.push(ResidentChild::new(child));
+        ResidentSlot {
+            children: &self.observation.current_children,
+            index,
+            membership,
+        }
     }
 
     fn parent(&self) -> Option<Arc<ScopeCell>> {
@@ -1380,12 +1427,7 @@ impl ScopeCell {
         // what makes a lingering half-wired resident invisible rather than a
         // membership with only half its edges.
         let projection = child.clone();
-        let residency_index = {
-            let mut children = self.current_children();
-            let index = children.len();
-            children.push(ResidentChild::new(child));
-            index
-        };
+        let resident_slot = self.push_unannounced(child);
         let gate = self.current_observation_gate();
         let admitted = if let Some(scope) = &projection.scope {
             let admitted = scope.admit_observation_gate(self, &gate, txn);
@@ -1448,16 +1490,7 @@ impl ScopeCell {
         // missing or mismatched index prevents a different resident from being
         // paired with this Added edge and diagnoses the same no-interleaving
         // invariant as the refusal pop above.
-        let announced_is_admission = {
-            let mut children = self.current_children();
-            children
-                .get_mut(residency_index)
-                .filter(|resident| resident.projection().member.membership() == membership)
-                .is_some_and(|resident| {
-                    resident.announced = true;
-                    true
-                })
-        };
+        let announced_is_admission = resident_slot.announce();
         if !announced_is_admission {
             // Residency no longer holds this admission, so the lookup clone
             // can be the last member/mailbox owner. Move it into the
@@ -2125,6 +2158,27 @@ mod tests {
                 .expect("scope clear disposes the lingering mailbox payload"),
             retiring_thread,
             "scope clear retains the detached disposal venue"
+        );
+    }
+
+    #[test]
+    fn resident_slot_announces_its_index_when_a_later_resident_exists() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let first = child_member(&root, "first");
+        let second = child_member(&root, "second");
+
+        let first_slot = root.push_unannounced(ResidentProjection::new(first, None));
+        let _second_slot = root.push_unannounced(ResidentProjection::new(second, None));
+
+        assert!(
+            first_slot.announce(),
+            "the slot still addresses the resident installed before the later push"
+        );
+        let children = root.current_children();
+        assert!(children[0].announced, "the indexed resident is announced");
+        assert!(
+            !children[1].announced,
+            "announcing an earlier slot cannot mark the last resident"
         );
     }
 

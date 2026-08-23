@@ -51,8 +51,8 @@ operations:
     keeps the 48-case suite near three minutes inside `just bench` and keeps
     routine spread on the backpressured arms out of the change reports.
 - `lifecycle` covers cold wide and deep trees, immediate restart cycles, and
-  dynamic admission/removal with no observer, a snapshot subscriber, a
-  lifecycle subscriber, or both.
+  dynamic admission/removal against a drained snapshot subscriber, a drained
+  lifecycle subscriber, both, or no subscriber at all.
 
 `concurrent_send_tasks` deliberately includes task spawn and join overhead. It
 represents the common application shape of short-lived producer tasks rather
@@ -68,10 +68,58 @@ stress incremental, level-triggered settlement; they do not model the driver's
 event-batch distribution. Use the lifecycle suite for end-to-end startup and
 shutdown costs.
 
-Cold lifecycle fixtures construct the declaration outside the timed region;
-`spawn`, recursive lowering, startup, shutdown, and joining are timed. Dynamic
-churn starts its root outside the timed region so it isolates live control-plane
-admission/removal and observation publication.
+Cold lifecycle fixtures build their top-level declaration outside the timed
+region; `spawn`, lowering, startup, shutdown, and joining are timed. The two
+sweeps differ in how much declaration survives into that region. `cold_width`
+builds all N `TaskDef`s in setup, so only lowering is timed. `cold_depth`
+builds only the outermost level eagerly: `SubtreeDef::factory` stores a
+closure that each nested incarnation invokes at construction, so a depth-32
+sample constructs 31 further trees and their definition `Arc`s inside the
+timed region. That is deliberate — a cold lifecycle is what the sweep measures
+— but the depth numbers include recursive declaration construction and the
+width numbers do not. `cold_depth/*/1` and `cold_width/*/1` build the
+identical one-task fixture on purpose: it is the shared intercept of both
+sweeps and a same-run check on host noise.
+
+`immediate_restarts` reports no element rate. Its timed region is a whole
+system lifecycle — `spawn`, `wait_started`, the restart cascade, `shutdown`,
+and the root driver join — so dividing by the restart count would attribute
+that fixed lifecycle cost to every restart. The sweep instead carries a
+zero-restart point; the marginal cost of one restart is the difference from
+that baseline divided by the restart count. The declared intensity budget
+carries head room over the exact number of charges the fixture provokes, so an
+unexpected charge cannot trip the scope and turn a slow sample into a panic.
+
+`dynamic_churn` starts its root outside the timed region, so it isolates live
+control-plane admission/removal and observation publication. Each cycle admits
+a task, waits for that incarnation's first poll, then removes it. The
+readiness rendezvous is inside the timed region and is there for determinism:
+removal latches immediately, so without it the removal races the driver's
+start transaction, the `Removing` mark suppresses the `Ready` edge, and the
+edge count per cycle varies between four and five — measured at 96 to 120
+edges per 24-cycle batch on a four-worker runtime, a 25% swing in the payload
+the arms are meant to hold constant. With the rendezvous every cycle emits
+exactly five edges (`Added`, `Started`, `Ready`, `Exited`, `Removed`) under
+both runtime configurations.
+
+The four `dynamic_churn` arms differ only in who is subscribed. Each
+subscribing arm parks a dedicated consumer task on its stream for the whole
+arm rather than draining inside the timed future, so publication has a real
+waiter to wake instead of an empty waiter list, and the lifecycle broadcast
+ring does not saturate: the arms measure the keeping-up-consumer regime, not a
+permanently lagged one. On the current-thread group that consumer is driven by
+the same `block_on` Criterion times, so its cost is attributed; on the
+multi-thread group it runs on another worker and only its wake and contention
+costs are. `none` is not an observer-free baseline for lifecycle work:
+snapshot publication skips a scope with no receivers, but lifecycle emission
+has no such gate — every edge mints retention guards, resolves ancestors,
+mints the sequence, builds the event, clones it per ancestor, takes the hub's
+signal mutex and the broadcast tail lock, and pulses the watch, whether or not
+anyone is subscribed. Only the ring write itself is skipped, and that is the
+channel's own zero-receiver check rather than a Shelterwood gate. The
+`lifecycle` arm's delta over `none` is therefore bounded below by that
+unconditional work and measures only the incremental cost of a subscribed,
+draining consumer — which on a keeping-up consumer is close to zero.
 
 That schedule is **quadratic** in the child count: it settles once per child,
 and every settle rescans the child table — `settle_finish` evaluates

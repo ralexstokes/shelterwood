@@ -9,21 +9,48 @@ use std::{
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use shelterwood::{
-    Backoff, DynamicScopeRef, DynamicTree, Intensity, LifecycleEvents, RemoveOutcome,
-    RestartCondition, RestartPolicy, ScopeRef, SnapshotReceiver, SubtreeDef, System, TaskDef, Tree,
+    Backoff, DynamicScopeRef, DynamicTree, Intensity, LifecycleEvents, LifecycleItem,
+    RemoveOutcome, RestartCondition, RestartPolicy, ScopeRef, SnapshotReceiver, SubtreeDef, System,
+    TaskDef, Tree,
 };
-use tokio::{runtime::Runtime, sync::Notify};
+use tokio::{runtime::Runtime, sync::Notify, task::JoinHandle};
 
 const DEADLINE: Duration = Duration::from_secs(30);
 const WIDTHS: [usize; 3] = [1, 16, 256];
 const DEPTHS: [usize; 3] = [1, 8, 32];
-const RESTARTS: [usize; 3] = [1, 8, 32];
+/// Restart counts, including a zero-restart baseline.
+///
+/// The timed region is a whole system lifecycle, so the marginal cost of one
+/// restart is only derivable by differencing against that baseline. See
+/// `bench_restarts` for why this group reports no element rate.
+const RESTARTS: [usize; 4] = [0, 1, 8, 32];
+/// Spare restart charges beyond the exact number the fixture provokes.
+///
+/// A budget of exactly `restarts` is correct at the boundary but has no
+/// tolerance: one extra charge from any source would trip the scope and turn
+/// a slow sample into a panic instead of a measurement.
+const RESTART_BUDGET_HEADROOM: u64 = 8;
 const CHURN_CYCLES: usize = 32;
 
 fn cooperative_task() -> TaskDef {
     TaskDef::new(|context| async move {
         context.shutdown_token().cancelled().await;
         Ok(())
+    })
+}
+
+/// A cooperative task that announces its first poll.
+///
+/// The dynamic churn loop uses the announcement to remove a child only after
+/// its incarnation has started, which pins the emitted lifecycle edge count.
+fn announcing_task(started: Arc<Notify>) -> TaskDef {
+    TaskDef::new(move |context| {
+        let started = Arc::clone(&started);
+        async move {
+            started.notify_one();
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        }
     })
 }
 
@@ -45,6 +72,10 @@ fn wide_dynamic(width: usize) -> DynamicTree {
     tree
 }
 
+// Only the outermost level is built here. `SubtreeDef::factory` stores the
+// recursion, so every nested level is constructed lazily at its incarnation's
+// construction — inside the timed region. The README records that asymmetry
+// against the width sweep.
 fn deep_ordered(depth: usize) -> Tree {
     let mut tree = Tree::new();
     if depth == 1 {
@@ -146,8 +177,11 @@ fn restarting_tree(restarts: usize) -> (Tree, Arc<Notify>) {
     let stable = Arc::new(Notify::new());
     let mut tree = Tree::new();
     tree.intensity(
-        Intensity::new(restarts as u64, Duration::from_secs(30))
-            .expect("the benchmark intensity window is non-zero"),
+        Intensity::new(
+            restarts as u64 + RESTART_BUDGET_HEADROOM,
+            Duration::from_secs(30),
+        )
+        .expect("the benchmark intensity window is non-zero"),
     );
     tree.add_task(
         "worker",
@@ -179,8 +213,12 @@ fn restarting_tree(restarts: usize) -> (Tree, Arc<Notify>) {
 
 fn bench_restarts(c: &mut Criterion, runtime_name: &str, runtime: &Runtime) {
     let mut group = c.benchmark_group(format!("lifecycle/{runtime_name}/immediate_restarts"));
+    // Deliberately no `Throughput::Elements`. The timed region is a whole
+    // system lifecycle — spawn, startup, the restart cascade, shutdown, and
+    // the root driver join — so a per-restart rate would charge every restart
+    // with the fixed lifecycle cost. The `0` point makes the marginal restart
+    // cost derivable by differencing instead.
     for restarts in RESTARTS {
-        group.throughput(Throughput::Elements(restarts as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(restarts),
             &restarts,
@@ -207,37 +245,97 @@ fn bench_restarts(c: &mut Criterion, runtime_name: &str, runtime: &Runtime) {
     group.finish();
 }
 
-enum Observation {
-    None,
-    Snapshots(SnapshotReceiver),
-    Lifecycle(LifecycleEvents),
-    Both(SnapshotReceiver, LifecycleEvents),
+/// What one draining consumer task observed over an arm.
+#[derive(Default)]
+struct DrainCounts {
+    items: AtomicUsize,
+    lagged: AtomicUsize,
 }
 
-impl Observation {
-    fn subscribe(mode: &str, scope: &ScopeRef) -> Self {
+/// The consumers an observation arm parks on its streams.
+///
+/// The arms exist to price observation, so a subscriber that never consumes
+/// prices the wrong thing: `WatchSender::pulse` walks an empty waiter list and
+/// the lifecycle ring saturates into a permanently lagged regime. A consumer
+/// task parked on the stream for the whole arm, rather than a drain inside the
+/// timed future, is what keeps a waiter present at the instant of publication.
+struct Observers {
+    handles: Vec<JoinHandle<()>>,
+    snapshots: Option<Arc<DrainCounts>>,
+    lifecycle: Option<Arc<DrainCounts>>,
+}
+
+impl Observers {
+    fn spawn(mode: &str, runtime: &Runtime, scope: &ScopeRef) -> Self {
+        let mut observers = Self {
+            handles: Vec::new(),
+            snapshots: None,
+            lifecycle: None,
+        };
         match mode {
-            "none" => Self::None,
-            "snapshots" => Self::Snapshots(scope.subscribe_snapshots()),
-            "lifecycle" => Self::Lifecycle(scope.subscribe_lifecycle()),
-            "both" => Self::Both(scope.subscribe_snapshots(), scope.subscribe_lifecycle()),
+            "none" => {}
+            "snapshots" => observers.drain_snapshots(runtime, scope.subscribe_snapshots()),
+            "lifecycle" => observers.drain_lifecycle(runtime, scope.subscribe_lifecycle()),
+            "both" => {
+                observers.drain_snapshots(runtime, scope.subscribe_snapshots());
+                observers.drain_lifecycle(runtime, scope.subscribe_lifecycle());
+            }
             _ => unreachable!("the benchmark supplies a known observation mode"),
         }
+        observers
     }
 
-    fn retain(&self) {
-        match self {
-            Self::None => {}
-            Self::Snapshots(receiver) => {
-                black_box(receiver);
+    fn drain_snapshots(&mut self, runtime: &Runtime, mut receiver: SnapshotReceiver) {
+        let counts = Arc::new(DrainCounts::default());
+        self.snapshots = Some(Arc::clone(&counts));
+        self.handles.push(runtime.spawn(async move {
+            while let Ok(snapshot) = receiver.changed().await {
+                black_box(&snapshot);
+                counts.items.fetch_add(1, Ordering::Relaxed);
             }
-            Self::Lifecycle(events) => {
-                black_box(events);
+        }));
+    }
+
+    fn drain_lifecycle(&mut self, runtime: &Runtime, mut events: LifecycleEvents) {
+        let counts = Arc::new(DrainCounts::default());
+        self.lifecycle = Some(Arc::clone(&counts));
+        self.handles.push(runtime.spawn(async move {
+            while let Some(item) = events.recv().await {
+                match item {
+                    LifecycleItem::Event(event) => {
+                        black_box(&event);
+                        counts.items.fetch_add(1, Ordering::Relaxed);
+                    }
+                    LifecycleItem::Lagged { dropped } => {
+                        counts.lagged.fetch_add(dropped as usize, Ordering::Relaxed);
+                    }
+                }
             }
-            Self::Both(receiver, events) => {
-                black_box((receiver, events));
-            }
+        }));
+    }
+
+    /// Checks the consumers were load-bearing, then retires them.
+    fn finish(self, runtime: &Runtime, mode: &str) {
+        for (stream, counts) in [
+            ("snapshots", &self.snapshots),
+            ("lifecycle", &self.lifecycle),
+        ] {
+            let Some(counts) = counts else { continue };
+            assert!(
+                counts.items.load(Ordering::Relaxed) > 0,
+                "the {mode} arm's {stream} consumer observed nothing, so the arm did not \
+                 measure a woken subscriber",
+            );
+            // Lag is a regime change, not an error: record it so a run that
+            // silently fell into the lagged regime is still visible.
+            black_box(counts.lagged.load(Ordering::Relaxed));
         }
+        runtime.block_on(async move {
+            for handle in self.handles {
+                handle.abort();
+                let _ = handle.await;
+            }
+        });
     }
 }
 
@@ -270,21 +368,35 @@ fn bench_dynamic_churn(c: &mut Criterion, runtime_name: &str, runtime: &Runtime)
 
     for mode in ["none", "snapshots", "lifecycle", "both"] {
         let (system, scope) = start_dynamic(runtime);
-        let observation = Observation::subscribe(mode, scope.as_scope());
+        let observers = Observers::spawn(mode, runtime, scope.as_scope());
         group.bench_function(mode, |b| {
             b.to_async(runtime).iter(|| async {
                 for _ in 0..CHURN_CYCLES {
+                    let started = Arc::new(Notify::new());
                     let task = scope
-                        .add_task("worker", cooperative_task())
+                        .add_task("worker", announcing_task(Arc::clone(&started)))
                         .await
                         .expect("the dynamic benchmark admits its task");
+                    // Removal latches immediately, so without this rendezvous
+                    // it races the driver's start transaction and the
+                    // `Removing` mark suppresses the `Ready` edge. Waiting
+                    // pins every cycle at five edges under both runtime
+                    // configurations; see the README.
+                    started.notified().await;
                     let outcome = scope.remove_task(&task).await;
-                    black_box(outcome);
-                    debug_assert_eq!(outcome, RemoveOutcome::Removed);
+                    // Promoted from `debug_assert_eq!`: `cargo bench` builds
+                    // the release-derived `bench` profile, where a debug
+                    // assertion is compiled out and this loop would have no
+                    // correctness guard at all.
+                    assert_eq!(
+                        outcome,
+                        RemoveOutcome::Removed,
+                        "each churn cycle must remove the membership it admitted",
+                    );
                 }
             });
         });
-        observation.retain();
+        observers.finish(runtime, mode);
         stop_dynamic(runtime, system);
     }
     group.finish();

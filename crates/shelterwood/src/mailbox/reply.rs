@@ -164,8 +164,8 @@ mod tests {
         time::Duration,
     };
 
-    use crate::mailbox::{
-        capability::{DisposingReceiver, OneShotClose, oneshot},
+    use crate::{
+        mailbox::capability::{DisposingReceiver, OneShotClose, oneshot},
         test_support::probe_waker,
     };
     use shelterwood_core::{

@@ -8,6 +8,7 @@ use shelterwood_core::{ChildId, Incarnation, IncarnationCounter, Membership, Sco
 
 struct WakerProbe {
     on_clone: Box<dyn Fn() + Send + Sync>,
+    on_wake: Box<dyn Fn() + Send + Sync>,
     on_drop: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -22,10 +23,16 @@ unsafe fn clone_probe(data: *const ()) -> RawWaker {
 
 unsafe fn wake_probe(data: *const ()) {
     // SAFETY: wake consumes exactly the Arc reference represented by `data`.
-    drop(unsafe { Arc::<WakerProbe>::from_raw(data.cast()) });
+    let probe = unsafe { Arc::<WakerProbe>::from_raw(data.cast()) };
+    (probe.on_wake)();
 }
 
-unsafe fn wake_probe_by_ref(_data: *const ()) {}
+unsafe fn wake_probe_by_ref(data: *const ()) {
+    // SAFETY: `data` remains owned by the caller, so this temporary reference
+    // neither consumes nor clones its Arc reference.
+    let probe = unsafe { &*data.cast::<WakerProbe>() };
+    (probe.on_wake)();
+}
 
 unsafe fn drop_probe(data: *const ()) {
     // SAFETY: drop consumes exactly the Arc reference represented by `data`.
@@ -44,8 +51,18 @@ pub(crate) fn probe_waker(
     on_clone: impl Fn() + Send + Sync + 'static,
     on_drop: impl Fn() + Send + Sync + 'static,
 ) -> Waker {
+    probe_waker_with_wake(on_clone, || {}, on_drop)
+}
+
+/// Builds a test-only waker that additionally observes wake operations.
+pub(crate) fn probe_waker_with_wake(
+    on_clone: impl Fn() + Send + Sync + 'static,
+    on_wake: impl Fn() + Send + Sync + 'static,
+    on_drop: impl Fn() + Send + Sync + 'static,
+) -> Waker {
     let probe = Arc::new(WakerProbe {
         on_clone: Box::new(on_clone),
+        on_wake: Box::new(on_wake),
         on_drop: Box::new(on_drop),
     });
     let raw = RawWaker::new(Arc::into_raw(probe).cast(), &PROBE_VTABLE);

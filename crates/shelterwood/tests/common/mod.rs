@@ -23,7 +23,7 @@ pub(crate) use timing::{
 };
 pub(crate) use waker::{
     LiveWakerCounter, OrdinalWakerState, counting_waker, hostile_waker, ordinal_drop_waker,
-    ordinal_waker,
+    ordinal_waker, probe_waker,
 };
 
 macro_rules! assert_eventually {

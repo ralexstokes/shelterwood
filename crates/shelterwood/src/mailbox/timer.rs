@@ -17,7 +17,7 @@ mod tests {
 
     use shelterwood_core::{BoxedSleep, ProxiedSleep};
 
-    use crate::mailbox::test_support::probe_waker;
+    use crate::test_support::probe_waker;
 
     fn thread_drop_waker(sender: mpsc::Sender<ThreadId>) -> Waker {
         probe_waker(

@@ -828,9 +828,9 @@ mod tests {
     use crate::{
         mailbox::{
             CallErrorKind, Incarnation, MailboxControl, MailboxEffectQueue, MailboxReceiver, Reply,
-            test_support::{mint_actor_incarnation, probe_waker},
         },
         policy::ResolvedMailbox,
+        test_support::{mint_actor_incarnation, probe_waker},
     };
 
     use super::{

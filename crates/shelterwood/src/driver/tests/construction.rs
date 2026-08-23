@@ -14,10 +14,7 @@ fn handle_identity_is_stable_across_membership_rebase() {
 
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     let mailbox: Arc<MailboxCell<u8>> =
         MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), mailbox);
@@ -53,10 +50,7 @@ fn handle_identity_is_stable_across_membership_rebase() {
 async fn attaching_after_terminality_closes_the_mailbox() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     let mut parked = Box::pin(actor.send(1));

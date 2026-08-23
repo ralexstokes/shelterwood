@@ -5,7 +5,6 @@ async fn reserve_error_identity_exhausted_maps_the_membership_domain() {
     let mut root_identity = ScopeIdentity::new();
     let root_id = ChildId::from("root");
     let root_member = MemberCell::new(
-        root_id.clone(),
         root_identity
             .mint_membership(&root_id)
             .expect("root membership available"),
@@ -110,7 +109,7 @@ fn member_transitions_own_their_complete_record_projection() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
     let membership = identity.mint_membership(&id).expect("membership available");
-    let member = MemberCell::new(id, membership);
+    let member = MemberCell::new(membership);
     let mut incarnations = member.take_incarnation_counter();
     let incarnation = incarnations.mint().expect("incarnation available");
 
@@ -166,7 +165,7 @@ fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
     let membership = identity.mint_membership(&id).expect("membership available");
-    let member = MemberCell::new(id, membership);
+    let member = MemberCell::new(membership);
     let previous = Exit::failed(
         ExitError::message("last completed incarnation"),
         Cancellation::NotObserved,
@@ -438,7 +437,7 @@ async fn nested_membership_exhaustion_is_structured_and_fail_closed() {
     let nested_membership = parent_identity
         .mint_membership(&nested_id)
         .expect("nested membership available");
-    let nested_member = MemberCell::new(nested_id, nested_membership);
+    let nested_member = MemberCell::new(nested_membership);
 
     let worker_id = ChildId::from("worker");
     let mut child_identity = ScopeIdentity::near_exhaustion(worker_id.clone(), 7);
@@ -508,7 +507,7 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
     let nested_membership = parent_identity
         .mint_membership(&nested_id)
         .expect("nested membership available");
-    let nested_member = MemberCell::new(nested_id, nested_membership);
+    let nested_member = MemberCell::new(nested_membership);
 
     let worker_id = ChildId::from("worker");
     let mut child_identity = ScopeIdentity::near_exhaustion(worker_id.clone(), 7);
@@ -610,7 +609,7 @@ async fn scope_incarnation_exhaustion_closes_nested_observation() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("nested");
     let membership = identity.mint_membership(&id).expect("membership available");
-    let member = MemberCell::new(id, membership);
+    let member = MemberCell::new(membership);
     let scope = ScopeCell::new(
         Arc::clone(&member),
         ScopeFlavor::Ordered,
@@ -706,7 +705,7 @@ fn lifecycle_sequence_exhaustion_poison_is_never_minted_and_becomes_lag() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("scope");
     let membership = identity.mint_membership(&id).expect("membership available");
-    let member = MemberCell::new(id, membership);
+    let member = MemberCell::new(membership);
     let scope = ScopeCell::new(member, ScopeFlavor::Ordered, ScopeIdentity::new());
     scope.set_lifecycle_sequence(u64::MAX - 2);
     let mut events = scope.subscribe_lifecycle();

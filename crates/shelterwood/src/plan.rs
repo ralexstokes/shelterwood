@@ -41,8 +41,7 @@ fn mint_reserved_slot_inner(
     id: &ChildId,
     child_scope: Option<ScopeFlavor>,
 ) -> Option<Arc<SlotCell>> {
-    let membership = parent.mint_membership(id)?;
-    let member = MemberCell::new(id.clone(), membership);
+    let member = MemberCell::new(parent.mint_membership(id)?);
     let scope = child_scope.map(|flavor| {
         let identity = ScopeIdentity::new();
         ScopeCell::new(Arc::clone(&member), flavor, identity)
@@ -328,10 +327,11 @@ impl BuilderCore {
     pub(crate) fn new(flavor: ScopeFlavor) -> Self {
         let root_id = ChildId::from("$root");
         let mut root_identity = ScopeIdentity::new();
-        let membership = root_identity
-            .mint_membership(&root_id)
-            .expect("fresh scope identity must mint its root membership");
-        let member = MemberCell::new(root_id, membership);
+        let member = MemberCell::new(
+            root_identity
+                .mint_membership(&root_id)
+                .expect("fresh scope identity must mint its root membership"),
+        );
         let child_identity = ScopeIdentity::new();
         let root = ScopeCell::new(member, flavor, child_identity);
         Self {
@@ -398,7 +398,7 @@ impl BuilderCore {
             // not this builder's throwaway root.
             self.adopting_root = Some(Arc::clone(&root));
             for slot in &self.slots {
-                match root.adopt_or_mint_membership(slot.member.id(), slot.member.membership()) {
+                match root.adopt_or_mint_membership(slot.member.take_provisional_membership()) {
                     MembershipReconciliation::Adopted => {}
                     MembershipReconciliation::Minted(identity) => {
                         slot.member.rebase_membership(identity);
@@ -914,10 +914,11 @@ mod tests {
         // preceding slot's lineage was already adopted.
         let root_id = ChildId::from("$root");
         let mut root_identity = ScopeIdentity::new();
-        let root_membership = root_identity
-            .mint_membership(&root_id)
-            .expect("fresh scope identity must mint its root membership");
-        let member = MemberCell::new(root_id, root_membership);
+        let member = MemberCell::new(
+            root_identity
+                .mint_membership(&root_id)
+                .expect("fresh scope identity must mint its root membership"),
+        );
         let exhausted_id = ChildId::from("exhausted");
         let mut child_identity = ScopeIdentity::near_exhaustion(exhausted_id.clone(), 7);
         let _ = child_identity

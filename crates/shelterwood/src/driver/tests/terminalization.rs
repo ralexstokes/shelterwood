@@ -541,10 +541,7 @@ fn stopped_publication_keeps_mailbox_panic_primary_and_finishes_observation() {
 fn panicking_mailbox_waker_cannot_skip_the_terminal_pulse() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     member.attach_mailbox(mailbox);
@@ -595,10 +592,7 @@ fn panicking_mailbox_waker_cannot_skip_the_terminal_pulse() {
 fn mailbox_teardown_panic_precedes_a_terminal_pulse_panic() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     member.attach_mailbox(mailbox);
@@ -751,10 +745,7 @@ async fn mailbox_waker_panic_is_contained_without_wedging_system_completion() {
 fn terminality_signal_follows_mailbox_termination() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     member.attach_mailbox(mailbox);
@@ -783,10 +774,7 @@ fn supervised_terminality_pulse_follows_mailbox_termination() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
@@ -847,10 +835,7 @@ fn supervised_mailbox_teardown_panic_precedes_terminal_pulse_panic() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
@@ -919,10 +904,7 @@ fn supervised_mailbox_teardown_panic_precedes_terminal_pulse_panic() {
 fn mailbox_wake_observes_terminal_record_and_reentrant_terminality_is_idempotent() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     member.attach_mailbox(mailbox);
@@ -960,10 +942,7 @@ fn mailbox_wake_observes_terminal_record_and_reentrant_terminality_is_idempotent
 fn attach_to_a_terminal_member_finishes_record_before_mailbox_wake() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     let first_exit = Exit::never_started();
@@ -1001,10 +980,7 @@ fn attach_to_a_terminal_member_finishes_record_before_mailbox_wake() {
 fn concurrent_terminalizers_return_after_one_consistent_record_is_visible() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     let start = Arc::new(Barrier::new(3));
     let workers = [
         Exit::never_started(),
@@ -1037,10 +1013,7 @@ fn concurrent_terminalizers_return_after_one_consistent_record_is_visible() {
 fn a_losing_terminalizer_does_not_reclassify_or_republish_startup() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     let winner = Exit::completed(Cancellation::NotObserved);
     member.terminalize(winner, StartupDisposition::NotAborted);
     let winning_record = member.record();
@@ -1075,10 +1048,7 @@ fn a_losing_terminalizer_does_not_reclassify_or_republish_startup() {
 fn terminal_startup_wake_follows_member_and_incarnation_publication() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("root");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     let scope = ScopeCell::new(member, ScopeFlavor::Ordered, ScopeIdentity::new());
     let epoch = scope
         .begin_incarnation(ScopeState::Starting)
@@ -1120,10 +1090,7 @@ fn terminal_startup_wake_follows_member_and_incarnation_publication() {
 fn no_live_root_startup_wake_follows_member_publication() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("root");
-    let member = MemberCell::new(
-        id.clone(),
-        identity.mint_membership(&id).expect("membership available"),
-    );
+    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
     let scope = ScopeCell::new(member, ScopeFlavor::Ordered, ScopeIdentity::new());
     let probe = Arc::new(ObserveScopeOnStartupWake {
         scope: Arc::clone(&scope),

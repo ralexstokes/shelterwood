@@ -14,7 +14,7 @@ use crate::{
 use shelterwood_core::{
     ChildId, Exit, ExitKind, Incarnation, Membership, RestartCount,
     engine::MembershipStatus,
-    identity::{IncarnationCounter, MintedMembership},
+    identity::{IncarnationCounter, MintedMembership, ProvisionalMembership},
     policy::ResolvedCommonOptions,
 };
 
@@ -176,6 +176,7 @@ pub(crate) struct MemberCell {
     id: ChildId,
     membership: Membership,
     rebased_membership: OnceLock<Membership>,
+    provisional_membership: Mutex<Option<ProvisionalMembership>>,
     incarnations: Mutex<Option<IncarnationCounter>>,
     pub(super) record: runtime::WatchSender<MemberRecord>,
     // Guards only a gate-pointer swap, so no torn state is possible; every
@@ -251,8 +252,13 @@ impl fmt::Debug for MemberMailbox {
 }
 
 impl MemberCell {
-    pub(crate) fn new(id: ChildId, identity: MintedMembership) -> Arc<Self> {
-        let (membership, incarnations) = identity.into_pair();
+    // The id is read from the grant rather than accepted beside it: the
+    // reconciliation token carries the id its lineage was minted for, so a
+    // member whose `id()` disagrees with the id its membership was minted
+    // under — and would therefore be adopted under — is unconstructible.
+    pub(crate) fn new(identity: MintedMembership) -> Arc<Self> {
+        let id = identity.id().clone();
+        let (membership, provisional_membership, incarnations) = identity.into_provisional_parts();
         let (record, _) = runtime::watch(MemberRecord {
             stage: MemberStage::Reserved,
             incarnation: None,
@@ -268,6 +274,7 @@ impl MemberCell {
             id,
             membership,
             rebased_membership: OnceLock::new(),
+            provisional_membership: Mutex::new(Some(provisional_membership)),
             incarnations: Mutex::new(Some(incarnations)),
             record,
             observation_gate: RwLock::new(ObservationGate::new()),
@@ -286,6 +293,18 @@ impl MemberCell {
             .get()
             .copied()
             .unwrap_or(self.membership)
+    }
+
+    pub(crate) fn take_provisional_membership(&self) -> ProvisionalMembership {
+        // Two statements, not one chain: the guard must be released before
+        // the verdict can panic, or the failing assertion would poison the
+        // mutex for every later caller.
+        let provisional = self
+            .provisional_membership
+            .lock()
+            .expect("provisional membership mutex poisoned")
+            .take();
+        provisional.expect("a declaration membership can be reconciled at most once")
     }
 
     pub(crate) fn rebase_membership(&self, identity: MintedMembership) {
@@ -989,7 +1008,6 @@ mod tests {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("worker");
         let member = MemberCell::new(
-            id.clone(),
             identity
                 .mint_membership(&id)
                 .expect("membership is available"),
@@ -1024,7 +1042,6 @@ mod tests {
         let id = ChildId::from("worker");
         let mut identity = ScopeIdentity::new();
         let member = MemberCell::new(
-            id.clone(),
             identity
                 .mint_membership(&id)
                 .expect("membership is available"),

@@ -447,8 +447,7 @@ mod tests {
     ) {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("task");
-        let membership = identity.mint_membership(&id).expect("membership available");
-        let member = MemberCell::new(id, membership);
+        let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
         let (sender, receiver) = runtime::oneshot();
         let claim = OneShotTaskRef::new(receiver, TaskRef::new(std::sync::Arc::clone(&member)));
         (sender, claim, member)
@@ -481,8 +480,7 @@ mod tests {
     async fn staged_one_shot_wait_cannot_double_panic_at_completion_delivery() {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("task");
-        let membership = identity.mint_membership(&id).expect("membership available");
-        let member = MemberCell::new(id, membership);
+        let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
         let (sending, receiver) = runtime::oneshot_sending_for_test();
         let claim = OneShotTaskRef::new(receiver, TaskRef::new(Arc::clone(&member)));
         member.terminalize(

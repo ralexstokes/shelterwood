@@ -143,6 +143,7 @@ impl Fence {
 /// `u64::MAX` is poison and is never returned. Once the last usable value has
 /// been minted, no successor can be minted.
 #[derive(Clone, Debug)]
+#[doc(hidden)]
 pub struct PoisonedCounter {
     current: u64,
 }
@@ -204,6 +205,7 @@ impl Default for PoisonedCounter {
 
 /// A thread-safe [`PoisonedCounter`] with the same fail-closed domain.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct AtomicPoisonedCounter(AtomicU64);
 
 impl AtomicPoisonedCounter {
@@ -297,16 +299,37 @@ impl FenceCounter {
 
 /// A membership and the generation counter that can mint only its incarnations.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct IncarnationCounter {
     membership: Membership,
     generations: PoisonedCounter,
 }
 
+/// Linear authority to reconcile one declaration-time membership.
+///
+/// The token carries the [`ChildId`] its lineage was minted for, and
+/// [`ScopeIdentity::adopt_or_mint_membership`] reads the id from it rather
+/// than from a second argument: donating a lineage to a *different* id is
+/// therefore unconstructible, not merely unused. Deliberately not `Clone` —
+/// one minted lineage may seed at most one stable id, so a copyable token
+/// would restore the cross-domain donation the binding removes. The
+/// remaining cross-*scope* half (two provisionals for one id, adopted into
+/// two stable scopes) cannot be closed by construction and rides on the
+/// framework-only ruling that keeps this whole minting family
+/// `#[doc(hidden)]`.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct ProvisionalMembership {
+    id: ChildId,
+    membership: Membership,
+}
+
 /// An inseparable identity grant: the counter for an incarnation lineage is
 /// allocated exactly once as its first membership method returns.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct MintedMembership {
-    membership: Membership,
+    provisional: ProvisionalMembership,
     incarnation_counter: IncarnationCounter,
 }
 
@@ -317,6 +340,7 @@ pub struct MintedMembership {
 /// reconciliation is never optional to consume.
 #[derive(Debug)]
 #[must_use]
+#[doc(hidden)]
 pub enum MembershipReconciliation {
     /// The stable scope adopted the provisional lineage unchanged.
     Adopted,
@@ -327,9 +351,9 @@ pub enum MembershipReconciliation {
 }
 
 impl MintedMembership {
-    fn new(membership: Membership) -> Self {
+    fn new(id: ChildId, membership: Membership) -> Self {
         Self {
-            membership,
+            provisional: ProvisionalMembership { id, membership },
             incarnation_counter: IncarnationCounter {
                 membership,
                 generations: PoisonedCounter::new(),
@@ -337,13 +361,29 @@ impl MintedMembership {
         }
     }
 
+    /// Returns the child id this lineage was minted for.
+    ///
+    /// Keeping the id inside the grant is what lets a member cell derive its
+    /// own id from its identity instead of accepting the two separately.
+    pub fn id(&self) -> &ChildId {
+        &self.provisional.id
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     pub fn membership(&self) -> Membership {
-        self.membership
+        self.provisional.membership
     }
 
     pub fn into_pair(self) -> (Membership, IncarnationCounter) {
-        (self.membership, self.incarnation_counter)
+        (self.provisional.membership, self.incarnation_counter)
+    }
+
+    pub fn into_provisional_parts(self) -> (Membership, ProvisionalMembership, IncarnationCounter) {
+        (
+            self.provisional.membership,
+            self.provisional,
+            self.incarnation_counter,
+        )
     }
 }
 
@@ -375,6 +415,7 @@ impl IncarnationCounter {
 
 /// The identity domain owned by one scope membership.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct ScopeIdentity {
     memberships: HashMap<ChildId, FenceCounter>,
 }
@@ -417,7 +458,7 @@ impl ScopeIdentity {
                 Some(membership)
             }
         }?;
-        Some(MintedMembership::new(membership))
+        Some(MintedMembership::new(id.clone(), membership))
     }
 
     /// Reconciles a declaration-time membership with this stable scope.
@@ -428,24 +469,28 @@ impl ScopeIdentity {
     /// successor. Terminalization evicts the lineage, so an ordinary later
     /// remove-and-re-add or post-restart rebuild donates a fresh, incomparable
     /// identity instead.
+    ///
+    /// The reconciled id comes from the [`ProvisionalMembership`] itself, so
+    /// the lineage can only ever be donated to the id it was minted for.
     pub fn adopt_or_mint_membership(
         &mut self,
-        id: &ChildId,
-        provisional: Membership,
+        provisional: ProvisionalMembership,
     ) -> MembershipReconciliation {
-        match self.memberships.entry(id.clone()) {
+        let ProvisionalMembership { id, membership } = provisional;
+        match self.memberships.entry(id) {
             Entry::Occupied(mut entry) => {
                 let Some(membership) = entry.get_mut().mint().map(Membership) else {
                     return MembershipReconciliation::Exhausted;
                 };
-                MembershipReconciliation::Minted(MintedMembership::new(membership))
+                let id = entry.key().clone();
+                MembershipReconciliation::Minted(MintedMembership::new(id, membership))
             }
             Entry::Vacant(entry) => {
                 // Diagnostic-only under the cells child-identity mutex. A
                 // public Membership cannot contain the private poison value;
                 // insertion behavior therefore does not rely on this check.
-                debug_assert_ne!(provisional.0.generation, Generation::POISON);
-                entry.insert(FenceCounter::from_fence(provisional.0));
+                debug_assert_ne!(membership.0.generation, Generation::POISON);
+                entry.insert(FenceCounter::from_fence(membership.0));
                 MembershipReconciliation::Adopted
             }
         }
@@ -581,14 +626,14 @@ mod tests {
     fn adopted_membership_orders_a_direct_mint_and_later_rebuild() {
         let id = ChildId::from("worker");
         let mut declaration = ScopeIdentity::new();
-        let provisional = declaration
+        let (provisional_membership, provisional, _) = declaration
             .mint_membership(&id)
             .expect("provisional membership available")
-            .membership();
+            .into_provisional_parts();
 
         let mut stable = ScopeIdentity::new();
         assert!(matches!(
-            stable.adopt_or_mint_membership(&id, provisional),
+            stable.adopt_or_mint_membership(provisional),
             MembershipReconciliation::Adopted
         ));
         let direct = stable
@@ -597,22 +642,21 @@ mod tests {
             .membership();
 
         let mut rebuilt_declaration = ScopeIdentity::new();
-        let rebuilt = rebuilt_declaration
+        let (rebuilt_membership, rebuilt, _) = rebuilt_declaration
             .mint_membership(&id)
             .expect("rebuilt provisional membership available")
-            .membership();
-        let MembershipReconciliation::Minted(reconciled) =
-            stable.adopt_or_mint_membership(&id, rebuilt)
+            .into_provisional_parts();
+        let MembershipReconciliation::Minted(reconciled) = stable.adopt_or_mint_membership(rebuilt)
         else {
             panic!("an occupied stable identity mints a successor")
         };
         let reconciled = reconciled.membership();
 
-        assert!(direct.supersedes(provisional));
+        assert!(direct.supersedes(provisional_membership));
         assert!(reconciled.supersedes(direct));
         assert!(!direct.supersedes(reconciled));
-        assert!(!rebuilt.supersedes(reconciled));
-        assert!(!reconciled.supersedes(rebuilt));
+        assert!(!rebuilt_membership.supersedes(reconciled));
+        assert!(!reconciled.supersedes(rebuilt_membership));
     }
 
     #[test]
@@ -620,42 +664,41 @@ mod tests {
         let id = ChildId::from("worker");
         let other_id = ChildId::from("other");
         let mut first_builder = ScopeIdentity::new();
-        let first = first_builder
+        let (first_membership, first, _) = first_builder
             .mint_membership(&id)
             .expect("first provisional membership available")
-            .membership();
-        let other = first_builder
+            .into_provisional_parts();
+        let (other_membership, other, _) = first_builder
             .mint_membership(&other_id)
             .expect("other provisional membership available")
-            .membership();
+            .into_provisional_parts();
         let mut rebuilt_builder = ScopeIdentity::new();
-        let rebuilt = rebuilt_builder
+        let (rebuilt_membership, rebuilt, _) = rebuilt_builder
             .mint_membership(&id)
             .expect("rebuilt provisional membership available")
-            .membership();
+            .into_provisional_parts();
 
         let mut stable = ScopeIdentity::new();
         assert!(matches!(
-            stable.adopt_or_mint_membership(&id, first),
+            stable.adopt_or_mint_membership(first),
             MembershipReconciliation::Adopted
         ));
         assert!(matches!(
-            stable.adopt_or_mint_membership(&other_id, other),
+            stable.adopt_or_mint_membership(other),
             MembershipReconciliation::Adopted
         ));
-        let MembershipReconciliation::Minted(successor) =
-            stable.adopt_or_mint_membership(&id, rebuilt)
+        let MembershipReconciliation::Minted(successor) = stable.adopt_or_mint_membership(rebuilt)
         else {
             panic!("stable identity mints a rebuilt successor")
         };
         let successor = successor.membership();
 
-        assert!(successor.supersedes(first));
-        assert!(!first.supersedes(successor));
-        assert!(!successor.supersedes(rebuilt));
-        assert!(!rebuilt.supersedes(successor));
-        assert!(!successor.supersedes(other));
-        assert!(!other.supersedes(successor));
+        assert!(successor.supersedes(first_membership));
+        assert!(!first_membership.supersedes(successor));
+        assert!(!successor.supersedes(rebuilt_membership));
+        assert!(!rebuilt_membership.supersedes(successor));
+        assert!(!successor.supersedes(other_membership));
+        assert!(!other_membership.supersedes(successor));
     }
 
     #[test]
@@ -715,17 +758,21 @@ mod tests {
             .mint_membership(&id)
             .expect("last usable stable membership is minted");
         let mut builder = ScopeIdentity::new();
-        let provisional = builder
+        let (_, first_provisional, _) = builder
             .mint_membership(&id)
             .expect("provisional membership available")
-            .membership();
+            .into_provisional_parts();
+        let (_, second_provisional, _) = builder
+            .mint_membership(&id)
+            .expect("second provisional membership available")
+            .into_provisional_parts();
 
         assert!(matches!(
-            stable.adopt_or_mint_membership(&id, provisional),
+            stable.adopt_or_mint_membership(first_provisional),
             MembershipReconciliation::Exhausted
         ));
         assert!(matches!(
-            stable.adopt_or_mint_membership(&id, provisional),
+            stable.adopt_or_mint_membership(second_provisional),
             MembershipReconciliation::Exhausted
         ));
         assert!(

@@ -15,7 +15,10 @@ use shelterwood_core::{
     ChildId, Exit, Incarnation, Membership, TotalRestarts,
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{StartupError, StopReason, stop_reason_precedence},
-    identity::{AtomicPoisonedCounter, MembershipReconciliation, MintedMembership, ScopeIdentity},
+    identity::{
+        AtomicPoisonedCounter, MembershipReconciliation, MintedMembership, ProvisionalMembership,
+        ScopeIdentity,
+    },
     panic::{catch_panic, discard_panic},
     policy::ScopeFlavor,
 };
@@ -244,13 +247,12 @@ impl ScopeCell {
 
     pub(crate) fn adopt_or_mint_membership(
         &self,
-        id: &ChildId,
-        provisional: Membership,
+        provisional: ProvisionalMembership,
     ) -> MembershipReconciliation {
         self.child_identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .adopt_or_mint_membership(id, provisional)
+            .adopt_or_mint_membership(provisional)
     }
 
     pub(crate) fn evict_child_identity(&self, member: &MemberCell) {
@@ -2682,7 +2684,6 @@ mod tests {
         let mut identity = ScopeIdentity::new();
         let root_id = ChildId::from("root");
         let root = MemberCell::new(
-            root_id.clone(),
             identity
                 .mint_membership(&root_id)
                 .expect("root membership is available"),
@@ -2690,7 +2691,6 @@ mod tests {
         let scope = ScopeCell::new(root, ScopeFlavor::Ordered, ScopeIdentity::new());
         let child_id = ChildId::from("worker");
         let child = MemberCell::new(
-            child_id.clone(),
             identity
                 .mint_membership(&child_id)
                 .expect("child membership is available"),
@@ -2743,7 +2743,6 @@ mod tests {
         let id = ChildId::from("root");
         let mut identity = ScopeIdentity::new();
         let member = MemberCell::new(
-            id.clone(),
             identity
                 .mint_membership(&id)
                 .expect("root membership is available"),
@@ -2817,7 +2816,6 @@ mod tests {
         let id = ChildId::from("root");
         let mut identity = ScopeIdentity::new();
         let member = MemberCell::new(
-            id.clone(),
             identity
                 .mint_membership(&id)
                 .expect("root membership is available"),
@@ -2855,7 +2853,6 @@ mod tests {
         let root_id = ChildId::from("root");
         let mut root_identity = ScopeIdentity::new();
         let root_member = MemberCell::new(
-            root_id.clone(),
             root_identity
                 .mint_membership(&root_id)
                 .expect("root membership is available"),
@@ -2866,7 +2863,6 @@ mod tests {
         let child_id = ChildId::from("child");
         let mut child_identity = ScopeIdentity::new();
         let child = MemberCell::new(
-            child_id.clone(),
             child_identity
                 .mint_membership(&child_id)
                 .expect("child membership is available"),

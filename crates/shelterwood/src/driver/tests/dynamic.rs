@@ -213,7 +213,6 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
     let mut identity = ScopeIdentity::new();
     let root_id = ChildId::from("root");
     let root_member = MemberCell::new(
-        root_id.clone(),
         identity
             .mint_membership(&root_id)
             .expect("root membership available"),
@@ -221,7 +220,6 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
     let root = ScopeCell::new(root_member, ScopeFlavor::Dynamic, ScopeIdentity::new());
     let child_id = ChildId::from("worker");
     let member = MemberCell::new(
-        child_id.clone(),
         root.mint_membership(&child_id)
             .expect("child membership available"),
     );
@@ -368,7 +366,6 @@ fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");
     let member = MemberCell::new(
-        child_id.clone(),
         root.mint_membership(&child_id)
             .expect("child membership available"),
     );
@@ -591,7 +588,7 @@ async fn removal_from_a_foreign_thread_reaches_the_driver() {
     let membership = root
         .mint_membership(&child_id)
         .expect("membership available");
-    let member = MemberCell::new(child_id.clone(), membership);
+    let member = MemberCell::new(membership);
     assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let slot = SlotCell::new(Arc::clone(&member), None);
     let key = ChildKey::fixture(1);

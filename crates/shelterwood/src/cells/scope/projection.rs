@@ -397,7 +397,6 @@ mod tests {
         let id = ChildId::from("root");
         let mut identity = ScopeIdentity::new();
         let member = MemberCell::new(
-            id.clone(),
             identity
                 .mint_membership(&id)
                 .expect("root membership is available"),
@@ -435,7 +434,6 @@ mod tests {
         let id = ChildId::from("root");
         let mut identity = ScopeIdentity::new();
         let member = MemberCell::new(
-            id.clone(),
             identity
                 .mint_membership(&id)
                 .expect("root membership is available"),

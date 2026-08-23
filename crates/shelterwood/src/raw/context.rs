@@ -1345,10 +1345,7 @@ mod tests {
     fn bound_raw_context_for<M: Send + 'static>() -> (RawContext<M>, ActorRef<M>, Latch) {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("raw-actor");
-        let member = MemberCell::new(
-            id.clone(),
-            identity.mint_membership(&id).expect("membership available"),
-        );
+        let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
         let mailbox = MailboxCell::new(id.clone(), crate::runtime::mailbox_runtime());
         member.attach_mailbox(mailbox.clone());
         let mut effects = MailboxEffectQueue::default();
@@ -1366,7 +1363,6 @@ mod tests {
         let mut scope_identity = ScopeIdentity::new();
         let scope_id = ChildId::from("scope");
         let scope_member = MemberCell::new(
-            scope_id.clone(),
             scope_identity
                 .mint_membership(&scope_id)
                 .expect("membership available"),

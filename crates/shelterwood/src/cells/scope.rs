@@ -2182,6 +2182,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resident_slot_refuses_a_different_membership_at_its_index() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let first = child_member(&root, "first");
+        let second = child_member(&root, "second");
+
+        let first_slot = root.push_unannounced(ResidentProjection::new(first, None));
+        let _second_slot = root.push_unannounced(ResidentProjection::new(second, None));
+        root.current_children().swap(0, 1);
+
+        assert!(
+            !first_slot.announce(),
+            "an index that now names another membership is not this admission's slot"
+        );
+        assert!(
+            root.current_children()
+                .iter()
+                .all(|resident| !resident.announced),
+            "a mismatched slot cannot announce either resident"
+        );
+    }
+
     /// Withdrawal mirrors announcement at both removal sites, not just the
     /// one `panicked_resident_admission_lingers_until_scope_clear` drives.
     #[test]

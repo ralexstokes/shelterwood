@@ -27,6 +27,7 @@
       extraChecks =
         {
           pkgs,
+          craneLibStable,
           craneLibNightly,
           commonArgs,
           cargoArtifactsNightly,
@@ -39,10 +40,43 @@
           # independent of that build ordering.
           benchmarkLock = ./tools/benchmarks/Cargo.lock;
           benchmarkArgs = commonArgs // {
+            # `--manifest-path` would otherwise place the build directory at
+            # tools/benchmarks/target, where crane's install/inherit hooks do
+            # not look, silently reducing the prebuilt dependency artifacts
+            # below to a no-op.
+            CARGO_TARGET_DIR = "target";
             cargoLock = benchmarkLock;
+            # Vendoring only reads the lockfile, so one vendor directory serves
+            # both toolchains.
             cargoVendorDir = craneLibNightly.vendorCargoDeps { cargoLock = benchmarkLock; };
-            pname = "shelterwood-benchmark-check";
+            pname = "shelterwood-benchmark";
           };
+          # Prebuild the benchmark package's dependencies against a dummy
+          # source keyed on the manifests and the benchmark lockfile, exactly
+          # as `cargoArtifactsNightly` does for the production workspace.
+          # Without this the Criterion dependency tree recompiles on every
+          # tracked source edit anywhere in the repository.
+          benchmarkDeps =
+            craneLib: suffix: buildCommand:
+            craneLib.buildDepsOnly (
+              benchmarkArgs
+              // {
+                pname = "${benchmarkArgs.pname}-${suffix}";
+                # `mkDummySrc` carries only the workspace-root lockfile across.
+                # The benchmark package has its own, and `--locked` needs it.
+                extraDummyScript = ''
+                  cp ${benchmarkLock} $out/tools/benchmarks/Cargo.lock
+                '';
+                doCheck = false;
+                buildPhaseCargoCommand = buildCommand;
+              }
+            );
+          benchmarkClippyDeps = benchmarkDeps craneLibNightly "clippy-deps" ''
+            cargo check --locked --manifest-path tools/benchmarks/Cargo.toml --all-targets
+          '';
+          benchmarkBuildDeps = benchmarkDeps craneLibStable "build-deps" ''
+            cargo bench --locked --manifest-path tools/benchmarks/Cargo.toml --no-run
+          '';
         in
         {
           cargo-clippy-default = craneLibNightly.cargoClippy (
@@ -94,6 +128,7 @@
               nativeBuildInputs = [ pkgs.ripgrep ];
               buildPhaseCargoCommand = ''
                 cargo fmt --manifest-path tools/external-consumer/Cargo.toml -- --check
+                cargo fmt --manifest-path tools/benchmarks/Cargo.toml -- --check
                 RUSTDOCFLAGS="-Z unstable-options --output-format json" \
                   cargo rustdoc --locked -p shelterwood --all-features --lib
                 cargo run --locked -p shelterwood-api-reachability -- \
@@ -106,15 +141,30 @@
           );
 
           # The Criterion harness has its own workspace and lockfile so its
-          # dependencies stay out of ordinary production builds. Compile it
-          # explicitly in the authoritative clean lane to prevent drift.
+          # dependencies stay out of ordinary production builds. Compile and
+          # lint it explicitly in the authoritative clean lane to prevent
+          # drift. The two halves are separate derivations because they run on
+          # separate toolchains, mirroring the justfile's `bench-check` recipe:
+          # lints on nightly like every other lint lane, and compiles on the
+          # pinned stable toolchain that `just bench` actually measures with,
+          # so a nightly-only construct cannot pass here and then fail there.
           benchmark-check = craneLibNightly.mkCargoDerivation (
             benchmarkArgs
             // {
-              cargoArtifacts = null;
+              cargoArtifacts = benchmarkClippyDeps;
               buildPhaseCargoCommand = ''
                 cargo clippy --locked --manifest-path tools/benchmarks/Cargo.toml \
                   --all-targets -- -D warnings
+              '';
+              doInstallCargoArtifacts = false;
+            }
+          );
+
+          benchmark-build = craneLibStable.mkCargoDerivation (
+            benchmarkArgs
+            // {
+              cargoArtifacts = benchmarkBuildDeps;
+              buildPhaseCargoCommand = ''
                 cargo bench --locked --manifest-path tools/benchmarks/Cargo.toml --no-run
               '';
               doInstallCargoArtifacts = false;

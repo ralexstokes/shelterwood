@@ -63,6 +63,10 @@ external-consumer-check:
 
 # The benchmark package is intentionally outside the production workspace.
 # Compile and lint it explicitly so the harness cannot rot between data runs.
+# The toolchain split is deliberate and mirrored by the flake's
+# `benchmark-check` (nightly) and `benchmark-build` (stable) derivations: lints
+# run on nightly like every other lint lane, and the compile runs on the pinned
+# stable toolchain that `bench` below measures with.
 bench-check:
     cargo +nightly clippy --locked --manifest-path tools/benchmarks/Cargo.toml --all-targets -- -D warnings
     cargo bench --locked --manifest-path tools/benchmarks/Cargo.toml --no-run

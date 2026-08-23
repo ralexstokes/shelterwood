@@ -101,16 +101,31 @@ impl ResidentChild {
     }
 }
 
+impl Drop for ResidentChild {
+    fn drop(&mut self) {
+        let Some(projection) = self.projection.take() else {
+            return;
+        };
+        discard_panic(catch_panic(|| drop(projection)).err());
+    }
+}
+
 /// The exact residency slot installed by one in-flight admission.
 ///
 /// The observation gate prevents a production admission from interleaving a
 /// second residency mutation, but the slot still carries its own index and
-/// membership. That makes the later announcement structurally address the
-/// resident whose `Added` edge is about to be published instead of relying on
-/// whichever child happens to be last.
-#[must_use = "an installed resident slot must be announced or withdrawn"]
+/// membership. That makes both of admission's later residency edits —
+/// announcement on success, withdrawal on refusal — structurally address the
+/// resident this admission installed instead of relying on whichever child
+/// happens to be last.
+///
+/// Dropping the token unconsumed is the containment path, not a leak: an
+/// unwind between the push and either edit deliberately leaves the resident
+/// installed and unannounced, so scope clear retires its possibly-last mailbox
+/// owner through detached disposal instead of unwinding it under the gate.
+#[must_use = "an installed resident slot is announced on success and withdrawn on refusal"]
 struct ResidentSlot<'a> {
-    children: &'a Mutex<Vec<ResidentChild>>,
+    scope: &'a ScopeCell,
     index: usize,
     membership: Membership,
 }
@@ -118,14 +133,12 @@ struct ResidentSlot<'a> {
 impl ResidentSlot<'_> {
     /// Marks this admission's exact resident as announced.
     ///
-    /// The token and everything inspected under the residency mutex are plain
-    /// framework-owned data, so this adds no effect to the doubled observation
-    /// gate section's lock-rule accounting.
+    /// Returns whether the slot still holds it. The token and everything
+    /// inspected under the residency mutex are plain framework-owned data, so
+    /// this adds no effect to the doubled observation gate section's lock-rule
+    /// accounting.
     fn announce(self) -> bool {
-        let mut children = self
-            .children
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut children = self.scope.current_children();
         children
             .get_mut(self.index)
             .filter(|resident| resident.projection().member.membership() == self.membership)
@@ -134,14 +147,22 @@ impl ResidentSlot<'_> {
                 true
             })
     }
-}
 
-impl Drop for ResidentChild {
-    fn drop(&mut self) {
-        let Some(projection) = self.projection.take() else {
-            return;
-        };
-        discard_panic(catch_panic(|| drop(projection)).err());
+    /// Removes this admission's resident again, publishing neither edge.
+    ///
+    /// Returns the displaced resident together with whether the slot still
+    /// held this admission's own. Popping is the diagnostic: no other
+    /// residency mutation may interleave under the observation gate, so the
+    /// entry this slot installed must still be the final one. A displaced
+    /// resident can own the last handle to a mailbox holding unread user
+    /// messages, so it is handed back by value for the caller to retire after
+    /// unlock rather than dropped here.
+    #[must_use = "a displaced resident retires after unlock, and the verdict is a diagnostic"]
+    fn withdraw(self) -> (Option<ResidentChild>, bool) {
+        let mut children = self.scope.current_children();
+        let is_admission = children.len() == self.index + 1
+            && children[self.index].projection().member.membership() == self.membership;
+        (children.pop(), is_admission)
     }
 }
 
@@ -375,7 +396,7 @@ impl ScopeCell {
         let index = children.len();
         children.push(ResidentChild::new(child));
         ResidentSlot {
-            children: &self.observation.current_children,
+            scope: self,
             index,
             membership,
         }
@@ -1464,14 +1485,11 @@ impl ScopeCell {
             )
         };
         if !admitted {
-            // No other residency mutation can interleave under the gate, so
-            // the entry pushed above is still the last one. Refusal removes
-            // it without emitting either half of the Added/Removed pair and
-            // retires its potentially last mailbox owner after unlock.
-            let rejected = self.current_children().pop();
-            let rejected_is_admission = rejected.as_ref().is_some_and(|rejected| {
-                rejected.projection().member.membership() == projection.member.membership()
-            });
+            // Refusal withdraws through the same token the announcement below
+            // consumes: it removes the entry pushed above without emitting
+            // either half of the Added/Removed pair and retires its
+            // potentially last mailbox owner after unlock.
+            let (rejected, rejected_is_admission) = resident_slot.withdraw();
             // Move both the resident and this function's lookup clone into
             // the effect before diagnosing the structural pop-last
             // invariant. If that diagnostic ever fires, neither possibly-last
@@ -1489,7 +1507,7 @@ impl ScopeCell {
         // walks residency and skips whatever is still unannounced. Refusing a
         // missing or mismatched index prevents a different resident from being
         // paired with this Added edge and diagnoses the same no-interleaving
-        // invariant as the refusal pop above.
+        // invariant as the refusal withdrawal above.
         let announced_is_admission = resident_slot.announce();
         if !announced_is_admission {
             // Residency no longer holds this admission, so the lookup clone
@@ -2201,6 +2219,87 @@ mod tests {
                 .iter()
                 .all(|resident| !resident.announced),
             "a mismatched slot cannot announce either resident"
+        );
+    }
+
+    #[test]
+    fn resident_slot_withdraws_the_resident_it_installed() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let only = child_member(&root, "only");
+        let membership = only.membership();
+
+        let slot = root.push_unannounced(ResidentProjection::new(only, None));
+        let (rejected, is_admission) = slot.withdraw();
+
+        assert!(
+            is_admission,
+            "the slot still holds this admission's resident"
+        );
+        assert_eq!(
+            rejected
+                .expect("withdrawal hands the displaced resident back")
+                .projection()
+                .member
+                .membership(),
+            membership,
+            "withdrawal returns the resident the slot installed"
+        );
+        assert!(
+            root.current_children().is_empty(),
+            "withdrawal leaves no residency entry behind"
+        );
+    }
+
+    #[test]
+    fn resident_slot_withdrawal_refuses_an_interposed_resident() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let first = child_member(&root, "first");
+        let second = child_member(&root, "second");
+        let second_membership = second.membership();
+
+        let first_slot = root.push_unannounced(ResidentProjection::new(first, None));
+        let _second_slot = root.push_unannounced(ResidentProjection::new(second, None));
+        let (rejected, is_admission) = first_slot.withdraw();
+
+        assert!(
+            !is_admission,
+            "a slot that is no longer the final entry is not this admission's resident"
+        );
+        assert_eq!(
+            rejected
+                .expect("withdrawal still displaces the final resident")
+                .projection()
+                .member
+                .membership(),
+            second_membership,
+            "withdrawal displaces the last entry so residency cannot grow past a refusal"
+        );
+    }
+
+    #[test]
+    fn resident_slot_withdrawal_refuses_a_different_membership_at_its_index() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let first = child_member(&root, "first");
+        let second = child_member(&root, "second");
+        let first_membership = first.membership();
+
+        let _first_slot = root.push_unannounced(ResidentProjection::new(first, None));
+        let second_slot = root.push_unannounced(ResidentProjection::new(second, None));
+        root.current_children().swap(0, 1);
+        let (rejected, is_admission) = second_slot.withdraw();
+
+        assert!(
+            !is_admission,
+            "a final index that now names another membership is not this admission's slot"
+        );
+        assert_eq!(
+            rejected
+                .expect("withdrawal still displaces the final resident")
+                .projection()
+                .member
+                .membership(),
+            first_membership,
+            "the displaced resident is whichever entry the swap left last"
         );
     }
 

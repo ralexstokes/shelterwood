@@ -2684,7 +2684,6 @@ mod tests {
         let mut identity = ScopeIdentity::new();
         let root_id = ChildId::from("root");
         let root = MemberCell::new(
-            root_id.clone(),
             identity
                 .mint_membership(&root_id)
                 .expect("root membership is available"),
@@ -2692,7 +2691,6 @@ mod tests {
         let scope = ScopeCell::new(root, ScopeFlavor::Ordered, ScopeIdentity::new());
         let child_id = ChildId::from("worker");
         let child = MemberCell::new(
-            child_id.clone(),
             identity
                 .mint_membership(&child_id)
                 .expect("child membership is available"),
@@ -2745,7 +2743,6 @@ mod tests {
         let id = ChildId::from("root");
         let mut identity = ScopeIdentity::new();
         let member = MemberCell::new(
-            id.clone(),
             identity
                 .mint_membership(&id)
                 .expect("root membership is available"),
@@ -2819,7 +2816,6 @@ mod tests {
         let id = ChildId::from("root");
         let mut identity = ScopeIdentity::new();
         let member = MemberCell::new(
-            id.clone(),
             identity
                 .mint_membership(&id)
                 .expect("root membership is available"),
@@ -2857,7 +2853,6 @@ mod tests {
         let root_id = ChildId::from("root");
         let mut root_identity = ScopeIdentity::new();
         let root_member = MemberCell::new(
-            root_id.clone(),
             root_identity
                 .mint_membership(&root_id)
                 .expect("root membership is available"),
@@ -2868,7 +2863,6 @@ mod tests {
         let child_id = ChildId::from("child");
         let mut child_identity = ScopeIdentity::new();
         let child = MemberCell::new(
-            child_id.clone(),
             child_identity
                 .mint_membership(&child_id)
                 .expect("child membership is available"),

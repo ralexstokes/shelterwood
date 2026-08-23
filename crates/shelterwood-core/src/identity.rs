@@ -306,6 +306,17 @@ pub struct IncarnationCounter {
 }
 
 /// Linear authority to reconcile one declaration-time membership.
+///
+/// The token carries the [`ChildId`] its lineage was minted for, and
+/// [`ScopeIdentity::adopt_or_mint_membership`] reads the id from it rather
+/// than from a second argument: donating a lineage to a *different* id is
+/// therefore unconstructible, not merely unused. Deliberately not `Clone` —
+/// one minted lineage may seed at most one stable id, so a copyable token
+/// would restore the cross-domain donation the binding removes. The
+/// remaining cross-*scope* half (two provisionals for one id, adopted into
+/// two stable scopes) cannot be closed by construction and rides on the
+/// framework-only ruling that keeps this whole minting family
+/// `#[doc(hidden)]`.
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct ProvisionalMembership {
@@ -348,6 +359,14 @@ impl MintedMembership {
                 generations: PoisonedCounter::new(),
             },
         }
+    }
+
+    /// Returns the child id this lineage was minted for.
+    ///
+    /// Keeping the id inside the grant is what lets a member cell derive its
+    /// own id from its identity instead of accepting the two separately.
+    pub fn id(&self) -> &ChildId {
+        &self.provisional.id
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -450,6 +469,9 @@ impl ScopeIdentity {
     /// successor. Terminalization evicts the lineage, so an ordinary later
     /// remove-and-re-add or post-restart rebuild donates a fresh, incomparable
     /// identity instead.
+    ///
+    /// The reconciled id comes from the [`ProvisionalMembership`] itself, so
+    /// the lineage can only ever be donated to the id it was minted for.
     pub fn adopt_or_mint_membership(
         &mut self,
         provisional: ProvisionalMembership,

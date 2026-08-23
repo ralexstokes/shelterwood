@@ -566,7 +566,6 @@ pub(super) fn restarting_member_fixture() -> (Arc<ScopeCell>, Arc<MemberCell>, I
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");
     let member = MemberCell::new(
-        child_id.clone(),
         root.mint_membership(&child_id)
             .expect("child membership available"),
     );

@@ -1,3 +1,12 @@
+//! What an out-of-crate consumer can reach in the identity module.
+//!
+//! `#[doc(hidden)]` on the minting-authority family is a *documentation*
+//! marker, not a visibility one, so nothing here can pin it — core has no
+//! public-surface audit lane (recorded on #436 as a deferred probe, not part
+//! of this fix). What this file does pin is the half that is mechanical: the
+//! three supported value types stay reachable and keyed, and the
+//! reconciliation token stays linear so a lineage cannot be donated twice.
+
 use std::hash::Hash;
 
 use shelterwood_core::{
@@ -19,6 +28,8 @@ macro_rules! assert_not_impl {
     };
 }
 
+// Copying the token would let one minted lineage seed two stable ids, which
+// is the cross-domain donation the id binding exists to remove.
 assert_not_impl!(ProvisionalMembership: Clone);
 
 fn assert_copy_identity<T: Copy + Eq + Hash + Send + Sync>() {}

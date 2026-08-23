@@ -490,7 +490,6 @@ mod tests {
         let id = ChildId::from("worker");
         let mut identity = ScopeIdentity::new();
         let member = MemberCell::new(
-            id.clone(),
             identity
                 .mint_membership(&id)
                 .expect("membership is available"),

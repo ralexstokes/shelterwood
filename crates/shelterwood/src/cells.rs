@@ -65,7 +65,6 @@ pub(crate) mod test_support {
         let id = ChildId::from(id);
         let mut identity = ScopeIdentity::new();
         let member = MemberCell::new(
-            id.clone(),
             identity
                 .mint_membership(&id)
                 .expect("scope membership is available"),
@@ -81,7 +80,6 @@ pub(crate) mod test_support {
     pub(super) fn child_member(parent: &ScopeCell, id: &str) -> Arc<MemberCell> {
         let id = ChildId::from(id);
         let member = MemberCell::new(
-            id.clone(),
             parent
                 .mint_membership(&id)
                 .expect("child membership is available"),

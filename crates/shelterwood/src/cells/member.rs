@@ -252,7 +252,12 @@ impl fmt::Debug for MemberMailbox {
 }
 
 impl MemberCell {
-    pub(crate) fn new(id: ChildId, identity: MintedMembership) -> Arc<Self> {
+    // The id is read from the grant rather than accepted beside it: the
+    // reconciliation token carries the id its lineage was minted for, so a
+    // member whose `id()` disagrees with the id its membership was minted
+    // under — and would therefore be adopted under — is unconstructible.
+    pub(crate) fn new(identity: MintedMembership) -> Arc<Self> {
+        let id = identity.id().clone();
         let (membership, provisional_membership, incarnations) = identity.into_provisional_parts();
         let (record, _) = runtime::watch(MemberRecord {
             stage: MemberStage::Reserved,
@@ -291,6 +296,9 @@ impl MemberCell {
     }
 
     pub(crate) fn take_provisional_membership(&self) -> ProvisionalMembership {
+        // Two statements, not one chain: the guard must be released before
+        // the verdict can panic, or the failing assertion would poison the
+        // mutex for every later caller.
         let provisional = self
             .provisional_membership
             .lock()
@@ -1000,7 +1008,6 @@ mod tests {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("worker");
         let member = MemberCell::new(
-            id.clone(),
             identity
                 .mint_membership(&id)
                 .expect("membership is available"),
@@ -1035,7 +1042,6 @@ mod tests {
         let id = ChildId::from("worker");
         let mut identity = ScopeIdentity::new();
         let member = MemberCell::new(
-            id.clone(),
             identity
                 .mint_membership(&id)
                 .expect("membership is available"),

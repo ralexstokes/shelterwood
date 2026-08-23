@@ -676,41 +676,6 @@ impl<T> OneShotReceiver<T> {
     }
 }
 
-mod framework_plain {
-    pub trait Sealed {}
-
-    impl Sealed for () {}
-
-    impl<T: Sealed, E: Sealed> Sealed for Result<T, E> {}
-}
-
-/// Marker for framework-owned response values whose destructor runs no user
-/// code.
-///
-/// [`DisposingReceiver::new_framework`] drops an abandoned published value
-/// inline in holder drop glue instead of submitting it to the blocking
-/// disposal lane, so this bound is what keeps that fast path from ever
-/// reaching a destructor that can block, panic, or re-enter. Implement it
-/// only for plain framework enums and their compositions; a type that can
-/// own user data — an `Exit`, a message, a type-erased error — must go
-/// through [`DisposingReceiver::new`] instead.
-///
-/// This trait is sealed: response types owned by another crate must use
-/// [`DisposingReceiver::new`], even when that crate currently knows their
-/// variants are plain. That keeps the authority to select inline destruction
-/// in the same runtime crate that owns the disposal implementation.
-///
-/// ```compile_fail
-/// struct ForeignResponse;
-/// impl shelterwood_runtime::FrameworkPlain for ForeignResponse {}
-/// ```
-#[doc(hidden)]
-pub trait FrameworkPlain: framework_plain::Sealed + Send + 'static {}
-
-impl FrameworkPlain for () {}
-
-impl<T: FrameworkPlain, E: FrameworkPlain> FrameworkPlain for Result<T, E> {}
-
 /// One-shot receive state that keeps user value destruction off framework and
 /// holder drop glue.
 ///
@@ -736,33 +701,15 @@ pub struct DisposingReceiver<T> {
 
 impl<T: Send + 'static> DisposingReceiver<T> {
     pub fn new(inner: OneShotReceiver<T>) -> Self {
-        Self::with_dispose(inner, dispose_detached::<T>)
-    }
-}
-
-impl<T: FrameworkPlain> DisposingReceiver<T> {
-    /// Creates a receiver whose abandoned value is plain framework data.
-    ///
-    /// This is an implementation seam for internal response enums. Unlike
-    /// [`Self::new`], dropping a published but unclaimed value does not
-    /// submit work to the blocking disposal lane; the [`FrameworkPlain`]
-    /// bound is what keeps that inline drop from ever reaching a user-owned
-    /// destructor.
-    #[doc(hidden)]
-    pub fn new_framework(inner: OneShotReceiver<T>) -> Self {
-        Self::with_dispose(inner, drop)
+        Self {
+            inner: Some(inner),
+            dispose: dispose_detached::<T>,
+            caller_poll: ProxiedPoll::new(),
+        }
     }
 }
 
 impl<T> DisposingReceiver<T> {
-    fn with_dispose(inner: OneShotReceiver<T>, dispose: fn(T)) -> Self {
-        Self {
-            inner: Some(inner),
-            dispose,
-            caller_poll: ProxiedPoll::new(),
-        }
-    }
-
     pub fn poll_receive(&mut self, context: &mut Context<'_>) -> Poll<Option<T>> {
         // In pinned Tokio 1.53.1, `Receiver::poll` obtains the result before
         // clearing its `Inner`; the last `Inner::drop` then calls
@@ -1190,7 +1137,6 @@ impl<T> fmt::Debug for BroadcastReceiver<T> {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::Cell,
         future::Future,
         mem::ManuallyDrop,
         panic::{AssertUnwindSafe, catch_unwind},
@@ -1215,21 +1161,6 @@ mod tests {
     struct CountWake(Arc<AtomicUsize>);
 
     struct DebugProbe(Arc<AtomicUsize>);
-
-    thread_local! {
-        static FRAMEWORK_DROP_OBSERVED: Cell<bool> = const { Cell::new(false) };
-    }
-
-    struct FrameworkDropProbe;
-
-    impl super::framework_plain::Sealed for FrameworkDropProbe {}
-    impl super::FrameworkPlain for FrameworkDropProbe {}
-
-    impl Drop for FrameworkDropProbe {
-        fn drop(&mut self) {
-            FRAMEWORK_DROP_OBSERVED.set(true);
-        }
-    }
 
     impl std::fmt::Debug for DebugProbe {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1583,20 +1514,6 @@ mod tests {
 
         assert_eq!(sending.publish(7_u8), Err(7));
         assert_eq!(receiver.try_receive(), None);
-    }
-
-    #[test]
-    fn framework_disposing_receiver_drops_abandoned_values_inline() {
-        FRAMEWORK_DROP_OBSERVED.set(false);
-        let (sender, receiver) = oneshot();
-        assert!(sender.send(FrameworkDropProbe).is_ok());
-
-        drop(DisposingReceiver::new_framework(receiver));
-
-        assert!(
-            FRAMEWORK_DROP_OBSERVED.replace(false),
-            "the plain framework response is destroyed synchronously on this thread"
-        );
     }
 
     #[test]

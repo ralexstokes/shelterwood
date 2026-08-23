@@ -142,6 +142,56 @@ async fn root_monitor_contains_a_terminal_wake_panic() {
 }
 
 #[crate::runtime::test]
+async fn panicked_root_monitor_publishes_its_exit_despite_a_terminal_wake_panic() {
+    const DRIVER_PANIC: &str = "panicked root driver";
+    const WAKE_PANIC: &str = "hostile root terminal wake";
+
+    let scope = isolated_scope("root", ScopeFlavor::Ordered);
+    let epoch = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    scope.finish_incarnation(epoch, StopReason::Finished);
+
+    let mut stopped = Box::pin(scope.wait_stopped());
+    let hostile = Waker::from(Arc::new(PanicWake(WAKE_PANIC)));
+    assert!(
+        stopped
+            .as_mut()
+            .poll(&mut Context::from_waker(&hostile))
+            .is_pending(),
+        "the hostile observer parks behind membership terminality"
+    );
+
+    let driver = crate::runtime::spawn(async {
+        panic!("{DRIVER_PANIC}");
+        #[allow(unreachable_code)]
+        crate::cells::RetainedStopReason::new(StopReason::Finished)
+    });
+    let monitor = monitor_root_driver(Arc::clone(&scope), driver);
+    let joined = crate::runtime::join(monitor).await;
+
+    assert!(matches!(
+        joined,
+        crate::runtime::JoinOutcome::Ok { ref value }
+            if value.as_reason() == &StopReason::ShutdownRequested
+    ));
+    assert!(matches!(
+        scope.member.record().stage,
+        MemberStage::Terminal(ref exit)
+            if matches!(
+                exit.kind(),
+                ExitKind::Panicked { message: Some(message) } if message == DRIVER_PANIC
+            ) && exit.cancellation() == Cancellation::NotObserved
+    ));
+    assert!(matches!(
+        stopped
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(StopReason::ShutdownRequested)
+    ));
+}
+
+#[crate::runtime::test]
 async fn terminal_stop_paths_share_one_complete_observation_transition() {
     for (path, reason) in [
         (TerminalStopPath::LiveEpoch, StopReason::ShutdownRequested),

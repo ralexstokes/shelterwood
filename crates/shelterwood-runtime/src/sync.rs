@@ -701,19 +701,15 @@ pub struct DisposingReceiver<T> {
 
 impl<T: Send + 'static> DisposingReceiver<T> {
     pub fn new(inner: OneShotReceiver<T>) -> Self {
-        Self::with_dispose(inner, dispose_detached::<T>)
+        Self {
+            inner: Some(inner),
+            dispose: dispose_detached::<T>,
+            caller_poll: ProxiedPoll::new(),
+        }
     }
 }
 
 impl<T> DisposingReceiver<T> {
-    fn with_dispose(inner: OneShotReceiver<T>, dispose: fn(T)) -> Self {
-        Self {
-            inner: Some(inner),
-            dispose,
-            caller_poll: ProxiedPoll::new(),
-        }
-    }
-
     pub fn poll_receive(&mut self, context: &mut Context<'_>) -> Poll<Option<T>> {
         // In pinned Tokio 1.53.1, `Receiver::poll` obtains the result before
         // clearing its `Inner`; the last `Inner::drop` then calls

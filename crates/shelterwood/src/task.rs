@@ -332,7 +332,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+        task::{Context, Poll, Waker},
     };
 
     use crate::{
@@ -340,6 +340,7 @@ mod tests {
         cells::MemberCell,
         identity::ScopeIdentity,
         runtime::{self, CompletionGatedLatch, Latch},
+        test_support::probe_waker,
     };
 
     use super::{OneShotTaskRef, TaskContext, TaskContextLatches, TaskOnceDef, TaskRef};
@@ -453,45 +454,11 @@ mod tests {
         (sender, claim, member)
     }
 
-    unsafe fn clone_panicking_drop_waker(data: *const ()) -> RawWaker {
-        // SAFETY: every pointer using this vtable came from an Arc of the
-        // matching type. ManuallyDrop preserves the represented reference;
-        // the returned raw waker owns only the new clone.
-        let state = ManuallyDrop::new(unsafe { Arc::<()>::from_raw(data.cast()) });
-        RawWaker::new(
-            Arc::into_raw(Arc::clone(&state)).cast(),
-            &PANICKING_DROP_WAKER_VTABLE,
-        )
-    }
-
-    unsafe fn wake_panicking_drop_waker(data: *const ()) {
-        // SAFETY: wake consumes the Arc reference represented by this waker.
-        drop(unsafe { Arc::<()>::from_raw(data.cast()) });
-    }
-
-    unsafe fn wake_by_ref_panicking_drop_waker(_data: *const ()) {}
-
-    unsafe fn drop_panicking_drop_waker(data: *const ()) {
-        // SAFETY: drop consumes the Arc reference represented by this waker.
-        drop(unsafe { Arc::<()>::from_raw(data.cast()) });
-        panic!("injected one-shot completion caller-waker drop panic");
-    }
-
-    static PANICKING_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-        clone_panicking_drop_waker,
-        wake_panicking_drop_waker,
-        wake_by_ref_panicking_drop_waker,
-        drop_panicking_drop_waker,
-    );
-
     fn panicking_drop_waker() -> Waker {
-        let raw = RawWaker::new(
-            Arc::into_raw(Arc::new(())).cast(),
-            &PANICKING_DROP_WAKER_VTABLE,
-        );
-        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-        // ownership across clone, wake, and drop.
-        unsafe { Waker::from_raw(raw) }
+        probe_waker(
+            || {},
+            || panic!("injected one-shot completion caller-waker drop panic"),
+        )
     }
 
     struct PanickingCompletion;

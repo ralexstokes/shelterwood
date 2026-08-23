@@ -24,8 +24,6 @@ mod errors;
 mod futures;
 mod reply;
 #[cfg(test)]
-mod test_support;
-#[cfg(test)]
 mod timer;
 pub(crate) use cell::*;
 pub use errors::*;

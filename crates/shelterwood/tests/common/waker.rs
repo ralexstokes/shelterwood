@@ -7,6 +7,68 @@ use std::{
     task::{RawWaker, RawWakerVTable, Waker},
 };
 
+struct WakerProbe {
+    on_clone: Box<dyn Fn() + Send + Sync>,
+    on_wake: Box<dyn Fn() + Send + Sync>,
+    on_drop: Box<dyn Fn() + Send + Sync>,
+}
+
+unsafe fn clone_probe(data: *const ()) -> RawWaker {
+    // SAFETY: `probe_waker` creates every pointer paired with this vtable from
+    // `Arc<WakerProbe>`. ManuallyDrop preserves the represented reference;
+    // the returned raw waker owns exactly the newly cloned reference.
+    let probe = ManuallyDrop::new(unsafe { Arc::<WakerProbe>::from_raw(data.cast()) });
+    (probe.on_clone)();
+    RawWaker::new(Arc::into_raw(Arc::clone(&probe)).cast(), &PROBE_VTABLE)
+}
+
+unsafe fn wake_probe(data: *const ()) {
+    // SAFETY: wake consumes exactly the Arc reference represented by `data`.
+    let probe = unsafe { Arc::<WakerProbe>::from_raw(data.cast()) };
+    (probe.on_wake)();
+}
+
+unsafe fn wake_probe_by_ref(data: *const ()) {
+    // SAFETY: `data` remains owned by the caller, so this temporary reference
+    // neither consumes nor clones its Arc reference.
+    let probe = unsafe { &*data.cast::<WakerProbe>() };
+    (probe.on_wake)();
+}
+
+unsafe fn drop_probe(data: *const ()) {
+    // SAFETY: drop consumes exactly the Arc reference represented by `data`.
+    let probe = unsafe { Arc::<WakerProbe>::from_raw(data.cast()) };
+    (probe.on_drop)();
+}
+
+static PROBE_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(clone_probe, wake_probe, wake_probe_by_ref, drop_probe);
+
+/// Builds a shared integration-test waker whose clone and drop entries are observable.
+pub(crate) fn probe_waker(
+    on_clone: impl Fn() + Send + Sync + 'static,
+    on_drop: impl Fn() + Send + Sync + 'static,
+) -> Waker {
+    probe_waker_with_wake(on_clone, || {}, on_drop)
+}
+
+/// Builds a shared integration-test waker that additionally observes wake operations.
+pub(crate) fn probe_waker_with_wake(
+    on_clone: impl Fn() + Send + Sync + 'static,
+    on_wake: impl Fn() + Send + Sync + 'static,
+    on_drop: impl Fn() + Send + Sync + 'static,
+) -> Waker {
+    let probe = Arc::new(WakerProbe {
+        on_clone: Box::new(on_clone),
+        on_wake: Box::new(on_wake),
+        on_drop: Box::new(on_drop),
+    });
+    let raw = RawWaker::new(Arc::into_raw(probe).cast(), &PROBE_VTABLE);
+    // SAFETY: `raw` owns one Arc reference and `PROBE_VTABLE` preserves or
+    // consumes exactly one reference for each RawWaker operation.
+    unsafe { Waker::from_raw(raw) }
+}
+
 #[derive(Default)]
 pub(crate) struct LiveWakerCounter(AtomicUsize);
 
@@ -183,53 +245,11 @@ fn make_ordinal_waker(
     (unsafe { Waker::from_raw(raw) }, shared)
 }
 
-struct HostileWakerState {
-    drop_panic: &'static str,
-}
-
-unsafe fn clone_hostile_waker(data: *const ()) -> RawWaker {
-    // SAFETY: every pointer using this vtable came from an Arc of the
-    // matching type. ManuallyDrop preserves the reference represented by
-    // `data`; the returned raw waker owns only the new clone.
-    let state = ManuallyDrop::new(unsafe { Arc::<HostileWakerState>::from_raw(data.cast()) });
-    RawWaker::new(
-        Arc::into_raw(Arc::clone(&state)).cast(),
-        &HOSTILE_WAKER_VTABLE,
-    )
-}
-
-unsafe fn wake_hostile_waker(data: *const ()) {
-    // SAFETY: wake consumes the Arc reference represented by this raw waker.
-    drop(unsafe { Arc::<HostileWakerState>::from_raw(data.cast()) });
-}
-
-unsafe fn wake_by_ref_hostile_waker(_data: *const ()) {}
-
-unsafe fn drop_hostile_waker(data: *const ()) {
-    // SAFETY: drop consumes the Arc reference represented by this raw waker.
-    let state = unsafe { Arc::<HostileWakerState>::from_raw(data.cast()) };
-    let drop_panic = state.drop_panic;
-    drop(state);
-    std::panic::panic_any(drop_panic);
-}
-
-static HOSTILE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_hostile_waker,
-    wake_hostile_waker,
-    wake_by_ref_hostile_waker,
-    drop_hostile_waker,
-);
-
 /// Creates a deliberately leaked caller waker whose cloned registrations
 /// panic when destroyed.
 pub(crate) fn hostile_waker(drop_panic: &'static str) -> ManuallyDrop<Waker> {
-    let state = Arc::new(HostileWakerState { drop_panic });
-    let raw = RawWaker::new(
-        Arc::into_raw(Arc::clone(&state)).cast(),
-        &HOSTILE_WAKER_VTABLE,
-    );
-    // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-    // ownership across clone, wake, and drop.
-    let waker = unsafe { Waker::from_raw(raw) };
-    ManuallyDrop::new(waker)
+    ManuallyDrop::new(probe_waker(
+        || {},
+        move || std::panic::panic_any(drop_panic),
+    ))
 }

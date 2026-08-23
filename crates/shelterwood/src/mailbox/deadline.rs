@@ -251,7 +251,7 @@ mod tests {
         task::{Context, Poll, Wake, Waker},
     };
 
-    use crate::mailbox::test_support::probe_waker;
+    use crate::test_support::probe_waker;
 
     /// Stays pending on its first elapsed poll, modelling an atomic
     /// completion transition that won without publishing its payload yet.

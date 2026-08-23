@@ -21,11 +21,11 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker},
+    task::{Context as TaskContext, Poll, Waker},
     time::Duration,
 };
 
-use common::ordinal_drop_waker;
+use common::{ordinal_drop_waker, probe_waker_with_wake};
 use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Reply, Tree};
 
 const OUTER_PANIC: &str = "injected outer panic";
@@ -55,52 +55,17 @@ impl Actor for HoldingActor {
     }
 }
 
-struct FirstWakerDropPanics(AtomicBool);
-
-unsafe fn clone_panicking_drop_waker(data: *const ()) -> RawWaker {
-    // SAFETY: every pointer using this vtable came from an Arc of the matching
-    // type. ManuallyDrop preserves the reference represented by data; the
-    // returned raw waker owns only the new clone.
-    let probe = ManuallyDrop::new(unsafe { Arc::<FirstWakerDropPanics>::from_raw(data.cast()) });
-    RawWaker::new(
-        Arc::into_raw(Arc::clone(&probe)).cast(),
-        &PANICKING_DROP_WAKER_VTABLE,
-    )
-}
-
-unsafe fn wake_panicking_drop_waker(data: *const ()) {
-    // SAFETY: wake consumes the reference represented by this raw waker.
-    drop(unsafe { Arc::<FirstWakerDropPanics>::from_raw(data.cast()) });
-    panic!("injected waker wake panic");
-}
-
-unsafe fn wake_by_ref_panicking_drop_waker(_data: *const ()) {
-    panic!("injected waker wake panic");
-}
-
-unsafe fn drop_panicking_drop_waker(data: *const ()) {
-    // SAFETY: drop consumes the reference represented by this raw waker.
-    let probe = unsafe { Arc::<FirstWakerDropPanics>::from_raw(data.cast()) };
-    if !probe.0.swap(true, Ordering::SeqCst) {
-        panic!("injected waker drop panic");
-    }
-}
-
-static PANICKING_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_panicking_drop_waker,
-    wake_panicking_drop_waker,
-    wake_by_ref_panicking_drop_waker,
-    drop_panicking_drop_waker,
-);
-
 fn panicking_drop_waker() -> Waker {
-    let raw = RawWaker::new(
-        Arc::into_raw(Arc::new(FirstWakerDropPanics(AtomicBool::new(false)))).cast(),
-        &PANICKING_DROP_WAKER_VTABLE,
-    );
-    // SAFETY: raw owns one Arc reference and its vtable maintains that
-    // ownership across clone, wake, and drop.
-    unsafe { Waker::from_raw(raw) }
+    let first = Arc::new(AtomicBool::new(false));
+    probe_waker_with_wake(
+        || {},
+        || panic!("injected waker wake panic"),
+        move || {
+            if !first.swap(true, Ordering::SeqCst) {
+                panic!("injected waker drop panic");
+            }
+        },
+    )
 }
 
 fn assert_pending_then_unwind<F: Future>(mut future: Pin<Box<F>>) {

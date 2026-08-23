@@ -15,9 +15,9 @@ use crate::{
     mailbox::{
         ActorIdentity, ActorRef, ChildId, Incarnation, MailboxControl, MailboxReceiver,
         SendErrorKind,
-        test_support::{mint_actor_incarnation, mint_actor_membership},
     },
     policy::{ResolvedDefaults, ResolvedMailbox},
+    test_support::{mint_actor_incarnation, mint_actor_membership},
 };
 
 use super::MailboxCell;

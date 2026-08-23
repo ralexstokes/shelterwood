@@ -226,6 +226,8 @@ mod raw;
 mod runtime;
 mod scope;
 mod task;
+#[cfg(test)]
+mod test_support;
 mod tree;
 
 pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};

@@ -1,62 +1,25 @@
 use std::{
     mem::ManuallyDrop,
     sync::Arc,
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    task::{Context, Poll, Waker},
 };
 
 use super::support::*;
-use crate::{cells::RetainedStopReason, policy::ScopeFlavor};
+use crate::{cells::RetainedStopReason, policy::ScopeFlavor, test_support::probe_waker_with_wake};
 
 #[derive(Default)]
 struct HostileWakeState {
     woken: tokio::sync::Notify,
 }
 
-unsafe fn clone_hostile_waker(data: *const ()) -> RawWaker {
-    // SAFETY: every pointer using this vtable came from an Arc of the
-    // matching type. ManuallyDrop preserves the reference represented by
-    // `data`; the returned raw waker owns only the new clone.
-    let state = ManuallyDrop::new(unsafe { Arc::<HostileWakeState>::from_raw(data.cast()) });
-    RawWaker::new(
-        Arc::into_raw(Arc::clone(&state)).cast(),
-        &HOSTILE_WAKER_VTABLE,
-    )
-}
-
-unsafe fn wake_hostile_waker(data: *const ()) {
-    // SAFETY: wake consumes the Arc reference represented by this raw waker.
-    let state = unsafe { Arc::<HostileWakeState>::from_raw(data.cast()) };
-    state.woken.notify_one();
-}
-
-unsafe fn wake_by_ref_hostile_waker(data: *const ()) {
-    // SAFETY: ManuallyDrop preserves the reference represented by `data`.
-    let state = ManuallyDrop::new(unsafe { Arc::<HostileWakeState>::from_raw(data.cast()) });
-    state.woken.notify_one();
-}
-
-unsafe fn drop_hostile_waker(data: *const ()) {
-    // SAFETY: drop consumes the Arc reference represented by this raw waker.
-    drop(unsafe { Arc::<HostileWakeState>::from_raw(data.cast()) });
-    panic!("injected SystemRun join caller-waker drop panic");
-}
-
-static HOSTILE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_hostile_waker,
-    wake_hostile_waker,
-    wake_by_ref_hostile_waker,
-    drop_hostile_waker,
-);
-
 fn hostile_waker() -> (ManuallyDrop<Waker>, Arc<HostileWakeState>) {
     let state = Arc::new(HostileWakeState::default());
-    let raw = RawWaker::new(
-        Arc::into_raw(Arc::clone(&state)).cast(),
-        &HOSTILE_WAKER_VTABLE,
+    let wake_state = Arc::clone(&state);
+    let waker = probe_waker_with_wake(
+        || {},
+        move || wake_state.woken.notify_one(),
+        || panic!("injected SystemRun join caller-waker drop panic"),
     );
-    // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-    // ownership across clone, wake, and drop.
-    let waker = unsafe { Waker::from_raw(raw) };
     (ManuallyDrop::new(waker), state)
 }
 

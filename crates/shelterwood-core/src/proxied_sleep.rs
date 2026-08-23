@@ -80,7 +80,9 @@ impl ProxiedSleep {
         let mut effects = WakerEffects::default();
         // Proxy retirement only moves framework-owned bookkeeping into the
         // effects sink, and its leaf-lock acquisition recovers poison. The
-        // caller-owned waker remains inside the accumulator-backed flush.
+        // proxy's own drop then finds the slot already emptied, so no caller
+        // destructor runs here either; the caller-owned waker stays inside
+        // the accumulator-backed flush below.
         self.timer_poll.retire(action, &mut effects);
         effects.flush(panics);
 

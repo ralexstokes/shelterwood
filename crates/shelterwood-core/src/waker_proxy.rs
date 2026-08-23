@@ -316,7 +316,7 @@ mod tests {
         mem::ManuallyDrop,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
-            Arc, Weak,
+            Arc, TryLockError, Weak,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
@@ -364,10 +364,13 @@ mod tests {
     impl Drop for ReentrantDrop {
         fn drop(&mut self) {
             let state = self.0.upgrade().expect("the proxy remains live");
-            let _guard = state
-                .caller
-                .try_lock()
-                .expect("a displaced waker drops after the proxy mutex is released");
+            let _guard = match state.caller.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    panic!("a displaced waker drops after the proxy mutex is released")
+                }
+            };
         }
     }
 
@@ -706,14 +709,25 @@ mod tests {
         proxy.waker().wake_by_ref();
         assert_eq!(first.0.load(Ordering::SeqCst), 1);
 
-        let second = Arc::new(CountWake::default());
-        proxy.register(&Waker::from(second));
+        // Clear the wake record before installing a caller that explicit
+        // retirement must actually remove from the poisoned registration.
         let mut effects = WakerEffects::default();
         proxy.retire(WakerAction::DropInline, &mut effects);
         drop(effects);
 
-        // Drop reaches `retire` once more. A poisoned leaf must remain
-        // non-panicking on that unwind-reachable fallback as well.
+        let retired = Waker::from(Arc::new(ReentrantDrop(Arc::downgrade(&proxy.state))));
+        proxy.register(&retired);
+        drop(retired);
+        let mut effects = WakerEffects::default();
+        proxy.retire(WakerAction::DropInline, &mut effects);
+        drop(effects);
+
+        // Leave a caller installed so drop glue both acquires the poisoned
+        // leaf and drains a real user waker. Its reentrant destructor proves
+        // that the recovered guard was released before the effect ran.
+        let dropped = Waker::from(Arc::new(ReentrantDrop(Arc::downgrade(&proxy.state))));
+        proxy.register(&dropped);
+        drop(dropped);
         drop(proxy);
     }
 

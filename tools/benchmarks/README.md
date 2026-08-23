@@ -50,6 +50,9 @@ operations:
     2 s measurement) with a 10% noise floor and a 1% significance level. That
     keeps the 48-case suite near three minutes inside `just bench` and keeps
     routine spread on the backpressured arms out of the change reports.
+- `lifecycle` covers cold wide and deep trees, immediate restart cycles, and
+  dynamic admission/removal with no observer, a snapshot subscriber, a
+  lifecycle subscriber, or both.
 
 `concurrent_send_tasks` deliberately includes task spawn and join overhead. It
 represents the common application shape of short-lived producer tasks rather
@@ -62,8 +65,13 @@ size in both groups, so it is a backpressured arm as well.
 The core supervisor `startup` and `drain` cases apply one child's transition
 sequence and then settle before advancing to the next child. They deliberately
 stress incremental, level-triggered settlement; they do not model the driver's
-event-batch distribution. End-to-end lifecycle benchmarks build on this
-harness in the stacked series.
+event-batch distribution. Use the lifecycle suite for end-to-end startup and
+shutdown costs.
+
+Cold lifecycle fixtures construct the declaration outside the timed region;
+`spawn`, recursive lowering, startup, shutdown, and joining are timed. Dynamic
+churn starts its root outside the timed region so it isolates live control-plane
+admission/removal and observation publication.
 
 That schedule is **quadratic** in the child count: it settles once per child,
 and every settle rescans the child table — `settle_finish` evaluates

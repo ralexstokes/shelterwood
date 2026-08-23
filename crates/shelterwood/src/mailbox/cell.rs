@@ -202,22 +202,33 @@ impl<M> SendOperation<M> {
 
     pub(super) fn poll(
         &self,
-        replacement: Option<std::task::Waker>,
+        mut replacement: Option<std::task::Waker>,
         current: &std::task::Waker,
     ) -> OperationPoll<M> {
         // Effects precede the guard, so even an unwind drops the guard before
         // invoking a displaced RawWaker vtable.
         let mut effects = WakerEffects::default();
-        let result = {
+        let result = loop {
             let mut state = self.state.lock().expect("send operation mutex poisoned");
-            match &mut state.outcome {
+            let result = match &mut state.outcome {
+                // The replacement was cloned outside this lock. Completion can
+                // win that window, leaving a caller waker which must be retired
+                // before a terminal message is moved into the return value. A
+                // hostile destructor is contained at this ready seam for the
+                // same reason as reply and timer retirement: after the handoff,
+                // unwinding would destroy a user value in the poll frame.
+                OperationOutcome::Accepted(_) | OperationOutcome::Terminated { .. }
+                    if replacement.is_some() =>
+                {
+                    None
+                }
                 OperationOutcome::Accepted(incarnation) => {
-                    Ok(OperationPoll::Accepted(*incarnation))
+                    Some(Ok(OperationPoll::Accepted(*incarnation)))
                 }
                 OperationOutcome::Terminated {
                     message,
                     final_incarnation,
-                } => message.take().map_or_else(
+                } => Some(message.take().map_or_else(
                     || Err("a terminal operation retains its message until observed"),
                     |message| {
                         Ok(OperationPoll::Terminated {
@@ -225,19 +236,40 @@ impl<M> SendOperation<M> {
                             final_incarnation: *final_incarnation,
                         })
                     },
-                ),
+                )),
                 OperationOutcome::Waiting { .. } => {
-                    if let Some(replacement) = replacement {
+                    if let Some(replacement) = replacement.take() {
                         state.waker.replace(replacement, &mut effects);
-                        Ok(OperationPoll::Pending)
+                        Some(Ok(OperationPoll::Pending))
                     } else if state.waker.will_wake(current) {
-                        Ok(OperationPoll::Pending)
+                        Some(Ok(OperationPoll::Pending))
                     } else {
-                        Ok(OperationPoll::NeedsWakerClone)
+                        Some(Ok(OperationPoll::NeedsWakerClone))
                     }
                 }
-                OperationOutcome::Withdrawn => Err("a withdrawn send future was polled"),
+                OperationOutcome::Withdrawn => Some(Err("a withdrawn send future was polled")),
+            };
+            drop(state);
+            if let Some(result) = result {
+                break result;
             }
+
+            // Stage the clone through the structural waker sink, then drain it
+            // with no operation lock held and before re-reading the stable
+            // completing outcome. `flush` catches its vtable panic; taking and
+            // discarding the payload prevents `PanicAccumulator::drop` from
+            // resuming it over the eventual by-value result.
+            let mut staged = WakerSlot::default();
+            staged.replace(
+                replacement
+                    .take()
+                    .expect("a completing clone window retains its replacement waker"),
+                &mut effects,
+            );
+            staged.take(WakerAction::DropInline, &mut effects);
+            let mut panics = PanicAccumulator::default();
+            effects.flush(&mut panics);
+            crate::runtime::discard_panic(panics.take());
         };
         drop(effects);
         match result {
@@ -1377,6 +1409,18 @@ impl<M: Send + 'static> MailboxCell<M> {
             Ok(transition) => transition,
             Err(message) => {
                 transaction.finish(());
+                if std::thread::panicking() {
+                    // `withdraw` is reached from `SendFuture` drop glue. If a
+                    // concurrent poll already consumed a terminal message and
+                    // then unwound, repeating this invariant panic would abort
+                    // the process. Preserve the primary unwind and return an
+                    // empty carrier whose remaining effects still flush after
+                    // every framework guard has been released.
+                    return Withdrawal {
+                        outcome: None,
+                        _waker_effects: waker_effects,
+                    };
+                }
                 panic!("{message}");
             }
         };
@@ -1798,6 +1842,10 @@ impl<M> Withdrawal<M> {
         self.outcome
             .take()
             .expect("a withdrawal outcome is consumed exactly once")
+    }
+
+    pub(super) fn take_outcome_if_present(&mut self) -> Option<WithdrawalOutcome<M>> {
+        self.outcome.take()
     }
 
     pub(super) fn finish(self) {}

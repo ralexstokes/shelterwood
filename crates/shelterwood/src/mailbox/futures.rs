@@ -501,12 +501,14 @@ impl<M: Send + 'static> Drop for SendFuture<M> {
                 let mut withdrawal = self
                     .mailbox
                     .withdraw(&operation, WithdrawalDisposition::Isolated);
-                match withdrawal.take_outcome() {
-                    WithdrawalOutcome::Withdrawn { message, .. }
-                    | WithdrawalOutcome::Terminated { message, .. } => {
-                        self.mailbox.dispose(message);
+                if let Some(outcome) = withdrawal.take_outcome_if_present() {
+                    match outcome {
+                        WithdrawalOutcome::Withdrawn { message, .. }
+                        | WithdrawalOutcome::Terminated { message, .. } => {
+                            self.mailbox.dispose(message);
+                        }
+                        WithdrawalOutcome::Accepted(_) => {}
                     }
-                    WithdrawalOutcome::Accepted(_) => {}
                 }
                 // A RawWaker vtable is caller code and there is no caller left
                 // to surface a panic to. Destroying it inline would run a
@@ -540,10 +542,11 @@ impl<M: Send + 'static> fmt::Debug for SendTimeout<M> {
 /// Withdraws an unaccepted send and classifies its outcome under the
 /// caller's chosen waker disposition.
 ///
-/// The outcome is taken before `finish()` releases the registered waker, so
-/// under either disposition the recovered message already belongs to
-/// `result` and a hostile waker destructor can neither divert nor destroy
-/// it.
+/// The outcome is taken before `finish()` releases the registered waker. An
+/// inline release is a poll-path ready seam and `result` can own a recovered
+/// user message, so any waker-destructor panic is contained before the result
+/// is returned. Allowing it to unwind would destroy that message during
+/// cleanup and could turn a second hostile destructor into a process abort.
 fn withdraw_send_with<M: Send + 'static>(
     send: &mut SendFuture<M>,
     disposition: WithdrawalDisposition,
@@ -565,7 +568,8 @@ fn withdraw_send_with<M: Send + 'static>(
             kind: SendErrorKind::Terminated,
         }),
     };
-    withdrawal.finish();
+    let finish_panic = crate::runtime::catch_panic(|| withdrawal.finish()).err();
+    crate::runtime::discard_panic(finish_panic);
     result
 }
 
@@ -834,8 +838,12 @@ mod tests {
     };
 
     use super::{
-        super::cell::tests::{
-            actor, actor_for, actor_for_with_runtime, bind, close, configure, prepare_termination,
+        super::cell::{
+            OperationOutcome,
+            tests::{
+                actor, actor_for, actor_for_with_runtime, bind, close, configure,
+                prepare_termination,
+            },
         },
         ActorRef, DeadlineOperation, DeadlinePhase, MailboxCell, SendFuture, SendFutureState,
         SendOperation,
@@ -1322,6 +1330,15 @@ mod tests {
         }
     }
 
+    struct PanickingMessageDrop(DisposalThread);
+
+    impl Drop for PanickingMessageDrop {
+        fn drop(&mut self) {
+            record_disposal(&self.0);
+            panic!("injected message drop panic");
+        }
+    }
+
     struct CallMessage {
         _reply: crate::Reply<u8>,
         _payload: ThreadRecordingDrop,
@@ -1415,16 +1432,16 @@ mod tests {
     }
 
     #[crate::runtime::test(start_paused = true)]
-    async fn send_timeout_releases_its_waker_inline_after_recovering_the_message() {
-        let (_, actor): (
-            Arc<MailboxCell<ThreadRecordingDrop>>,
-            ActorRef<ThreadRecordingDrop>,
+    async fn send_timeout_contains_its_inline_waker_panic_before_returning_the_message() {
+        let (mailbox, actor): (
+            Arc<MailboxCell<PanickingMessageDrop>>,
+            ActorRef<PanickingMessageDrop>,
         ) = actor_for();
         let width = Duration::from_secs(1);
         let message_thread = disposal_thread();
         let waker_thread = disposal_thread();
         let mut send =
-            Box::pin(actor.send_timeout(ThreadRecordingDrop(message_thread.clone()), width));
+            Box::pin(actor.send_timeout(PanickingMessageDrop(message_thread.clone()), width));
         // Keep the caller-owned raw waker permanently inert: if an assertion
         // below fails, dropping it during that unwind would create a second
         // panic and abort the test process. Only its registered clone is the
@@ -1444,24 +1461,25 @@ mod tests {
         );
         crate::runtime::advance(width * 2).await;
         let polling_thread = std::thread::current().id();
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            send.deadlined.operation.poll_deadlined(
-                &mut context,
-                deadline,
-                DeadlinePhase::TimeoutArbitration,
-            )
-        }))
-        .expect_err("inline waker destruction surfaces its panic from the timeout poll");
-        assert_eq!(
-            panic.downcast_ref::<&'static str>().copied(),
-            Some("injected call waker drop panic")
-        );
+        let Poll::Ready(Err(error)) = send.deadlined.operation.poll_deadlined(
+            &mut context,
+            deadline,
+            DeadlinePhase::TimeoutArbitration,
+        ) else {
+            panic!("timeout arbitration returns the recovered message")
+        };
+        assert_eq!(error.kind, crate::SendErrorKind::TimedOut);
         assert_eq!(await_disposal(&waker_thread), polling_thread);
-        assert_eq!(
-            await_disposal(&message_thread),
-            polling_thread,
-            "the recovered message remains caller-owned when the waker drop unwinds"
+        assert!(
+            message_thread
+                .recorded
+                .lock()
+                .expect("message disposal recorder mutex")
+                .is_none(),
+            "the contained waker panic cannot destroy the returned message"
         );
+        mailbox.dispose(error);
+        assert_ne!(await_disposal(&message_thread), polling_thread);
     }
 
     #[test]
@@ -1594,5 +1612,145 @@ mod tests {
             "will_wake registers once and skips the vtable on every repoll"
         );
         assert_eq!(calls.drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn termination_in_the_waker_clone_window_contains_drop_before_returning_the_message() {
+        let (mailbox, actor): (
+            Arc<MailboxCell<PanickingMessageDrop>>,
+            ActorRef<PanickingMessageDrop>,
+        ) = actor_for();
+        let message_thread = disposal_thread();
+        let waker_thread = disposal_thread();
+        let mut send = Box::pin(actor.send(PanickingMessageDrop(message_thread.clone())));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+
+        let completing = Arc::new(Mutex::new(Some(Arc::clone(&mailbox))));
+        let hostile = ManuallyDrop::new(probe_waker(
+            {
+                let completing = Arc::clone(&completing);
+                move || {
+                    let mailbox = completing
+                        .lock()
+                        .expect("completion probe mutex")
+                        .take()
+                        .expect("the replacement waker is cloned once");
+                    let teardown = prepare_termination(&mailbox)
+                        .expect("the clone-window probe terminates once");
+                    drop(teardown.finish());
+                }
+            },
+            {
+                let waker_thread = waker_thread.clone();
+                move || {
+                    record_disposal(&waker_thread);
+                    panic!("injected clone-window waker drop panic");
+                }
+            },
+        ));
+        let polling_thread = std::thread::current().id();
+
+        let Poll::Ready(Err(error)) = send.as_mut().poll(&mut Context::from_waker(&hostile)) else {
+            panic!("termination in the clone window returns the message")
+        };
+        assert_eq!(error.kind, crate::SendErrorKind::Terminated);
+        assert_eq!(await_disposal(&waker_thread), polling_thread);
+        assert!(
+            message_thread
+                .recorded
+                .lock()
+                .expect("message disposal recorder mutex")
+                .is_none(),
+            "the replacement retires before the terminal message is taken"
+        );
+        mailbox.dispose(error);
+        assert_ne!(await_disposal(&message_thread), polling_thread);
+    }
+
+    #[test]
+    fn acceptance_in_the_waker_clone_window_contains_replacement_drop() {
+        let (mailbox, actor): (Arc<MailboxCell<u8>>, ActorRef<u8>) = actor_for();
+        let mut send = Box::pin(actor.send(7));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let completing = Arc::new(Mutex::new(Some(Arc::clone(&mailbox))));
+        let waker_thread = disposal_thread();
+        let hostile = ManuallyDrop::new(probe_waker(
+            {
+                let completing = Arc::clone(&completing);
+                move || {
+                    let mailbox = completing
+                        .lock()
+                        .expect("completion probe mutex")
+                        .take()
+                        .expect("the replacement waker is cloned once");
+                    let token = configure(
+                        &mailbox,
+                        ResolvedMailbox::Queue(
+                            std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
+                        ),
+                    );
+                    bind(&mailbox, token, mint_actor_incarnation());
+                }
+            },
+            {
+                let waker_thread = waker_thread.clone();
+                move || {
+                    record_disposal(&waker_thread);
+                    panic!("injected clone-window waker drop panic");
+                }
+            },
+        ));
+        let polling_thread = std::thread::current().id();
+
+        assert!(matches!(
+            send.as_mut().poll(&mut Context::from_waker(&hostile)),
+            Poll::Ready(Ok(_))
+        ));
+        assert_eq!(await_disposal(&waker_thread), polling_thread);
+    }
+
+    #[test]
+    fn terminal_message_invariant_is_contained_during_an_existing_unwind() {
+        let (mailbox, actor): (Arc<MailboxCell<u8>>, ActorRef<u8>) = actor_for();
+        let mut send = Box::pin(actor.send(7));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let operation = match &send.as_ref().get_ref().state {
+            SendFutureState::Parked(operation) => Arc::clone(operation),
+            SendFutureState::Immediate(_) | SendFutureState::Sent(_) | SendFutureState::Done => {
+                panic!("an unbound mailbox parks its send")
+            }
+        };
+        let teardown = prepare_termination(&mailbox).expect("the mailbox terminates once");
+        drop(teardown.finish());
+        let retained = {
+            let mut state = operation.state.lock().expect("send operation mutex");
+            let OperationOutcome::Terminated { message, .. } = &mut state.outcome else {
+                panic!("termination publishes a terminal operation")
+            };
+            message.take().expect("termination retains the message")
+        };
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _send = send;
+            panic!("primary unwind");
+        }))
+        .expect_err("the primary panic survives send drop");
+        assert_eq!(
+            panic.downcast_ref::<&'static str>().copied(),
+            Some("primary unwind")
+        );
+        assert_eq!(retained, 7);
     }
 }

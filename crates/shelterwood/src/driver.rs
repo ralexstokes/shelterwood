@@ -85,6 +85,10 @@ use admission_control::RemovalResponses;
 pub(crate) struct SystemRun {
     pub(crate) root: Arc<ScopeCell>,
     driver: Option<runtime::JoinHandle<RetainedStopReason>>,
+    // Taking the handle starts a cancellation-sensitive join. Keep its
+    // completion separate so dropping a cancelled consuming API still requests
+    // shutdown even though the in-flight future already moved the handle out.
+    driver_joined: bool,
 }
 
 fn resident_projection(slot: &SlotCell) -> ResidentProjection {
@@ -102,9 +106,8 @@ impl SystemRun {
     }
 
     pub(crate) async fn wait(&mut self) -> StopReason {
-        let reason = self.root.wait_stopped().await;
         self.join_driver().await;
-        reason
+        self.root.wait_stopped().await
     }
 
     async fn join_driver(&mut self) {
@@ -119,9 +122,9 @@ impl SystemRun {
         if let Err(exit) =
             classify_retained_root_driver_join(runtime::join_user_polled(driver).await)
         {
-            self.root
-                .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
+            finish_monitored_root(&self.root, StopReason::ShutdownRequested, exit);
         }
+        self.driver_joined = true;
     }
 }
 
@@ -143,7 +146,7 @@ fn classify_retained_root_driver_join(
 
 impl Drop for SystemRun {
     fn drop(&mut self) {
-        if self.driver.is_none() {
+        if self.driver_joined {
             return;
         }
         // After a clean shutdown the root epochs are `Idle`, not `Exhausted`,
@@ -165,6 +168,7 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
     SystemRun {
         root,
         driver: Some(lifecycle),
+        driver_joined: false,
     }
 }
 
@@ -174,13 +178,31 @@ fn monitor_root_driver(
 ) -> runtime::JoinHandle<RetainedStopReason> {
     runtime::spawn(async move {
         match classify_retained_root_driver_join(runtime::join(driver).await) {
-            Ok(reason) => reason,
+            Ok(reason) => {
+                let public_reason = reason.as_reason().clone();
+                let exit = stop_reason_root_exit(&public_reason);
+                finish_monitored_root(&monitor_root, public_reason, exit);
+                reason
+            }
             Err(exit) => {
-                monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
+                finish_monitored_root(&monitor_root, StopReason::ShutdownRequested, exit);
                 RetainedStopReason::new(StopReason::ShutdownRequested)
             }
         }
     })
+}
+
+/// Publishes the join monitor's final root verdict without letting a hostile
+/// terminal observer kill the monitor itself.
+///
+/// The driver is already joined, so exit classification cannot change after
+/// this boundary. A panic from the terminal wake flush is consequently only a
+/// diagnostic; discard it rather than replacing a classified completion with
+/// a second monitor failure that could strand the root's finality fence.
+fn finish_monitored_root(root: &ScopeCell, reason: StopReason, exit: Exit) {
+    let mut panics = runtime::PanicAccumulator::default();
+    panics.run(|| root.finish_live_root_incarnation(reason, exit));
+    runtime::discard_panic(panics.take());
 }
 
 struct AncestorCommandLatches {
@@ -360,7 +382,6 @@ impl<T> IndexMut<ChildKey> for ChildResources<T> {
 
 struct ScopeCompletion {
     reason: RetainedStopReason,
-    root_exit: Option<RetainedExit>,
 }
 
 /// Runs the synchronous fail-closed scope epilogue.
@@ -454,14 +475,12 @@ impl Drop for ScopeRuntime {
             .map(|completion| completion.reason.as_reason().clone())
             .or_else(|| self.supervisor.lifecycle().draining_reason().cloned())
             .unwrap_or(StopReason::ShutdownRequested);
-        panics.run(|| {
-            if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
-                self.root
-                    .finish_root_incarnation(self.epoch, reason, exit.into_exit());
-            } else {
-                self.root.finish_incarnation(self.epoch, reason);
-            }
-        });
+        // Root membership terminality is join-gated: the monitor owns it on
+        // both successful and failed driver joins. The scope epilogue only
+        // retires this incarnation and publishes its stopped projection, just
+        // as it already does while unwinding. That keeps `wait_stopped` behind
+        // the last point at which the join can change the final verdict.
+        panics.run(|| self.root.finish_incarnation(self.epoch, reason));
     }
 }
 
@@ -1150,13 +1169,8 @@ async fn wait_for_scope_wake(
             // receiver and any queued admission response wakers outside
             // ScopeRuntime's contained epilogue.
             let reason = StopReason::ShutdownRequested;
-            let root_exit = scope
-                .role
-                .is_root()
-                .then(|| RetainedExit::new(stop_reason_root_exit(&reason)));
             scope.completion = Some(ScopeCompletion {
                 reason: RetainedStopReason::new(reason.clone()),
-                root_exit,
             });
             return Some(reason);
         }
@@ -1453,16 +1467,12 @@ async fn run_scope_incarnation(
         // until the recomputation above establishes that order.
         scope.publish_startup_removals();
         if let Some(reason) = scope.finished.take() {
-            let root_exit = scope
-                .role
-                .is_root()
-                .then(|| RetainedExit::new(stop_reason_root_exit(&reason)));
             // ScopeRuntime's synchronous epilogue clears dynamic state,
             // discharges child obligations and residency, and only then
-            // publishes the scope's terminal state.
+            // publishes the stopped projection. For the root, the join
+            // monitor owns the later membership-terminal fence.
             scope.completion = Some(ScopeCompletion {
                 reason: RetainedStopReason::new(reason.clone()),
-                root_exit,
             });
             return reason;
         }

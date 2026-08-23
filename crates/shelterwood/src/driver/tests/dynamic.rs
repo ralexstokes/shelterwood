@@ -1,8 +1,16 @@
 use super::{super::AdmissionInstall, support::*};
 use crate::plan::ChildPlan;
 
+/// Panics from the locked never-started terminalization seam.
+///
+/// `fuse`, when present, fires during conversion — after `handle_admission`'s
+/// pre-conversion latch check and before the ledger exists — so the rejection
+/// the panic then interrupts is the fused-cancel disjunct of the under-lock
+/// recheck, the one arm that claims the reservation before terminalizing.
 #[derive(Debug)]
-struct PanicTerminationMailbox;
+struct PanicTerminationMailbox {
+    fuse: Option<Latch>,
+}
 
 impl crate::mailbox::MailboxControl for PanicTerminationMailbox {
     fn configure(
@@ -10,6 +18,9 @@ impl crate::mailbox::MailboxControl for PanicTerminationMailbox {
         _mailbox: shelterwood_core::policy::ResolvedMailbox,
         _effects: &mut dyn crate::mailbox::MailboxEffectSink,
     ) -> crate::mailbox::MailboxBindToken {
+        if let Some(fuse) = &self.fuse {
+            fuse.fire_silently();
+        }
         crate::mailbox::MailboxBindToken::new(Arc::new(AtomicBool::new(false)))
     }
 
@@ -157,7 +168,7 @@ async fn rejected_admission_retains_its_child_across_locked_terminalization() {
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
     let member = Arc::clone(&reservation.slot.member);
-    member.attach_mailbox(Arc::new(PanicTerminationMailbox));
+    member.attach_mailbox(Arc::new(PanicTerminationMailbox { fuse: None }));
     reservation.slot.define(ChildConstruction::Task(
         TaskDef::new(|_| future::pending()).erase(),
     ));
@@ -197,6 +208,102 @@ async fn rejected_admission_retains_its_child_across_locked_terminalization() {
         !control.state.is_poisoned(),
         "locked terminalization begins only after dynamic state is released"
     );
+}
+
+/// Records whether the observation gate was held when a waker fired.
+struct GateVenueWake {
+    root: Arc<ScopeCell>,
+    held: Arc<Mutex<Option<bool>>>,
+}
+
+impl Wake for GateVenueWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        *self.held.lock().expect("gate venue probe mutex poisoned") =
+            Some(self.root.observation_gate().is_held());
+    }
+}
+
+#[crate::runtime::test]
+async fn rejected_admission_wakes_its_removal_waiter_outside_the_gate() {
+    let (mut scope, _events, mut dynamic_events, control) = running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    let member = Arc::clone(&reservation.slot.member);
+    let fused_cancel = Latch::default();
+    member.attach_mailbox(Arc::new(PanicTerminationMailbox {
+        fuse: Some(fused_cancel.clone()),
+    }));
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
+    let (mut response, request) = begin_admission(
+        &reservation,
+        &mut dynamic_events,
+        Some(fused_cancel.clone()),
+    )
+    .await;
+
+    // Park a remover on the still-reserved entry. Its waker fires from the
+    // entry's removal obligation, so it reports the venue that obligation
+    // runs in when the ledger retires the claimed reservation.
+    let removal = control
+        .state
+        .lock()
+        .expect("dynamic-state mutex starts healthy")
+        .entries_mut()
+        .get_mut(member.id())
+        .expect("the reservation is still indexed")
+        .removal
+        .payload_mut()
+        .subscribe();
+    let held = Arc::new(Mutex::new(None));
+    let waker = Waker::from(Arc::new(GateVenueWake {
+        root: Arc::clone(&root),
+        held: Arc::clone(&held),
+    }));
+    let mut removal = Box::pin(removal.receive());
+    assert!(
+        removal
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending(),
+        "the remover parks before the rejection"
+    );
+
+    let (finished, completion) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request)));
+        let _ = finished.send(result.is_err());
+    });
+    assert_eq!(
+        completion.recv_timeout(DRIVER_PROGRESS_WAIT),
+        Ok(true),
+        "the fused-cancel rejection unwinds out of locked terminalization"
+    );
+
+    assert_eq!(
+        *held.lock().expect("gate venue probe mutex remains healthy"),
+        Some(false),
+        "the claimed reservation retires from the ledger, so its removal \
+         obligation cannot wake a remover under the observation gate"
+    );
+    assert!(matches!(
+        removal
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Some(RemoveOutcome::Removed))
+    ));
+    assert!(matches!(
+        response.try_receive(),
+        Some(Err(ReserveError::NotAdmitting(
+            crate::NotAdmittingCause::Terminal
+        )))
+    ));
 }
 
 #[crate::runtime::test(start_paused = true)]

@@ -167,19 +167,35 @@ impl AdmissionInstall {
             .expect("an admission install inserts its child once")
     }
 
+    // The three claims below all land under both control-plane guards, so an
+    // overwrite would destroy the displaced value there: a `ChildRuntime`
+    // re-enters this very observation gate through its terminality fallback,
+    // and a `DynamicEntry` wakes a parked remover through its removal
+    // obligation. Each claim has exactly one caller and follows the matching
+    // take, so these stay diagnostics — and diagnostics under a lock the
+    // codebase `.expect()`s are `debug_assert!`s, never panics.
     fn restore_child(&mut self, child: Box<ChildRuntime>) {
+        debug_assert!(
+            self.child.is_none(),
+            "an admission install restores the runtime it took"
+        );
         self.child = Some(child);
     }
 
     fn claim_entry(&mut self, entry: DynamicEntry) {
+        debug_assert!(
+            self.entry.is_none(),
+            "an admission install claims one reservation"
+        );
         self.entry = Some(entry);
     }
 
     fn record_key(&mut self, key: ChildKey) {
-        assert!(
-            self.key.replace(key).is_none(),
+        debug_assert!(
+            self.key.is_none(),
             "an admission install claims one arena key"
         );
+        self.key = Some(key);
     }
 
     fn promote_entry(&mut self, txn: &mut ObservationTxn<'_>) {

@@ -200,9 +200,9 @@ fn monitor_root_driver(
 /// diagnostic; discard it rather than replacing a classified completion with
 /// a second monitor failure that could strand the root's finality fence.
 fn finish_monitored_root(root: &ScopeCell, reason: StopReason, exit: Exit) {
-    let mut panics = runtime::PanicAccumulator::default();
-    panics.run(|| root.finish_live_root_incarnation(reason, exit));
-    runtime::discard_panic(panics.take());
+    runtime::discard_panic(
+        runtime::catch_panic(|| root.finish_live_root_incarnation(reason, exit)).err(),
+    );
 }
 
 struct AncestorCommandLatches {

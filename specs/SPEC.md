@@ -3806,17 +3806,18 @@ no scope incarnation ever began, rather than giving a live scope
 incarnation's verdict. This lattice and its agreement guarantee apply within
 the scope plane: `wait_stopped()`, the final snapshot, and the stream's last
 `ScopeState` event always report the same, highest-precedence verdict. They do
-not require the membership plane's exit kind to match. Root membership
-terminality is join-gated: the driver epilogue retires its incarnation and
-publishes its stopped projection, while the join monitor terminalizes the
-membership only after the driver's final outcome is known. In particular, a
+not require the membership plane's exit kind to match. In particular, a
 nested scope body dropped before its first poll is the sanctioned
 cross-plane divergence: the scope projection is `Stopped { NeverStarted }`
 because no scope incarnation began, while the membership exit is
 `Aborted { WithinGrace }` with `last_incarnation: Some(1)` because an
 incarnation was spawned on the membership plane and then aborted. A root
 driver that dies mid-drain reports the join monitor's `ShutdownRequested`
-rather than the abandoned drain's `Finished`.
+rather than the abandoned drain's `Finished`. Root membership terminality is
+join-gated so that verdict cannot be missed: the driver epilogue retires its
+incarnation and publishes its stopped projection, while the join monitor
+terminalizes the membership only after the driver's final outcome is known.
+`wait_stopped()` on the root therefore never resolves ahead of the join.
 
 ```text
 ActorStats (II §22)

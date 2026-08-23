@@ -1,6 +1,6 @@
 use std::{
     mem,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     task::{Context, Wake, Waker},
 };
 
@@ -126,7 +126,9 @@ impl ProxiedPoll {
 ///
 /// The proxy mutex is a **leaf**: [`Wake::wake_by_ref`] takes it from whatever
 /// thread drives the external primitive, so nothing this type does under it may
-/// take another framework lock.
+/// take another framework lock. Its guard acquisition deliberately recovers
+/// poison: the registration contains only framework-owned bookkeeping, and a
+/// poisoned leaf must not introduce a panic into unwind-reachable retirement.
 #[doc(hidden)]
 pub struct WakerProxy {
     proxy: Waker,
@@ -144,6 +146,19 @@ struct Registration {
 #[derive(Default)]
 struct WakerProxyState {
     caller: Mutex<Registration>,
+}
+
+impl WakerProxyState {
+    /// Acquires the leaf registration without turning an earlier bookkeeping
+    /// panic into a second panic at a later proxy operation.
+    ///
+    /// No user code runs under this mutex and `Registration` contains only
+    /// framework-owned state, so poison marks no application invariant that
+    /// callers could rely on. Every acquisition goes through this helper so
+    /// the non-panicking policy is structural, including drop-glue retirement.
+    fn registration(&self) -> MutexGuard<'_, Registration> {
+        self.caller.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl WakerProxy {
@@ -189,11 +204,7 @@ impl WakerProxy {
             // releases the mutex before a displaced RawWaker vtable runs.
             let mut effects = WakerEffects::default();
             let needs_clone = {
-                let mut registration = self
-                    .state
-                    .caller
-                    .lock()
-                    .expect("waker proxy mutex poisoned");
+                let mut registration = self.state.registration();
                 let installed = if registration.caller.will_wake(current) {
                     true
                 } else if let Some(replacement) = replacement.take() {
@@ -251,11 +262,7 @@ impl WakerProxy {
     /// caller to register on a reused proxy is woken once for an event that
     /// predates it.
     pub(crate) fn retire(&self, action: WakerAction, effects: &mut WakerEffects) {
-        let mut registration = self
-            .state
-            .caller
-            .lock()
-            .expect("waker proxy mutex poisoned");
+        let mut registration = self.state.registration();
         registration.woken = false;
         registration.caller.take(action, effects);
     }
@@ -286,7 +293,7 @@ impl Wake for WakerProxyState {
     fn wake_by_ref(self: &Arc<Self>) {
         let mut effects = WakerEffects::default();
         {
-            let mut registration = self.caller.lock().expect("waker proxy mutex poisoned");
+            let mut registration = self.registration();
             // Record every wake, whether or not a caller is installed. An
             // empty slot can mean the wake landed in `register`'s clone
             // window; an occupied slot can hold the previous task's waker
@@ -307,6 +314,7 @@ impl Wake for WakerProxyState {
 mod tests {
     use std::{
         mem::ManuallyDrop,
+        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc, Weak,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -678,6 +686,35 @@ mod tests {
             0,
             "a retired registration leaves no wake for the next caller to inherit"
         );
+    }
+
+    #[test]
+    fn poisoned_proxy_leaf_remains_usable_across_every_transition() {
+        let proxy = WakerProxy::new();
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _registration = proxy
+                .state
+                .caller
+                .lock()
+                .expect("the fresh proxy mutex is not poisoned");
+            panic!("poison the framework-only proxy leaf");
+        }));
+        assert!(poisoned.is_err());
+
+        let first = Arc::new(CountWake::default());
+        proxy.register(&Waker::from(Arc::clone(&first)));
+        proxy.waker().wake_by_ref();
+        assert_eq!(first.0.load(Ordering::SeqCst), 1);
+
+        let second = Arc::new(CountWake::default());
+        proxy.register(&Waker::from(second));
+        let mut effects = WakerEffects::default();
+        proxy.retire(WakerAction::DropInline, &mut effects);
+        drop(effects);
+
+        // Drop reaches `retire` once more. A poisoned leaf must remain
+        // non-panicking on that unwind-reachable fallback as well.
+        drop(proxy);
     }
 
     #[test]

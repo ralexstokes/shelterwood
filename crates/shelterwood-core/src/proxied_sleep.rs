@@ -78,12 +78,10 @@ impl ProxiedSleep {
 
     fn retire(&mut self, action: WakerAction, panics: &mut PanicAccumulator) {
         let mut effects = WakerEffects::default();
-        let timer_poll = &mut self.timer_poll;
-        // The proxy mutex guards framework-owned data and is documented
-        // unpoisonable, but this path also runs during unwind. Keep every
-        // cleanup step inside the accumulator so a bookkeeping defect cannot
-        // turn a caller panic into an abort.
-        panics.run(|| timer_poll.retire(action, &mut effects));
+        // Proxy retirement only moves framework-owned bookkeeping into the
+        // effects sink, and its leaf-lock acquisition recovers poison. The
+        // caller-owned waker remains inside the accumulator-backed flush.
+        self.timer_poll.retire(action, &mut effects);
         effects.flush(panics);
 
         // Slot first, timer second: once the caller waker is gone, cancelling

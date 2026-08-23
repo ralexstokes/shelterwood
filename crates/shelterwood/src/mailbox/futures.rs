@@ -568,8 +568,13 @@ fn withdraw_send_with<M: Send + 'static>(
             kind: SendErrorKind::Terminated,
         }),
     };
-    let finish_panic = crate::runtime::catch_panic(|| withdrawal.finish()).err();
-    crate::runtime::discard_panic(finish_panic);
+    match disposition {
+        WithdrawalDisposition::Inline => {
+            let finish_panic = crate::runtime::catch_panic(|| withdrawal.finish()).err();
+            crate::runtime::discard_panic(finish_panic);
+        }
+        WithdrawalDisposition::Isolated => withdrawal.finish(),
+    }
     result
 }
 
@@ -590,8 +595,9 @@ impl<M: Send + 'static> DeadlineOperation for SendFuture<M> {
         } else {
             // Unlike cancellation this is a normal return on the caller's
             // task. The recovered message goes back to that caller and the
-            // registered waker destructor stays inline, so its panic remains
-            // visible.
+            // registered waker destructor stays inline. Its panic is contained
+            // at this by-value handoff so it cannot destroy that message during
+            // cleanup.
             Poll::Ready(withdraw_send_with(self, WithdrawalDisposition::Inline))
         }
     }
@@ -839,7 +845,7 @@ mod tests {
 
     use super::{
         super::cell::{
-            OperationOutcome,
+            OperationOutcome, WithdrawalDisposition,
             tests::{
                 actor, actor_for, actor_for_with_runtime, bind, close, configure,
                 prepare_termination,
@@ -1339,6 +1345,40 @@ mod tests {
         }
     }
 
+    struct PanickingDisposeRuntime {
+        inner: Arc<dyn crate::mailbox::MailboxRuntime>,
+    }
+
+    impl crate::mailbox::MailboxRuntime for PanickingDisposeRuntime {
+        fn oneshot(
+            &self,
+        ) -> (
+            Box<dyn shelterwood_core::ErasedOneShotSender>,
+            Pin<Box<dyn shelterwood_core::ErasedOneShotReceiver>>,
+        ) {
+            self.inner.oneshot()
+        }
+
+        fn signal(&self) -> Arc<dyn crate::mailbox::MailboxSignal> {
+            self.inner.signal()
+        }
+
+        fn dispose(&self, _value: Box<dyn Send + 'static>) {
+            panic!("injected isolated disposal submission panic");
+        }
+
+        fn now(&self) -> std::time::Instant {
+            self.inner.now()
+        }
+
+        fn sleep_until(
+            &self,
+            deadline: Option<std::time::Instant>,
+        ) -> shelterwood_core::BoxedSleep {
+            self.inner.sleep_until(deadline)
+        }
+    }
+
     struct CallMessage {
         _reply: crate::Reply<u8>,
         _payload: ThreadRecordingDrop,
@@ -1480,6 +1520,30 @@ mod tests {
         );
         mailbox.dispose(error);
         assert_ne!(await_disposal(&message_thread), polling_thread);
+    }
+
+    #[test]
+    fn isolated_withdrawal_preserves_a_disposal_submission_diagnostic() {
+        let runtime = Arc::new(PanickingDisposeRuntime {
+            inner: crate::mailbox::capability::tests::runtime(),
+        });
+        let (_mailbox, actor): (Arc<MailboxCell<u8>>, ActorRef<u8>) =
+            actor_for_with_runtime(runtime);
+        let mut send = Box::pin(actor.send(7));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::withdraw_send_with(send.as_mut().get_mut(), WithdrawalDisposition::Isolated)
+        }))
+        .expect_err("isolated disposal submission retains its diagnostic");
+        assert_eq!(
+            panic.downcast_ref::<&'static str>().copied(),
+            Some("injected isolated disposal submission panic")
+        );
     }
 
     #[test]

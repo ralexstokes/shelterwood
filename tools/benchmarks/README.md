@@ -29,10 +29,35 @@ operations:
 - `core` covers the supervision reducer and deadline queue.
 - `mailbox` covers batched send, fail-fast send, request/reply, and concurrent
   producer tasks over both current-thread and four-worker Tokio runtimes.
+  Four details govern how to read it:
+  - The timed region of every batched send case ends at the last accepted
+    send. `Mailbox::Queue` is FIFO, so a reply barrier inside that region
+    would have to wait for the handler to run the whole batch, reporting
+    `enqueue + handler + wakeups + a round trip` under the name of a send and
+    burying the difference between two send APIs in the shared drain. The
+    barrier still runs once per iteration, between measurements, so every
+    iteration starts from an empty queue.
+  - Capacity selects which operation runs rather than tuning one operation,
+    so the arms are named for their regime. `send_buffered` holds the whole
+    batch and parks no sender; `send_backpressured` parks every send past its
+    capacity, so its timed region legitimately includes consumer scheduling.
+    The two are not comparable, and the backpressured arms are the noisy ones.
+  - `call` is measured whole. Boxing the message constructor, creating the
+    reply channel, and arming and retiring a real deadline wheel entry are
+    inside the timed region because the operation cannot be performed without
+    them; no deadline ever expires there.
+  - The group runs at a reduced sampling budget (20 samples, 0.5 s warm-up,
+    2 s measurement) with a 10% noise floor and a 1% significance level. That
+    keeps the 48-case suite near three minutes inside `just bench` and keeps
+    routine spread on the backpressured arms out of the change reports.
 
 `concurrent_send_tasks` deliberately includes task spawn and join overhead. It
 represents the common application shape of short-lived producer tasks rather
-than claiming to isolate mailbox mutex contention alone.
+than claiming to isolate mailbox mutex contention alone. Under the
+`current_thread` group there is no real contention to isolate: the producers
+interleave cooperatively on a single thread, and only the `multi_thread_4`
+group exercises parallel senders. Its mailbox capacity sits below the batch
+size in both groups, so it is a backpressured arm as well.
 
 The core supervisor `startup` and `drain` cases apply one child's transition
 sequence and then settle before advancing to the next child. They deliberately

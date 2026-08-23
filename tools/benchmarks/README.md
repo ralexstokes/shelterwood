@@ -23,6 +23,17 @@ Criterion accepts a name filter after `--`. For example:
   --manifest-path tools/benchmarks/Cargo.toml -- core/deadline
 ```
 
+The suites separate deterministic structural costs from executor-backed public
+operations:
+
+- `core` covers the supervision reducer and deadline queue.
+- `mailbox` covers batched send, fail-fast send, request/reply, and concurrent
+  producer tasks over both current-thread and four-worker Tokio runtimes.
+
+`concurrent_send_tasks` deliberately includes task spawn and join overhead. It
+represents the common application shape of short-lived producer tasks rather
+than claiming to isolate mailbox mutex contention alone.
+
 The core supervisor `startup` and `drain` cases apply one child's transition
 sequence and then settle before advancing to the next child. They deliberately
 stress incremental, level-triggered settlement; they do not model the driver's

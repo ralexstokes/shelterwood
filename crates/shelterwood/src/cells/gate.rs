@@ -330,6 +330,57 @@ mod tests {
     }
 
     #[test]
+    fn observation_txn_unwind_drains_panicking_surrender_prefix_after_unlock() {
+        let gate = ObservationGate::new();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let payload = catch_unwind(AssertUnwindSafe({
+            let observed = Arc::clone(&observed);
+            let gate = gate.clone();
+            move || {
+                let mut txn = ObservationTxn::new(&gate, gate.lock());
+                let ordinary = Arc::clone(&observed);
+                let ordinary_gate = gate.clone();
+                txn.defer(move || {
+                    ordinary
+                        .lock()
+                        .expect("probe mutex remains healthy")
+                        .push((3, ordinary_gate.is_held()));
+                });
+
+                let first = Arc::clone(&observed);
+                let first_gate = gate.clone();
+                txn.defer_surrender(move || {
+                    first
+                        .lock()
+                        .expect("probe mutex remains healthy")
+                        .push((1, first_gate.is_held()));
+                    std::panic::panic_any("hostile surrender effect");
+                });
+
+                let second = Arc::clone(&observed);
+                let second_gate = gate.clone();
+                txn.defer_surrender(move || {
+                    second
+                        .lock()
+                        .expect("probe mutex remains healthy")
+                        .push((2, second_gate.is_held()));
+                });
+
+                std::panic::panic_any("primary panic");
+            }
+        }))
+        .expect_err("the original unwind reaches its boundary");
+
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"primary panic"));
+        assert_eq!(
+            *observed.lock().expect("probe mutex remains healthy"),
+            [(1, false), (2, false), (3, false)],
+            "surrender effects stay ahead of the ordinary suffix, all run after unlock, and a \
+             hostile surrender cannot strand later effects during unwind"
+        );
+    }
+
+    #[test]
     fn observation_txn_drop_runs_later_pulses_after_a_hostile_waker() {
         let gate = ObservationGate::new();
         let (hostile_sender, mut hostile_receiver) = runtime::watch(());

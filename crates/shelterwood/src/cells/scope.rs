@@ -1817,7 +1817,7 @@ mod tests {
 
     use super::*;
     use crate::cells::{
-        LifecycleItem, LifecycleTryRecvError,
+        LifecycleEvent, LifecycleItem, LifecycleTryRecvError,
         test_support::{TEST_WAIT, ThreadProbe, child_member, child_scope, isolated_scope},
     };
 
@@ -2261,42 +2261,104 @@ mod tests {
     }
 
     #[test]
-    fn clearing_announced_nested_resident_makes_removed_the_last_parent_event() {
+    fn announced_nested_retirement_makes_removed_the_last_parent_event() {
+        #[derive(Clone, Copy, Debug)]
+        enum Retirement {
+            Prune,
+            Clear,
+            Replace,
+        }
+
+        for retirement in [Retirement::Prune, Retirement::Clear, Retirement::Replace] {
+            let root = isolated_scope("root", ScopeFlavor::Ordered);
+            let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
+            let membership = nested.member.membership();
+            let mut root_lifecycle = root.subscribe_lifecycle();
+            let mut nested_lifecycle = nested.subscribe_lifecycle();
+
+            assert!(root.admit_child(ResidentProjection::new(
+                Arc::clone(&nested.member),
+                Some(Arc::clone(&nested)),
+            )));
+            assert!(matches!(
+                root_lifecycle.try_recv(),
+                Ok(LifecycleItem::Event(LifecycleEvent {
+                    kind: LifecycleEventKind::Added {
+                        membership: added,
+                        ..
+                    },
+                    ..
+                })) if added == membership
+            ));
+
+            match retirement {
+                Retirement::Prune => assert!(root.prune_child(&nested.member)),
+                Retirement::Clear => root.clear_residents(),
+                Retirement::Replace => assert!(root.set_admitted_children(Vec::new())),
+            }
+            assert!(matches!(
+                root_lifecycle.try_recv(),
+                Ok(LifecycleItem::Event(LifecycleEvent {
+                    kind: LifecycleEventKind::Removed {
+                        membership: removed,
+                        ..
+                    },
+                    ..
+                })) if removed == membership
+            ));
+            assert!(
+                nested.parent().is_none(),
+                "{retirement:?} withdraws the resident's upward observation edge"
+            );
+
+            nested.set_state(ScopeState::Stopped {
+                reason: StopReason::Finished,
+            });
+            assert!(matches!(
+                nested_lifecycle.try_recv(),
+                Ok(LifecycleItem::Event(LifecycleEvent {
+                    kind: LifecycleEventKind::ScopeState {
+                        state: ScopeState::Stopped {
+                            reason: StopReason::Finished,
+                        },
+                    },
+                    ..
+                }))
+            ));
+            assert_eq!(
+                root_lifecycle.try_recv(),
+                Err(LifecycleTryRecvError::Empty),
+                "Removed is the parent stream's final word about the subtree ({retirement:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_retirement_tolerates_a_poisoned_parent_link() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
-        let mut root_lifecycle = root.subscribe_lifecycle();
-        let mut nested_lifecycle = nested.subscribe_lifecycle();
-
         assert!(root.admit_child(ResidentProjection::new(
             Arc::clone(&nested.member),
             Some(Arc::clone(&nested)),
         )));
-        assert!(matches!(
-            root_lifecycle.try_recv(),
-            Ok(LifecycleItem::Event(_))
-        ));
 
-        root.clear_residents();
-        assert!(matches!(
-            root_lifecycle.try_recv(),
-            Ok(LifecycleItem::Event(_))
-        ));
+        let poisoned = Arc::clone(&nested);
         assert!(
-            nested.parent().is_none(),
-            "retiring the resident withdraws its upward observation edge"
+            catch_unwind(AssertUnwindSafe(move || {
+                let _parent = poisoned
+                    .observation
+                    .parent
+                    .lock()
+                    .expect("parent link starts healthy");
+                panic!("inject parent-link poison");
+            }))
+            .is_err()
         );
 
-        nested.set_state(ScopeState::Stopped {
-            reason: StopReason::Finished,
-        });
-        assert!(matches!(
-            nested_lifecycle.try_recv(),
-            Ok(LifecycleItem::Event(_))
-        ));
-        assert_eq!(
-            root_lifecycle.try_recv(),
-            Err(LifecycleTryRecvError::Empty),
-            "Removed is the parent stream's final word about the subtree"
+        root.clear_residents();
+        assert!(
+            nested.parent().is_none(),
+            "retirement recovers the parent link and severs it"
         );
     }
 

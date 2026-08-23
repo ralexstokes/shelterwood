@@ -99,6 +99,18 @@ impl ResidentChild {
             .as_ref()
             .expect("a resident child owns its projection until it is dropped")
     }
+
+    /// Withdraws the upward observation edge for the resident being retired.
+    ///
+    /// This is deliberately not part of `Drop`: a refused duplicate admission
+    /// temporarily owns a `ResidentChild`, but must not sever the subtree from
+    /// its original parent. Prune and displacement call this only after they
+    /// have selected their own resident for retirement.
+    fn sever_parent(&self) {
+        if let Some(scope) = &self.projection().scope {
+            scope.sever_parent();
+        }
+    }
 }
 
 impl Drop for ResidentChild {
@@ -411,6 +423,14 @@ impl ScopeCell {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .and_then(Weak::upgrade)
+    }
+
+    fn sever_parent(&self) {
+        *self
+            .observation
+            .parent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     #[cfg(test)]
@@ -966,6 +986,11 @@ impl ScopeCell {
         let Some(resident) = resident else {
             return false;
         };
+        // Residency is the ownership edge for upward observation. Withdraw
+        // the nested scope's parent link in the same gate transaction that
+        // removes the resident, before publishing `Removed` or retiring its
+        // graph. An unannounced resident takes this path too.
+        resident.sever_parent();
         // Mirror the announcement: a resident an unwound admission installed
         // never published `Added`, and SPEC §3.2's pairing is both edges or
         // neither. It is still withdrawn and disposed.
@@ -1524,6 +1549,13 @@ impl ScopeCell {
             let mut children = self.current_children();
             std::mem::take(&mut *children)
         };
+        // Sever each nested observation edge before any `Removed` publication
+        // or detached graph retirement. The parent mutex contains only a
+        // framework-owned weak link, so this remains legal under the resident
+        // tree's observation gate.
+        for resident in &residents {
+            resident.sever_parent();
+        }
         // An unannounced resident is one an admission installed and then
         // unwound past. It never published `Added`, so SPEC §3.2's exact
         // pairing forbids publishing its `Removed`; it is still displaced and
@@ -2169,6 +2201,102 @@ mod tests {
                 .expect("scope clear disposes the lingering mailbox payload"),
             retiring_thread,
             "scope clear retains the detached disposal venue"
+        );
+    }
+
+    #[test]
+    fn clearing_unannounced_nested_resident_severs_its_parent_link() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
+        let mut root_lifecycle = root.subscribe_lifecycle();
+        let mut nested_lifecycle = nested.subscribe_lifecycle();
+
+        // `set_parent` installs the back-link before this poisoned control
+        // lock unwinds the admission, leaving an unannounced resident behind.
+        let poisoned = Arc::clone(&nested);
+        assert!(
+            catch_unwind(AssertUnwindSafe(move || {
+                let _control = poisoned.control.lock().expect("control starts healthy");
+                panic!("inject admission bookkeeping panic");
+            }))
+            .is_err()
+        );
+        catch_unwind(AssertUnwindSafe(|| {
+            let _ = root.admit_child(ResidentProjection::new(
+                Arc::clone(&nested.member),
+                Some(Arc::clone(&nested)),
+            ));
+        }))
+        .expect_err("poisoned parent wiring unwinds admission");
+
+        assert!(Arc::ptr_eq(
+            &nested
+                .parent()
+                .expect("the failed admission installed its link"),
+            &root
+        ));
+        root.clear_residents();
+        assert!(
+            nested.parent().is_none(),
+            "retiring an unannounced resident severs its parent link"
+        );
+        assert_eq!(
+            root_lifecycle.try_recv(),
+            Err(LifecycleTryRecvError::Empty),
+            "the failed admission published neither membership edge"
+        );
+
+        nested.set_state(ScopeState::Stopped {
+            reason: StopReason::Finished,
+        });
+        assert!(matches!(
+            nested_lifecycle.try_recv(),
+            Ok(LifecycleItem::Event(_))
+        ));
+        assert_eq!(
+            root_lifecycle.try_recv(),
+            Err(LifecycleTryRecvError::Empty),
+            "post-retirement events stay local to the removed subtree"
+        );
+    }
+
+    #[test]
+    fn clearing_announced_nested_resident_makes_removed_the_last_parent_event() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
+        let mut root_lifecycle = root.subscribe_lifecycle();
+        let mut nested_lifecycle = nested.subscribe_lifecycle();
+
+        assert!(root.admit_child(ResidentProjection::new(
+            Arc::clone(&nested.member),
+            Some(Arc::clone(&nested)),
+        )));
+        assert!(matches!(
+            root_lifecycle.try_recv(),
+            Ok(LifecycleItem::Event(_))
+        ));
+
+        root.clear_residents();
+        assert!(matches!(
+            root_lifecycle.try_recv(),
+            Ok(LifecycleItem::Event(_))
+        ));
+        assert!(
+            nested.parent().is_none(),
+            "retiring the resident withdraws its upward observation edge"
+        );
+
+        nested.set_state(ScopeState::Stopped {
+            reason: StopReason::Finished,
+        });
+        assert!(matches!(
+            nested_lifecycle.try_recv(),
+            Ok(LifecycleItem::Event(_))
+        ));
+        assert_eq!(
+            root_lifecycle.try_recv(),
+            Err(LifecycleTryRecvError::Empty),
+            "Removed is the parent stream's final word about the subtree"
         );
     }
 

@@ -3816,8 +3816,12 @@ driver that dies mid-drain reports the join monitor's `ShutdownRequested`
 rather than the abandoned drain's `Finished`. Root membership terminality is
 join-gated so that verdict cannot be missed: the driver epilogue retires its
 incarnation and publishes its stopped projection, while the join monitor
-terminalizes the membership only after the driver's final outcome is known.
-`wait_stopped()` on the root therefore never resolves ahead of the join.
+terminalizes the membership only once that join has settled. Cancellation of
+the monitor — runtime teardown dropping it mid-join — is one such settling: it
+makes the driver's own outcome permanently unobservable, and the monitor
+publishes that cancellation's classification rather than leaving the
+membership live. `wait_stopped()` on the root therefore never resolves ahead
+of the join, and never fails to resolve.
 
 ```text
 ActorStats (II §22)

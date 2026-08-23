@@ -1,9 +1,22 @@
 #[path = "mod.rs"]
 mod common;
 
-use std::{cell::Cell, future, task::Poll, time::Duration};
+use std::{
+    cell::Cell,
+    future,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    task::{Poll, Waker},
+    time::Duration,
+};
 
-use common::{ConsumeCount, LiveFlag, ReleaseGate, assert_quiet, poll_once};
+use common::{
+    ConsumeCount, LiveFlag, ReleaseGate, assert_quiet, hostile_waker, poll_once,
+    probe_waker_with_wake,
+};
 
 #[tokio::test]
 async fn release_gate_stores_one_permit() {
@@ -93,4 +106,105 @@ async fn eventual_assertion_context_is_evaluated_only_on_failure() {
     .await;
 
     assert!(!evaluated.get());
+}
+
+/// The integration-side raw-waker probe is a hand-written vtable restated from
+/// the crate-internal twin, and every fixture built on it -- `hostile_waker`
+/// above all -- is consumed by abort-class regressions that assert only that
+/// the process survives. A probe that silently stopped invoking its callbacks
+/// would therefore leave those suites passing with nothing injected. These
+/// pins are what makes that drift loud.
+#[test]
+fn probe_waker_routes_clone_wake_and_drop_without_leaking() {
+    let clones = Arc::new(AtomicUsize::new(0));
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let retained = Arc::new(());
+
+    let clone_count = Arc::clone(&clones);
+    let clone_retained = Arc::clone(&retained);
+    let wake_count = Arc::clone(&wakes);
+    let wake_retained = Arc::clone(&retained);
+    let drop_count = Arc::clone(&drops);
+    let drop_retained = Arc::clone(&retained);
+    let waker = probe_waker_with_wake(
+        move || {
+            let _retained = &clone_retained;
+            clone_count.fetch_add(1, Ordering::SeqCst);
+        },
+        move || {
+            let _retained = &wake_retained;
+            wake_count.fetch_add(1, Ordering::SeqCst);
+        },
+        move || {
+            let _retained = &drop_retained;
+            drop_count.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+
+    let by_ref = waker.clone();
+    by_ref.wake_by_ref();
+    drop(by_ref);
+    let consumed = waker.clone();
+    consumed.wake();
+    drop(waker);
+
+    assert_eq!(clones.load(Ordering::SeqCst), 2);
+    assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+    assert_eq!(Arc::strong_count(&retained), 1);
+}
+
+#[test]
+fn panicking_consuming_wake_still_retires_its_raw_reference() {
+    let first_wake = Arc::new(AtomicBool::new(true));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let retained = Arc::new(());
+
+    let wake_once = Arc::clone(&first_wake);
+    let wake_retained = Arc::clone(&retained);
+    let drop_count = Arc::clone(&drops);
+    let drop_retained = Arc::clone(&retained);
+    let waker = probe_waker_with_wake(
+        || {},
+        move || {
+            let _retained = &wake_retained;
+            if wake_once.swap(false, Ordering::SeqCst) {
+                panic!("injected wake panic");
+            }
+        },
+        move || {
+            let _retained = &drop_retained;
+            drop_count.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+    let consumed = waker.clone();
+
+    let panic = catch_unwind(AssertUnwindSafe(|| consumed.wake()));
+    assert!(
+        panic.is_err(),
+        "the wake callback panic reaches the harness"
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(waker);
+
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(Arc::strong_count(&retained), 1);
+}
+
+/// `hostile_waker`'s whole contract is the destructor it installs on every
+/// registration the framework clones. The suites that consume it judge the
+/// absence of an abort, so the injection itself is pinned here.
+#[test]
+fn hostile_waker_registrations_panic_with_their_named_payload() {
+    const INJECTED: &str = "injected fixture caller-waker drop panic";
+
+    let hostile = hostile_waker(INJECTED);
+    // `ManuallyDrop`'s own `Clone` would yield another leaked handle, so clone
+    // the `Waker` itself: only a real registration reaches the drop vtable.
+    let registration = Waker::clone(&hostile);
+
+    let payload = catch_unwind(AssertUnwindSafe(move || drop(registration)))
+        .expect_err("a cloned hostile registration panics when it is destroyed");
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&INJECTED));
 }

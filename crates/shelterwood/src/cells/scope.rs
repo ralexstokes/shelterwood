@@ -945,13 +945,6 @@ impl ScopeCell {
         terminalized.expect("a supervised terminal child must remain in parent residency")
     }
 
-    /// Installs residency without announcing it, as an admission that
-    /// unwound between its residency push and its `Added` publication does.
-    #[cfg(test)]
-    fn push_unannounced_resident_for_test(&self, child: ResidentProjection) {
-        self.current_children().push(ResidentChild::new(child));
-    }
-
     #[cfg(test)]
     pub(crate) fn prune_child(&self, member: &MemberCell) -> bool {
         self.with_observation_gate(|wakes| self.prune_child_locked(member, wakes))
@@ -2312,8 +2305,9 @@ mod tests {
         let mut lifecycle = root.subscribe_lifecycle();
 
         // Install residency exactly as an admission that unwound before its
-        // `Added` publication leaves it.
-        root.push_unannounced_resident_for_test(ResidentProjection::new(Arc::clone(&member), None));
+        // `Added` publication leaves it: the production push, with its slot
+        // dropped instead of announced.
+        drop(root.push_unannounced(ResidentProjection::new(Arc::clone(&member), None)));
         assert_eq!(root.resident_projections().len(), 1);
         assert!(root.snapshot().children.is_empty());
 

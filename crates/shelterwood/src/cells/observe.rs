@@ -998,8 +998,10 @@ impl LifecycleHub {
             // critical disposal under both locks. That submission is
             // refcount/framework work only and is the accepted trade because
             // drop glue inside the send has no transaction sink to reach.
-            undelivered = self.events.send(event).err();
-            published = true;
+            match self.events.send(event) {
+                Ok(_) => published = true,
+                Err(event) => undelivered = Some(event),
+            }
         });
         if let Some(undelivered) = undelivered {
             txn.defer(move || drop(undelivered));
@@ -1071,22 +1073,27 @@ pub enum WaitError {
 #[cfg(test)]
 mod tests {
     use std::{
+        fmt,
+        future::Future,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
+            mpsc,
         },
+        task::{Context, Poll, Waker},
     };
 
     use crate::runtime;
     use shelterwood_core::{
-        ChildId, Intensity, TotalRestarts,
+        Cancellation, ChildId, Exit, ExitError, Intensity, TotalRestarts,
         identity::{PoisonedCounter, ScopeIdentity},
         policy::ScopeFlavor,
     };
 
     use crate::cells::{
-        LifecycleEvent, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, ScopeSnapshot,
+        LifecycleEvent, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, ObservationGate,
+        ScopeSnapshot, test_support::TEST_WAIT,
     };
     use shelterwood_core::{ScopeState, StopReason};
 
@@ -1108,6 +1115,28 @@ mod tests {
             }),
             Vec::new(),
         )
+    }
+
+    struct DropSignal(mpsc::SyncSender<()>);
+
+    impl fmt::Debug for DropSignal {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("DropSignal")
+        }
+    }
+
+    impl fmt::Display for DropSignal {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("drop signal")
+        }
+    }
+
+    impl std::error::Error for DropSignal {}
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
     }
 
     #[test]
@@ -1469,6 +1498,60 @@ mod tests {
         drop(txn);
 
         assert_eq!(runtime::join_resuming(waiter).await, None);
+    }
+
+    #[test]
+    fn failed_lifecycle_send_does_not_pulse_and_retires_after_commit() {
+        let hub = LifecycleHub::default();
+        // Production bundles the signal and broadcast receivers inside one
+        // `LifecycleEvents`. Holding only this raw signal watcher models the
+        // benign 1 -> 0 broadcast-receiver race after the publication gate.
+        let mut signal = hub.signal.watcher();
+        assert_eq!(hub.events.receiver_count(), 0);
+
+        let mut identity = ScopeIdentity::new();
+        let (membership, mut incarnations) = identity
+            .mint_membership(&ChildId::from("scope"))
+            .expect("membership available")
+            .into_pair();
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let event = LifecycleEvent {
+            scope_path: Vec::new(),
+            scope: membership,
+            seq: LifecycleSeq::new(1),
+            kind: LifecycleEventKind::Exited {
+                id: ChildId::from("worker"),
+                membership,
+                incarnation: incarnations.mint().expect("incarnation available"),
+                exit: Exit::failed(
+                    ExitError::from(DropSignal(dropped)),
+                    Cancellation::NotObserved,
+                ),
+            },
+        };
+        let gate = ObservationGate::new();
+        let mut txn = ObservationTxn::new(&gate, gate.lock());
+
+        hub.publish(&mut txn, event);
+        assert!(
+            observed.try_recv().is_err(),
+            "an undelivered event remains deferred while the transaction holds the gate"
+        );
+        drop(txn);
+
+        observed
+            .recv_timeout(TEST_WAIT)
+            .expect("the undelivered event retires after commit");
+        let mut changed = Box::pin(signal.changed());
+        assert!(
+            matches!(
+                changed
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ),
+            "a failed broadcast send must not pulse the signal watch"
+        );
     }
 
     #[test]

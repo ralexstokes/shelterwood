@@ -3564,6 +3564,11 @@ Ordering and delivery contract:
   Forwarding preserves each origin scope's order and the causal edges — a
   child's `Added → Started/Ready/… → Removed` chain is never reordered,
   and a subtree child's own `Added` precedes any event from inside it.
+  Forwarding lasts only while the nested scope is resident: residency
+  withdrawal severs its parent link before publishing `Removed`, making
+  `Removed` the containing scope's last word about that subtree. Events the
+  removed subtree emits later remain on its own stream and do not reach the
+  former parent's stream.
 - Subscriptions and the snapshot watch are membership-owned, like the
   mailbox binding (§5.4): they ride the scope's own restarts, and they
   exist from cell creation (§3.2) — a subscription through a pre-spawn

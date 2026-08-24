@@ -970,6 +970,18 @@ impl LifecycleHub {
         }
     }
 
+    /// Whether this hub has an active lifecycle subscription.
+    ///
+    /// The signal count is an atomic-load proxy for the broadcast count,
+    /// which would take Tokio's broadcast tail mutex. `LifecycleEvents`
+    /// bundles both receivers and `subscribe` is their only constructor, so
+    /// the counts agree outside the benign user-timed 1 -> 0 drop race. The
+    /// observation gate serializes subscription with publication, preventing
+    /// a missed 0 -> 1 transition.
+    pub(crate) fn has_receivers(&self) -> bool {
+        self.signal.receiver_count() != 0
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         self.signal.read_with(|signal| signal.closed)
     }
@@ -981,6 +993,10 @@ impl LifecycleHub {
         event: impl Into<RetainedLifecycleEvent>,
     ) {
         let event = event.into();
+        if !self.has_receivers() {
+            txn.defer(move || drop(event));
+            return;
+        }
         let mut published = false;
         let mut undelivered = None;
         self.signal.modify_silently(|signal| {
@@ -1013,6 +1029,12 @@ impl LifecycleHub {
 
     /// Publishes an explicit lag marker under the observation gate.
     pub(crate) fn publish_lagged(&self, txn: &mut ObservationTxn<'_>, dropped: u64) {
+        // A later subscriber baselines `seen_explicit_lag`, so loss accrued
+        // before that subscription cannot be observed and need not mutate the
+        // retained signal state.
+        if !self.has_receivers() {
+            return;
+        }
         let mut published = false;
         self.signal.modify_silently(|signal| {
             if signal.closed {
@@ -1028,6 +1050,8 @@ impl LifecycleHub {
 
     /// Closes while the containing scope's observation gate is held.
     pub(crate) fn close(&self, txn: &mut ObservationTxn<'_>) {
+        // Unlike event publication, closure is retained watch state. Install
+        // it even while receiverless so a later subscriber starts closed.
         let mut modified = false;
         self.signal.modify_silently(|signal| {
             if !signal.closed {
@@ -1551,6 +1575,21 @@ mod tests {
                 Poll::Pending
             ),
             "a failed broadcast send must not pulse the signal watch"
+        );
+    }
+
+    #[test]
+    fn receiverless_lifecycle_lag_is_not_retained() {
+        let hub = LifecycleHub::default();
+        let mut txn = ObservationTxn::detached();
+
+        hub.publish_lagged(&mut txn, 5);
+        drop(txn);
+
+        assert_eq!(
+            hub.signal.read_with(|signal| signal.explicit_lag),
+            0,
+            "lag before any subscription is outside every subscriber's history"
         );
     }
 

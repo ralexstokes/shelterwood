@@ -313,6 +313,23 @@ impl ScopeCell {
         };
         self.publish_snapshot_chain_through_locked(wakes, &ancestors);
 
+        // Sequence minting and snapshot watermarks stay unconditional: the
+        // catch-up protocol uses them across stretches with no subscribers.
+        // When the whole propagation chain is receiverless, retire the raw
+        // kind before its guards after unlock and avoid event construction,
+        // path extension, cloning, and per-hub publication entirely.
+        if !self.observation.lifecycle.has_receivers()
+            && ancestors
+                .iter()
+                .all(|ancestor| !ancestor.observation.lifecycle.has_receivers())
+        {
+            wakes.defer(move || {
+                drop(kind);
+                drop(guards);
+            });
+            return;
+        }
+
         let scope = self.member.membership();
         let mut event = RetainedLifecycleEvent::from_parts(scope, seq, kind, guards);
         self.observation.lifecycle.publish(wakes, event.clone());

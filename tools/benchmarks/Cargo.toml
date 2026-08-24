@@ -13,6 +13,12 @@ publish = false
 name = "core"
 harness = false
 
+[[bench]]
+name = "mailbox"
+harness = false
+
 [dev-dependencies]
-criterion = "=0.8.2"
+criterion = { version = "=0.8.2", features = ["async_tokio"] }
+shelterwood = { path = "../../crates/shelterwood" }
 shelterwood-core = { path = "../../crates/shelterwood-core" }
+tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "time"] }

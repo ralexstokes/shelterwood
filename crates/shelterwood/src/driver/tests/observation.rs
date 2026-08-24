@@ -1179,7 +1179,7 @@ fn plain_parent_state_preserves_nested_snapshot_propagation() {
 }
 
 #[test]
-fn lifecycle_emit_resolves_the_ancestor_chain_once() {
+fn ancestor_only_lifecycle_subscription_receives_forwarded_leaf_events() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
     let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));

@@ -3621,6 +3621,14 @@ Ordering and delivery contract:
   (§16.14's consistent-or-newer guarantee covers every event delivered
   before the snapshot read) — discard it. The same protocol is the
   post-`Lagged` resync. The documentation MUST teach it in this form.
+- Event construction and publication to each scope's lifecycle hub MAY
+  be skipped while that hub has no active subscription. The emitting
+  scope's `LifecycleSeq` mint MUST remain unconditional: a later
+  subscription replays no history, but its first event's sequence still
+  includes the receiverless stretch and every snapshot watermark remains
+  authoritative. Forwarding is gated per hub, so an ancestor subscription
+  still receives descendant events when the descendant itself has no
+  subscriber.
 - `LifecycleSeq` exposes `get()` plus the documented `EXHAUSTED`
   sentinel; `seq`/`lifecycle_seq` mint through §3.1's one primitive:
   `u64`, saturating advance, the saturated value poisoned and never

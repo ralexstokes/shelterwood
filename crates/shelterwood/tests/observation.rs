@@ -117,6 +117,33 @@ async fn admit_waiter(scope: &DynamicScopeRef, id: String) {
         .expect("task is admitted");
 }
 
+#[tokio::test]
+async fn lifecycle_sequence_advances_across_an_unobserved_stretch() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+    let before = scope.as_scope().snapshot().lifecycle_seq;
+    assert!(
+        before.get() > 0,
+        "startup mints lifecycle edges without a subscriber"
+    );
+
+    let mut events = scope.as_scope().subscribe_lifecycle();
+    admit_waiter(&scope, "worker".to_owned()).await;
+    let first = next_event(&mut events).await;
+    assert!(matches!(first.kind, LifecycleEventKind::Added { .. }));
+    assert_eq!(
+        first.seq.get(),
+        before.get() + 1,
+        "the first observed edge follows sequence numbers minted while receiverless"
+    );
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root shuts down");
+}
+
 async fn drain_added_started_ready(events: &mut LifecycleEvents) {
     for expected in ["added", "started", "ready"] {
         let event = next_event(events).await;

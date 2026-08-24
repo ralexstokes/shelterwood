@@ -110,16 +110,15 @@ ring does not saturate: the arms measure the keeping-up-consumer regime, not a
 permanently lagged one. On the current-thread group that consumer is driven by
 the same `block_on` Criterion times, so its cost is attributed; on the
 multi-thread group it runs on another worker and only its wake and contention
-costs are. `none` is not an observer-free baseline for lifecycle work:
-snapshot publication skips a scope with no receivers, but lifecycle emission
-has no such gate — every edge mints retention guards, resolves ancestors,
-mints the sequence, builds the event, clones it per ancestor, takes the hub's
-signal mutex and the broadcast tail lock, and pulses the watch, whether or not
-anyone is subscribed. Only the ring write itself is skipped, and that is the
-channel's own zero-receiver check rather than a Shelterwood gate. The
-`lifecycle` arm's delta over `none` is therefore bounded below by that
-unconditional work and measures only the incremental cost of a subscribed,
-draining consumer — which on a keeping-up consumer is close to zero.
+costs are. `none` is the observation-free publication baseline. Lifecycle
+emission still mints retention guards, resolves ancestors, advances the
+sequence, and keeps on-demand snapshot watermarks authoritative because those
+are unconditional parts of the catch-up contract. When the whole lifecycle
+propagation chain is receiverless, however, it skips event construction, path
+extension, cloning, the signal mutex, the broadcast tail lock, and watch
+pulses. The `lifecycle` arm's delta over `none` therefore measures
+subscriber-dependent event publication plus the cost of its draining
+consumer.
 
 That schedule is **quadratic** in the child count: it settles once per child,
 and every settle rescans the child table — `settle_finish` evaluates

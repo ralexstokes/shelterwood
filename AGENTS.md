@@ -18,11 +18,14 @@ Two types implement the rule and are the shapes to reach for:
 
 - **`ObservationTxn`** (`crates/shelterwood/src/cells/gate.rs`) holds the
   observation-gate guard plus a deferred-effect list. `defer`/`pulse` queue
-  work; `commit` drops the guard *then* runs the queue through a
-  `PanicAccumulator`. Its `Drop` runs the same path during an unwind, so a
-  poisoned transaction cannot strand already-committed wakes. Every retained
-  control-plane writer takes the token, which makes an out-of-transaction
-  mutation unavailable by construction.
+  work; `surrender` queues framework-internal `RetainedExit` raw drops at the
+  front, so they run after unlock but before an ordinary effect can hand their
+  co-owner to concurrent disposal. `commit` drops the guard *then* runs the
+  queue through a `PanicAccumulator`. Its `Drop` runs the same path during an
+  unwind, so a poisoned transaction cannot strand already-committed wakes.
+  Every retained control-plane writer takes the token, which makes both an
+  out-of-transaction mutation and a post-commit surrender unavailable by
+  construction.
 - **`MailboxTxn`** (`crates/shelterwood/src/mailbox/cell.rs`) is the same idea for
   every mutable mailbox transition. It owns the state guard beside a
   `MailboxEffects` sink that collects signal pulses, waker wake/drop actions,
@@ -68,6 +71,15 @@ rests on:
   `reconcile_recorded_outcomes_retaining` and
   `classify_disposal_panic_retaining`; the raw `shelterwood-core` folds hand
   both halves back and are for core's own tests.
+  `RetainedExit::into_user_owned` is deliberately narrower than surrender, and
+  `pub(in crate::cells)` is what keeps it narrow: no driver-layer caller can
+  extract a raw `Exit` from a carrier at all, so a carrier crossing a driver
+  seam stays a carrier. Its two remaining users are
+  `RetainedLifecycleEvent::into_public`, the one genuine hand-off to a
+  user-owned value, and `RetainedStopReason::into_public`, whose two call
+  sites release a framework copy beside an installed co-owner and therefore
+  still rest on the older conventional proof. Every other framework-internal
+  raw refcount drop goes through `ObservationTxn::surrender`.
   `RetainedExitResult` closes the earlier raw-incarnation window: the completed
   callback result stays in that carrier across the fallible teardown epilogue,
   so an epilogue panic transfers a failed result to critical disposal instead

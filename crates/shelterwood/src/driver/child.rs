@@ -234,7 +234,7 @@ impl ChildRuntime {
     pub(super) fn terminalize(
         &mut self,
         root: &ScopeCell,
-        exit: Exit,
+        exit: RetainedExit,
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
@@ -653,14 +653,14 @@ impl ScopeRuntime {
     pub(super) fn terminalize_child(
         &mut self,
         key: ChildKey,
-        exit: Exit,
+        exit: impl Into<RetainedExit>,
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
         // Protect the raw user error before every resource lookup and reducer
         // invariant. A malformed key may still be diagnosed, but it cannot
         // unwind the Exit payload on the driver stack.
-        let mut exit = Some(RetainedExit::new(exit));
+        let mut exit = Some(exit.into());
         // Production terminal publication follows joined construction
         // disposal.  A few structural test/fallback paths synthesize that
         // already-joined boundary directly, so normalize them through the
@@ -676,8 +676,7 @@ impl ScopeRuntime {
             .terminalize(
                 &self.root,
                 exit.take()
-                    .expect("terminal publication consumes its retained exit once")
-                    .into_exit(),
+                    .expect("terminal publication consumes its retained exit once"),
                 exited_incarnation,
                 startup,
             );
@@ -1134,11 +1133,13 @@ impl ScopeRuntime {
                 // would restart the child with neither `Exited` nor
                 // `RestartScheduled` published — see the partial-effect note
                 // on issue #392.
+                let raw_exit = exit.as_exit().clone();
                 let published = self.root.publish_child_restart(
                     &child.slot.member,
                     decision.total_restarts(),
+                    exit,
                     MemberTransition::RestartScheduled {
-                        exit: exit.as_exit().clone(),
+                        exit: raw_exit.clone(),
                         restart_count: decision.restart_count(),
                         // Publish the derived schedule even when intensity prevents spawning it.
                         // `None` means the exact clock point cannot be represented and armed; no
@@ -1149,7 +1150,7 @@ impl ScopeRuntime {
                         id: child.slot.member.id().clone(),
                         membership: child.slot.member.membership(),
                         incarnation,
-                        exit: exit.as_exit().clone(),
+                        exit: raw_exit,
                     },
                     LifecycleEventKind::RestartScheduled {
                         id: child.slot.member.id().clone(),
@@ -1162,10 +1163,6 @@ impl ScopeRuntime {
                     published,
                     "a restart is scheduled from an active incarnation's exit"
                 );
-                // Successful publication installed retained copies in the
-                // member record and lifecycle event. Releasing the local raw
-                // copy is therefore provably refcount traffic.
-                drop(exit.into_exit());
                 let trip = decision.intensity_trip();
                 if trip.is_none()
                     && let Some(restart_at) = decision.restart_at()
@@ -1328,12 +1325,11 @@ impl ScopeRuntime {
         } else {
             StartupDisposition::NotAborted
         };
-        let terminalized = self.terminalize_child(
-            key,
-            exit.as_exit().clone(),
-            terminal.exited_incarnation,
-            startup,
-        );
+        // Hand the publication seam a guarded clone rather than a raw one, so
+        // no window between here and the cell layer's own retention holds the
+        // user error unguarded. The cell layer surrenders its copy inside the
+        // publishing transaction.
+        self.terminalize_child(key, exit.clone(), terminal.exited_incarnation, startup);
         // Keep the marker installed until terminal publication has committed.
         // A concurrent shutdown sampler then sees either pending cleanup or a
         // terminal member, never the gap between those two representations.
@@ -1354,21 +1350,16 @@ impl ScopeRuntime {
                 self.prune_terminal(key);
             }
         }
-        // Both routes above are fallible, so the guard is released once, here.
-        // A winning publication installed an equivalent retained copy in the
-        // terminal member record, which the `member` handle keeps alive past
-        // this statement, so surrendering the raw copy is refcount traffic.
-        //
-        // A losing publication is unreachable today: #458 established that by
-        // whole-workspace enumeration rather than by any local guard, so no
-        // test pins the other branch and a probe for it would be a
-        // strong-count race by construction. It is retained defensively — the
-        // guard simply falls out of scope, and `RetainedExit::drop` retires
-        // the user error through critical disposal at the cost of one extra
-        // blocking-pool job.
-        if terminalized {
-            drop(exit.into_exit());
-        }
+        // Both routes above are fallible, so the guard retires once, here, by
+        // falling out of scope whichever route ran. Issue #455 removed the
+        // escape hatch that let a driver-layer caller surrender a guard on a
+        // conventional co-owner proof, and the driver owns no observation
+        // transaction to surrender into, so `RetainedExit::drop` is the venue:
+        // it retires a failed user error through critical disposal at the cost
+        // of one blocking-pool job. The copy that retires as refcount traffic
+        // is the clone handed to `terminalize_child` above, surrendered inside
+        // the publishing transaction where the terminal member record is its
+        // structural co-owner.
     }
 }
 

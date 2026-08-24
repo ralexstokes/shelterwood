@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use crate::runtime;
+use crate::{cells::ObservationTxn, runtime};
 use shelterwood_core::{
     Exit,
     engine::ScopeState,
@@ -29,7 +29,15 @@ impl RetainedExit {
         self.0.as_ref().expect("retained exit was already taken")
     }
 
-    pub(crate) fn into_exit(mut self) -> Exit {
+    /// Hands the raw exit to a public/user-owned value.
+    ///
+    /// Framework-internal copies must instead go through
+    /// [`ObservationTxn::surrender`], which makes their pre-commit co-owner
+    /// proof structural and releases them only after the observation gate.
+    /// `pub(in crate::cells)` is what keeps that structural: no driver-layer
+    /// caller can reach the raw exit at all, so a framework carrier crossing
+    /// a driver seam has to stay a carrier.
+    pub(super) fn into_user_owned(mut self) -> Exit {
         self.0.take().expect("retained exit was already taken")
     }
 
@@ -63,11 +71,12 @@ impl RetainedExit {
         }
     }
 
-    pub(crate) fn retain_owned(exits: &mut Vec<Self>, exit: Self) {
+    pub(crate) fn retain_owned(exits: &mut Vec<Self>, exit: Self, surrendered: &mut Vec<Self>) {
         if exits.iter().any(|retained| retained == &exit) {
             // An existing retained copy keeps the raw clone alive while it is
-            // released. Avoid submitting a duplicate disposal job.
-            drop(exit.into_exit());
+            // released. Hand the duplicate to the surrounding observation
+            // transaction rather than submitting a duplicate disposal job.
+            surrendered.push(exit);
         } else {
             exits.push(exit);
         }
@@ -81,18 +90,40 @@ impl RetainedExit {
     /// released as refcount traffic, because an equal retained copy — for
     /// `ExitKind::Failed`, equality is `Arc::ptr_eq` — proves the payload
     /// stays owned.
-    pub(super) fn install(guards: &mut Arc<Vec<Self>>, incoming: Vec<Self>) {
+    pub(super) fn install(
+        guards: &mut Arc<Vec<Self>>,
+        incoming: Vec<Self>,
+        surrendered: &mut Vec<Self>,
+    ) {
         if incoming.len() == guards.len()
             && incoming
                 .iter()
                 .all(|incoming| guards.iter().any(|current| current == incoming))
         {
-            for exit in incoming {
-                drop(exit.into_exit());
-            }
+            surrendered.extend(incoming);
             return;
         }
         *guards = Arc::new(incoming);
+    }
+}
+
+impl ObservationTxn<'_> {
+    /// Surrenders framework-internal retained copies as raw refcount traffic.
+    ///
+    /// Accepting the transaction token makes the co-owner proof structural:
+    /// every caller queues the surrender before commit. Surrenders flush first
+    /// after unlock, while record owners still exist and before an ordinary
+    /// deferred effect can hand a queued co-owner to concurrent disposal.
+    pub(crate) fn surrender(&mut self, exits: impl IntoIterator<Item = RetainedExit>) {
+        let exits: Vec<_> = exits.into_iter().collect();
+        if exits.is_empty() {
+            return;
+        }
+        self.defer_surrender(move || {
+            for mut exit in exits {
+                drop(exit.0.take().expect("retained exit was already taken"));
+            }
+        });
     }
 }
 
@@ -250,10 +281,11 @@ pub(crate) fn classify_exit_retaining(
 /// the application error whenever one was recorded, because
 /// `Failed` ranks below `Panicked`.
 pub(crate) fn classify_disposal_panic_retaining(
-    exit: RetainedExit,
+    mut exit: RetainedExit,
     message: Option<String>,
 ) -> RetainedExit {
-    let (selected, discarded) = classify_disposal_panic(exit.into_exit(), message);
+    let exit = exit.0.take().expect("retained exit was already taken");
+    let (selected, discarded) = classify_disposal_panic(exit, message);
     drop(RetainedExit::new(discarded));
     RetainedExit::new(selected)
 }
@@ -291,7 +323,7 @@ impl RetainedStopReason {
             .take()
             .expect("retained stop reason was already taken");
         for exit in std::mem::take(&mut self.retained_exits) {
-            drop(exit.into_exit());
+            drop(exit.into_user_owned());
         }
         reason
     }
@@ -320,7 +352,15 @@ mod tests {
         let mut guards = Arc::new(vec![RetainedExit::new(exit.clone())]);
         let original = Arc::clone(&guards);
 
-        RetainedExit::install(&mut guards, vec![RetainedExit::new(exit.clone())]);
+        let mut txn = ObservationTxn::detached();
+        let mut surrendered = Vec::new();
+        RetainedExit::install(
+            &mut guards,
+            vec![RetainedExit::new(exit.clone())],
+            &mut surrendered,
+        );
+        txn.surrender(surrendered);
+        drop(txn);
 
         assert!(
             Arc::ptr_eq(&guards, &original),
@@ -352,12 +392,15 @@ mod tests {
         ))]);
         let original = Arc::downgrade(&guards);
 
+        let mut surrendered = Vec::new();
         RetainedExit::install(
             &mut guards,
             vec![RetainedExit::new(Exit::completed(
                 Cancellation::NotObserved,
             ))],
+            &mut surrendered,
         );
+        assert!(surrendered.is_empty());
 
         assert!(
             original.upgrade().is_none(),
@@ -394,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_exit_conversion_preserves_the_callers_drop_thread() {
+    fn retained_exit_user_handoff_preserves_the_callers_drop_thread() {
         let caller = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
         let retained = RetainedExit::new(Exit::failed(
@@ -402,7 +445,7 @@ mod tests {
             Cancellation::NotObserved,
         ));
 
-        drop(retained.into_exit());
+        drop(retained.into_user_owned());
 
         assert_eq!(
             observed

@@ -8,6 +8,7 @@ default:
 fmt:
     cargo +nightly fmt --all --check
     cargo +nightly fmt --manifest-path tools/external-consumer/Cargo.toml -- --check
+    cargo +nightly fmt --manifest-path tools/benchmarks/Cargo.toml -- --check
 
 lint:
     cargo +nightly clippy --locked --workspace --all-targets --all-features -- -D warnings
@@ -60,12 +61,25 @@ examples:
 external-consumer-check:
     ./tools/check-external-consumer.sh
 
+# The benchmark package is intentionally outside the production workspace.
+# Compile and lint it explicitly so the harness cannot rot between data runs.
+# The toolchain split is deliberate and mirrored by the flake's
+# `benchmark-check` (nightly) and `benchmark-build` (stable) derivations: lints
+# run on nightly like every other lint lane, and the compile runs on the pinned
+# stable toolchain that `bench` below measures with.
+bench-check:
+    cargo +nightly clippy --locked --manifest-path tools/benchmarks/Cargo.toml --all-targets -- -D warnings
+    cargo bench --locked --manifest-path tools/benchmarks/Cargo.toml --no-run
+
+bench:
+    cargo bench --locked --manifest-path tools/benchmarks/Cargo.toml
+
 nixfmt-check:
     git ls-files -z '*.nix' | xargs -0 nixfmt --check
 
 # Fast local CI mirror — reuses the local cargo cache and incremental builds.
 # The clean Nix lane retains the explicit all-target build for non-test codegen coverage.
-ci: fmt lint lint-default test examples doc-check book runtime-api-check external-consumer-check nixfmt-check
+ci: fmt lint lint-default test examples doc-check book runtime-api-check external-consumer-check bench-check nixfmt-check
 
 # Full clean Nix CI lane; use before pushing or when touching Nix files.
 ci-nix:

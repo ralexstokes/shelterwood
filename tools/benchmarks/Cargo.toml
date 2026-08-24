@@ -1,0 +1,18 @@
+[package]
+name = "shelterwood-benchmarks"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Keep the benchmark harness out of Shelterwood's production workspace. This
+# gives it an independent lockfile and keeps Criterion out of ordinary
+# workspace builds while still allowing an explicit clean compile check.
+[workspace]
+
+[[bench]]
+name = "core"
+harness = false
+
+[dev-dependencies]
+criterion = "=0.8.2"
+shelterwood-core = { path = "../../crates/shelterwood-core" }

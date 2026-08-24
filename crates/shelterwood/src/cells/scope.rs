@@ -1025,6 +1025,7 @@ impl ScopeCell {
         self.finish_incarnation_with_terminal(epoch, RetainedStopReason::new(reason), None);
     }
 
+    #[cfg(test)]
     pub(crate) fn finish_root_incarnation(&self, epoch: Epoch, reason: StopReason, exit: Exit) {
         self.finish_incarnation_with_terminal(
             epoch,

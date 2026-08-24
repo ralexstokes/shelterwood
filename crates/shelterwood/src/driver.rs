@@ -85,6 +85,10 @@ use admission_control::RemovalResponses;
 pub(crate) struct SystemRun {
     pub(crate) root: Arc<ScopeCell>,
     driver: Option<runtime::JoinHandle<RetainedStopReason>>,
+    // Taking the handle starts a cancellation-sensitive join. Keep its
+    // completion separate so dropping a cancelled consuming API still requests
+    // shutdown even though the in-flight future already moved the handle out.
+    driver_joined: bool,
 }
 
 fn resident_projection(slot: &SlotCell) -> ResidentProjection {
@@ -102,9 +106,8 @@ impl SystemRun {
     }
 
     pub(crate) async fn wait(&mut self) -> StopReason {
-        let reason = self.root.wait_stopped().await;
         self.join_driver().await;
-        reason
+        self.root.wait_stopped().await
     }
 
     async fn join_driver(&mut self) {
@@ -119,9 +122,9 @@ impl SystemRun {
         if let Err(exit) =
             classify_retained_root_driver_join(runtime::join_user_polled(driver).await)
         {
-            self.root
-                .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
+            finish_monitored_root(&self.root, StopReason::ShutdownRequested, exit);
         }
+        self.driver_joined = true;
     }
 }
 
@@ -143,7 +146,7 @@ fn classify_retained_root_driver_join(
 
 impl Drop for SystemRun {
     fn drop(&mut self) {
-        if self.driver.is_none() {
+        if self.driver_joined {
             return;
         }
         // After a clean shutdown the root epochs are `Idle`, not `Exhausted`,
@@ -165,6 +168,7 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
     SystemRun {
         root,
         driver: Some(lifecycle),
+        driver_joined: false,
     }
 }
 
@@ -172,15 +176,101 @@ fn monitor_root_driver(
     monitor_root: Arc<ScopeCell>,
     driver: runtime::JoinHandle<RetainedStopReason>,
 ) -> runtime::JoinHandle<RetainedStopReason> {
+    // Constructed before the future so it is an upvar of the `async move`
+    // block rather than a local of its body: an `async` block owns its
+    // captures from creation, so the fence retires even for a monitor task
+    // that is dropped without ever being polled.
+    let mut fence = MonitorFence::armed(monitor_root);
     runtime::spawn(async move {
         match classify_retained_root_driver_join(runtime::join(driver).await) {
-            Ok(reason) => reason,
+            Ok(reason) => {
+                let public_reason = reason.as_reason().clone();
+                let exit = stop_reason_root_exit(&public_reason);
+                fence.publish(public_reason, exit);
+                reason
+            }
             Err(exit) => {
-                monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
+                fence.publish(StopReason::ShutdownRequested, exit);
                 RetainedStopReason::new(StopReason::ShutdownRequested)
             }
         }
     })
+}
+
+/// The monitor body's root-terminality duty, held across the driver join.
+///
+/// Invariant: **the monitor future never completes or is dropped without root
+/// membership terminality having been published.** Since `ScopeRuntime::drop`
+/// deliberately leaves root terminality to this monitor, an unpublished fence
+/// would strand every retained `wait_stopped()` observer forever and leave the
+/// observation streams open — the guard is what makes that unrepresentable.
+///
+/// The only way to reach `drop` still armed is cancellation of the monitor
+/// task itself: dropping the monitor's `JoinHandle` merely detaches, and no
+/// framework path aborts it. Runtime teardown is the reachable case, where
+/// every spawned task future is dropped, polled or not. Cancellation is also why the fallback
+/// verdict is not speculative: the driver's own `JoinHandle` lives inside the
+/// dropped join future, so the driver's real outcome becomes unobservable to
+/// everyone at exactly this moment, and the one join anyone can still observe
+/// — the monitor handle — resolves `Cancelled`. Publishing that outcome's
+/// classification is therefore a statement about the join that did settle, and
+/// it is bit-for-bit the verdict `SystemRun::join_driver`'s self-heal computes
+/// for the same cancellation. Should both run, member terminalization is
+/// first-writer-wins and the record lattice treats an equal verdict as an
+/// idempotent repeat, so neither can outrank or race the other.
+///
+/// Teardown drops the two tasks in an unspecified order, so the fence can
+/// precede the driver's own epilogue and close observation ahead of its final
+/// `Removed` edges. That truncation is confined to a runtime that is going
+/// away underneath its subscribers, and it is strictly the better half of the
+/// trade against an observer that never resolves at all.
+///
+/// Publication goes through [`finish_monitored_root`], which contains any
+/// hostile terminal-wake panic: this `drop` runs in task drop glue on a
+/// teardown thread that may already be unwinding, where a second panic would
+/// abort the process. The cancellation exit owns no user error, so the guard
+/// adds no user-value destruction and no lock site of its own.
+struct MonitorFence {
+    root: Arc<ScopeCell>,
+    armed: bool,
+}
+
+impl MonitorFence {
+    fn armed(root: Arc<ScopeCell>) -> Self {
+        Self { root, armed: true }
+    }
+
+    fn publish(&mut self, reason: StopReason, exit: Exit) {
+        finish_monitored_root(&self.root, reason, exit);
+        self.armed = false;
+    }
+}
+
+impl Drop for MonitorFence {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // A cancelled join never classifies as a completed reason, so the
+        // `Ok` half is unreachable; matching rather than unwrapping keeps a
+        // panic out of drop glue regardless.
+        if let Err(exit) = classify_retained_root_driver_join(runtime::JoinOutcome::Cancelled) {
+            finish_monitored_root(&self.root, StopReason::ShutdownRequested, exit);
+        }
+    }
+}
+
+/// Publishes the join monitor's final root verdict without letting a hostile
+/// terminal observer kill the monitor itself.
+///
+/// The driver is already joined, so exit classification cannot change after
+/// this boundary. A panic from the terminal wake flush is consequently only a
+/// diagnostic; discard it rather than replacing a classified completion with
+/// a second monitor failure that could strand the root's finality fence.
+fn finish_monitored_root(root: &ScopeCell, reason: StopReason, exit: Exit) {
+    runtime::discard_panic(
+        runtime::catch_panic(|| root.finish_live_root_incarnation(reason, exit)).err(),
+    );
 }
 
 struct AncestorCommandLatches {
@@ -360,7 +450,6 @@ impl<T> IndexMut<ChildKey> for ChildResources<T> {
 
 struct ScopeCompletion {
     reason: RetainedStopReason,
-    root_exit: Option<RetainedExit>,
 }
 
 /// Runs the synchronous fail-closed scope epilogue.
@@ -454,14 +543,12 @@ impl Drop for ScopeRuntime {
             .map(|completion| completion.reason.as_reason().clone())
             .or_else(|| self.supervisor.lifecycle().draining_reason().cloned())
             .unwrap_or(StopReason::ShutdownRequested);
-        panics.run(|| {
-            if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
-                self.root
-                    .finish_root_incarnation(self.epoch, reason, exit.into_exit());
-            } else {
-                self.root.finish_incarnation(self.epoch, reason);
-            }
-        });
+        // Root membership terminality is join-gated: the monitor owns it on
+        // both successful and failed driver joins. The scope epilogue only
+        // retires this incarnation and publishes its stopped projection, just
+        // as it already does while unwinding. That keeps `wait_stopped` behind
+        // the last point at which the join can change the final verdict.
+        panics.run(|| self.root.finish_incarnation(self.epoch, reason));
     }
 }
 
@@ -1150,13 +1237,8 @@ async fn wait_for_scope_wake(
             // receiver and any queued admission response wakers outside
             // ScopeRuntime's contained epilogue.
             let reason = StopReason::ShutdownRequested;
-            let root_exit = scope
-                .role
-                .is_root()
-                .then(|| RetainedExit::new(stop_reason_root_exit(&reason)));
             scope.completion = Some(ScopeCompletion {
                 reason: RetainedStopReason::new(reason.clone()),
-                root_exit,
             });
             return Some(reason);
         }
@@ -1453,16 +1535,12 @@ async fn run_scope_incarnation(
         // until the recomputation above establishes that order.
         scope.publish_startup_removals();
         if let Some(reason) = scope.finished.take() {
-            let root_exit = scope
-                .role
-                .is_root()
-                .then(|| RetainedExit::new(stop_reason_root_exit(&reason)));
             // ScopeRuntime's synchronous epilogue clears dynamic state,
             // discharges child obligations and residency, and only then
-            // publishes the scope's terminal state.
+            // publishes the stopped projection. For the root, the join
+            // monitor owns the later membership-terminal fence.
             scope.completion = Some(ScopeCompletion {
                 reason: RetainedStopReason::new(reason.clone()),
-                root_exit,
             });
             return reason;
         }

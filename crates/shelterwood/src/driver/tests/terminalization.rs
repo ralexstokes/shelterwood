@@ -73,6 +73,196 @@ enum TerminalStopPath {
 }
 
 #[crate::runtime::test]
+async fn successful_root_monitor_publishes_membership_terminality() {
+    let scope = isolated_scope("root", ScopeFlavor::Ordered);
+    let epoch = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    scope.finish_incarnation(epoch, StopReason::Finished);
+    assert!(
+        !matches!(scope.member.record().stage, MemberStage::Terminal(_)),
+        "the scope epilogue leaves root membership live until its join"
+    );
+
+    let driver = crate::runtime::spawn(async {
+        crate::cells::RetainedStopReason::new(StopReason::Finished)
+    });
+    let monitor = monitor_root_driver(Arc::clone(&scope), driver);
+    let joined = crate::runtime::join(monitor).await;
+
+    assert!(matches!(
+        joined,
+        crate::runtime::JoinOutcome::Ok { ref value }
+            if value.as_reason() == &StopReason::Finished
+    ));
+    assert!(matches!(
+        scope.member.record().stage,
+        MemberStage::Terminal(ref exit) if matches!(exit.kind(), ExitKind::Completed)
+    ));
+    assert_eq!(scope.wait_stopped().await, StopReason::Finished);
+}
+
+#[crate::runtime::test]
+async fn root_monitor_contains_a_terminal_wake_panic() {
+    const PANIC: &str = "hostile root terminal wake";
+
+    let scope = isolated_scope("root", ScopeFlavor::Ordered);
+    let epoch = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    scope.finish_incarnation(epoch, StopReason::Finished);
+
+    let mut stopped = Box::pin(scope.wait_stopped());
+    let hostile = Waker::from(Arc::new(PanicWake(PANIC)));
+    assert!(
+        stopped
+            .as_mut()
+            .poll(&mut Context::from_waker(&hostile))
+            .is_pending(),
+        "the hostile observer parks behind membership terminality"
+    );
+
+    let driver = crate::runtime::spawn(async {
+        crate::cells::RetainedStopReason::new(StopReason::Finished)
+    });
+    let monitor = monitor_root_driver(Arc::clone(&scope), driver);
+    let joined = crate::runtime::join(monitor).await;
+
+    assert!(matches!(
+        joined,
+        crate::runtime::JoinOutcome::Ok { ref value }
+            if value.as_reason() == &StopReason::Finished
+    ));
+    assert!(matches!(
+        stopped
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(StopReason::Finished)
+    ));
+}
+
+#[crate::runtime::test]
+async fn panicked_root_monitor_publishes_its_exit_despite_a_terminal_wake_panic() {
+    const DRIVER_PANIC: &str = "panicked root driver";
+    const WAKE_PANIC: &str = "hostile root terminal wake";
+
+    let scope = isolated_scope("root", ScopeFlavor::Ordered);
+    let epoch = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    scope.finish_incarnation(epoch, StopReason::Finished);
+
+    let mut stopped = Box::pin(scope.wait_stopped());
+    let hostile = Waker::from(Arc::new(PanicWake(WAKE_PANIC)));
+    assert!(
+        stopped
+            .as_mut()
+            .poll(&mut Context::from_waker(&hostile))
+            .is_pending(),
+        "the hostile observer parks behind membership terminality"
+    );
+
+    let driver = crate::runtime::spawn(async {
+        panic!("{DRIVER_PANIC}");
+        #[allow(unreachable_code)]
+        crate::cells::RetainedStopReason::new(StopReason::Finished)
+    });
+    let monitor = monitor_root_driver(Arc::clone(&scope), driver);
+    let joined = crate::runtime::join(monitor).await;
+
+    assert!(matches!(
+        joined,
+        crate::runtime::JoinOutcome::Ok { ref value }
+            if value.as_reason() == &StopReason::ShutdownRequested
+    ));
+    assert!(matches!(
+        scope.member.record().stage,
+        MemberStage::Terminal(ref exit)
+            if matches!(
+                exit.kind(),
+                ExitKind::Panicked { message: Some(message) } if message == DRIVER_PANIC
+            ) && exit.cancellation() == Cancellation::NotObserved
+    ));
+    assert!(matches!(
+        stopped
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(StopReason::ShutdownRequested)
+    ));
+}
+
+/// A cancelled monitor is the runtime-teardown venue: every spawned task
+/// future is dropped mid-await, so neither join arm runs. The monitor body's
+/// fence guard must still publish root terminality, or a retained
+/// `wait_stopped()` observer would park forever behind a membership that the
+/// deliberately terminality-free driver epilogue never terminalizes.
+#[crate::runtime::test]
+async fn cancelled_root_monitor_publishes_membership_terminality() {
+    let scope = isolated_scope("root", ScopeFlavor::Ordered);
+    let epoch = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    scope.finish_incarnation(epoch, StopReason::Finished);
+    assert!(
+        !matches!(scope.member.record().stage, MemberStage::Terminal(_)),
+        "the scope epilogue leaves root membership live until its join"
+    );
+
+    let driver = crate::runtime::spawn(future::pending::<crate::cells::RetainedStopReason>());
+    let monitor = monitor_root_driver(Arc::clone(&scope), driver);
+    // Let the monitor reach its parked driver join before cancelling, so the
+    // guard is exercised at the mid-await venue rather than before first poll.
+    crate::runtime::yield_now().await;
+    monitor.abort_handle().abort();
+
+    // `Cancelled` is reported only after the task future -- and with it the
+    // fence -- has been dropped, so the publication is already complete here.
+    assert!(matches!(
+        crate::runtime::join(monitor).await,
+        crate::runtime::JoinOutcome::Cancelled
+    ));
+    assert!(
+        matches!(
+            scope.member.record().stage,
+            MemberStage::Terminal(ref exit)
+                if matches!(
+                    exit.kind(),
+                    ExitKind::Aborted {
+                        phase: GracePhase::WithinGrace
+                    }
+                ) && exit.cancellation() == Cancellation::Observed
+        ),
+        "the fence publishes the cancelled join's own classification"
+    );
+    assert_eq!(scope.wait_stopped().await, StopReason::ShutdownRequested);
+}
+
+/// The same duty holds for a monitor task dropped before its first poll: the
+/// fence is an upvar of the `async move` block, not a local of its body.
+#[crate::runtime::test]
+async fn unpolled_root_monitor_publishes_membership_terminality() {
+    let scope = isolated_scope("root", ScopeFlavor::Ordered);
+    let epoch = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    scope.finish_incarnation(epoch, StopReason::Finished);
+
+    let driver = crate::runtime::spawn(future::pending::<crate::cells::RetainedStopReason>());
+    let monitor = monitor_root_driver(Arc::clone(&scope), driver);
+    monitor.abort_handle().abort();
+
+    assert!(matches!(
+        crate::runtime::join(monitor).await,
+        crate::runtime::JoinOutcome::Cancelled
+    ));
+    assert!(matches!(
+        scope.member.record().stage,
+        MemberStage::Terminal(_)
+    ));
+    assert_eq!(scope.wait_stopped().await, StopReason::ShutdownRequested);
+}
+
+#[crate::runtime::test]
 async fn terminal_stop_paths_share_one_complete_observation_transition() {
     for (path, reason) in [
         (TerminalStopPath::LiveEpoch, StopReason::ShutdownRequested),

@@ -43,6 +43,7 @@ async fn system_run_wait_proxies_a_pending_driver_join_caller_waker() {
     let mut run = super::super::SystemRun {
         root,
         driver: Some(driver),
+        driver_joined: false,
     };
     let mut wait = Box::pin(run.wait());
     let (hostile, state) = hostile_waker();
@@ -60,6 +61,36 @@ async fn system_run_wait_proxies_a_pending_driver_join_caller_waker() {
         wait.as_mut().poll(&mut Context::from_waker(&hostile)),
         Poll::Ready(StopReason::NeverStarted)
     ));
+}
+
+#[crate::runtime::test]
+async fn system_run_wait_reloads_after_self_healing_a_cancelled_monitor() {
+    let root = isolated_scope("root", ScopeFlavor::Ordered);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.finish_root_incarnation(
+        epoch,
+        StopReason::Finished,
+        Exit::completed(Cancellation::NotObserved),
+    );
+
+    let driver = crate::runtime::spawn(future::pending::<RetainedStopReason>());
+    driver.abort_handle().abort();
+    let mut run = super::super::SystemRun {
+        root: Arc::clone(&root),
+        driver: Some(driver),
+        driver_joined: false,
+    };
+
+    assert_eq!(run.wait().await, StopReason::ShutdownRequested);
+    assert_eq!(
+        root.record().state,
+        ScopeState::Stopped {
+            reason: StopReason::ShutdownRequested
+        },
+        "wait reloads the record after its join fallback upgrades the verdict"
+    );
 }
 
 /// `SystemRun::shutdown` is the exact join seam reached by both public
@@ -82,6 +113,7 @@ async fn system_run_shutdown_proxies_a_pending_driver_join_caller_waker() {
     let mut run = super::super::SystemRun {
         root,
         driver: Some(driver),
+        driver_joined: false,
     };
     let mut shutdown = Box::pin(run.shutdown(crate::DeadlineBudget::ZERO));
     let (hostile, state) = hostile_waker();

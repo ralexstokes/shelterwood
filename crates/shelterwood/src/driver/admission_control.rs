@@ -2,7 +2,7 @@
 
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     sync::{Arc, Mutex, Weak},
 };
 
@@ -202,6 +202,21 @@ impl DynamicState {
         _txn: &mut ObservationTxn<'_>,
     ) -> Option<DynamicEntry> {
         self.entries.insert(id, entry)
+    }
+
+    pub(super) fn insert_vacant(
+        &mut self,
+        id: ChildId,
+        entry: DynamicEntry,
+        _txn: &mut ObservationTxn<'_>,
+    ) -> Result<(), DynamicEntry> {
+        match self.entries.entry(id) {
+            Entry::Vacant(slot) => {
+                slot.insert(entry);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(entry),
+        }
     }
 
     pub(super) fn remove(

@@ -170,8 +170,9 @@ rests on:
   root gate while calling `admit_child_locked`, but the reserved member was
   already adopted onto that root gate and the root cannot be re-homed while
   its dynamic route is live, so the handoff check short-circuits without a
-  second gate acquisition. Changing either publication or re-homing invariant
-  requires re-deriving this exception.
+  second gate acquisition. `AdmissionInstall` debug-asserts that identity when
+  it takes ownership, before either guard is acquired. Changing either
+  publication or re-homing invariant requires re-deriving this exception.
   `WakerProxy`'s mutex (`crates/shelterwood-core/src/waker_proxy.rs`) sits at the
   other end of that order: it is a **leaf**. `wake_by_ref` acquires it from
   whatever thread drives the external primitive — the timer driver, a sender,

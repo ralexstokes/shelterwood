@@ -9,7 +9,6 @@ mod startup;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    mem::ManuallyDrop,
     ops::{Index, IndexMut},
     sync::{Arc, OnceLock},
     time::Instant,
@@ -105,14 +104,18 @@ fn resident_projection(slot: &SlotCell) -> ResidentProjection {
 /// runs after both control-plane guards have gone: it retires the projection
 /// through detached disposal and completes the caller's response fail-closed.
 ///
-/// `request` is manual so that deleting this destructor cannot silently fall
-/// back through `AdmissionRequest`'s field drop. The ledger, rather than field
-/// order, is the structural owner of the lost-response contract.
+/// The ledger is the *primary* owner of the lost-response contract, not the
+/// only one: `request` stays a plain `Option<AdmissionRequest>` so its own
+/// `Obligation` still discharges the caller's promise on any path this
+/// destructor fails to cover, as SPEC §15.5 requires of every cross-task
+/// promise. Field order below is the Drop body's order, so even the bare
+/// fallback keeps terminality ahead of the removal completion and both ahead
+/// of the response.
 struct AdmissionInstall {
-    request: Option<ManuallyDrop<AdmissionRequest>>,
     projection: Option<ResidentProjection>,
     child: Option<Box<ChildRuntime>>,
     entry: Option<DynamicEntry>,
+    request: Option<AdmissionRequest>,
     key: Option<ChildKey>,
     entry_promoted: bool,
     entry_installed: bool,
@@ -127,7 +130,7 @@ impl AdmissionInstall {
         );
         Self {
             projection: Some(resident_projection(&request.slot)),
-            request: Some(ManuallyDrop::new(request)),
+            request: Some(request),
             child: Some(Box::new(child)),
             entry: None,
             key: None,
@@ -139,22 +142,20 @@ impl AdmissionInstall {
 
     fn request(&self) -> &AdmissionRequest {
         self.request
-            .as_deref()
+            .as_ref()
             .expect("an unfinished admission install owns its request")
     }
 
     fn request_mut(&mut self) -> &mut AdmissionRequest {
         self.request
-            .as_deref_mut()
+            .as_mut()
             .expect("an unfinished admission install owns its request")
     }
 
     fn take_request(&mut self) -> AdmissionRequest {
-        ManuallyDrop::into_inner(
-            self.request
-                .take()
-                .expect("an admission install releases its request once"),
-        )
+        self.request
+            .take()
+            .expect("an admission install releases its request once")
     }
 
     fn slot(&self) -> &Arc<SlotCell> {
@@ -296,8 +297,7 @@ impl Drop for AdmissionInstall {
         if let Some(entry) = self.entry.take() {
             panics.run(move || drop(entry));
         }
-        if let Some(request) = self.request.take() {
-            let mut request = ManuallyDrop::into_inner(request);
+        if let Some(mut request) = self.request.take() {
             panics.run(|| request.complete_lost());
             panics.run(move || drop(request));
         }

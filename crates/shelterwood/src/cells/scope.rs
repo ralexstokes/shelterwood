@@ -1076,23 +1076,35 @@ impl ScopeCell {
         published
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_incarnation(&self, state: ScopeState) -> Option<Epoch> {
+        let mut epoch = None;
+        self.begin_incarnation_into(state, &mut epoch);
+        epoch
+    }
+
+    /// Installs epoch ownership before publishing startup. The caller keeps
+    /// its owning guard outside this call so its destructor runs after the
+    /// observation transaction releases the gate, including on a wake panic.
+    pub(crate) fn begin_incarnation_into(&self, state: ScopeState, owned: &mut Option<Epoch>) {
+        assert!(owned.is_none(), "a scope epoch owner begins empty");
         assert!(
             matches!(state, ScopeState::Starting),
             "a fresh incarnation publishes its lifecycle machine's initial state"
         );
-        let (epoch, projection_idle) = self.with_observation_gate(|wakes| {
+        let projection_idle = self.with_observation_gate(|wakes| {
             let projection_idle = matches!(
                 self.record().state,
                 ScopeState::Unstarted | ScopeState::Stopped { .. }
             );
             if !projection_idle {
-                return (None, false);
+                return false;
             }
             let mut control = self.control.lock().expect("scope control mutex poisoned");
             let Some(epoch) = control.epochs.begin() else {
-                return (None, true);
+                return true;
             };
+            *owned = Some(epoch);
             // The idle epoch plane pairs only with a settled projection:
             // `Unstarted` before any mint, `Stopped` after every finish. That
             // pairing is what lets `settled` treat terminal membership
@@ -1113,13 +1125,12 @@ impl ScopeCell {
             wakes.pulse(&self.observation.record);
             wakes.pulse(&self.member.record);
             self.emit_locked(wakes, LifecycleEventKind::ScopeState { state });
-            (Some(epoch), true)
+            true
         });
         assert!(
             projection_idle,
             "an idle scope projection is Unstarted or Stopped before a fresh incarnation mints"
         );
-        epoch
     }
 
     pub(crate) fn finish_incarnation(&self, epoch: Epoch, reason: StopReason) {
@@ -1406,7 +1417,7 @@ impl ScopeCell {
     /// scope runtime exists, the scope runtime itself afterwards — and both
     /// finish it from `Drop`, so an unsettled target always has a pending
     /// finisher. Second, an idle epoch plane implies a settled projection:
-    /// `begin_incarnation` is the only mint and it publishes `Starting`
+    /// `begin_incarnation_into` is the only mint and it publishes `Starting`
     /// under the control guard,
     /// while [`Self::finish_incarnation`] always publishes `Stopped` under
     /// that same guard, so `ScopeEpochs::Idle`/`Exhausted` can only pair with

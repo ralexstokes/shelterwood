@@ -4,8 +4,8 @@ use std::{error::Error, fmt, sync::mpsc, thread::ThreadId, time::Duration};
 
 use crate::common::next_exit_of;
 use shelterwood::{
-    Actor, ActorOnceDef, Context, ExitError, ExitKind, ExitResult, RawActor, RawContext,
-    RawOnceDef, StopReason, Tree,
+    Actor, ActorOnceDef, Context, ExitError, ExitKind, ExitResult, Guard, Handler, RawActor,
+    RawContext, RawOnceDef, Shutdown, StopReason, Tree,
 };
 
 const ACTOR_DROP_PANIC: &str = "injected actor-state destructor panic";
@@ -165,4 +165,134 @@ async fn handler_error_is_retained_while_the_teardown_panic_unwinds() {
     ));
     assert_eq!(system.wait().await, StopReason::Finished);
     assert_disposed_off_the_teardown_thread(&teardown, &observed);
+}
+
+struct ErrorDuringCleanup<const INIT: bool> {
+    release: Option<mpsc::Receiver<()>>,
+    guard: Option<tokio::sync::oneshot::Sender<Guard>>,
+    error_dropped: ThreadProbe,
+}
+
+impl<const INIT: bool> ErrorDuringCleanup<INIT> {
+    async fn fail(&mut self, context: &mut Context<'_, Self>) -> ExitError {
+        let release = self.release.take().expect("offload starts once");
+        let (started, running) = tokio::sync::oneshot::channel();
+        let guard = context
+            .offload_scoped(
+                async move {
+                    // Notify from outside the executor: waking the actor from
+                    // this worker could put it in Tokio's unstealable LIFO slot
+                    // immediately before this deliberately blocked poll.
+                    std::thread::spawn(move || started.send(()).expect("actor awaits start"))
+                        .join()
+                        .expect("start notifier returns");
+                    release
+                        .recv_timeout(PROBE_WAIT)
+                        .expect("test releases the blocked offload");
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("live callback accepts offload");
+        running
+            .await
+            .expect("offload is polling before callback fails");
+        self.guard
+            .take()
+            .expect("guard is exported once")
+            .send(guard)
+            .expect("test receives completion guard");
+        ExitError::from(HostileError(self.error_dropped.clone()))
+    }
+}
+
+impl<const INIT: bool> Actor for ErrorDuringCleanup<INIT> {
+    type Msg = ();
+    type Args = Self;
+
+    async fn init(mut args: Self, context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        if INIT {
+            Err(args.fail(context).await)
+        } else {
+            Ok(args)
+        }
+    }
+
+    async fn handle(&mut self, (): (), context: &mut Context<'_, Self>) -> ExitResult {
+        Err(self.fail(context).await)
+    }
+}
+
+/// The root raw value survives even an initializer failure, so its destructor
+/// witnesses the cancellation thread in both callback paths.
+struct CleanupProbe<const INIT: bool> {
+    handler: Handler<ErrorDuringCleanup<INIT>>,
+    teardown: ThreadProbe,
+}
+
+impl<const INIT: bool> RawActor for CleanupProbe<INIT> {
+    type Msg = ();
+
+    async fn run(&mut self, context: &mut RawContext<()>) -> ExitResult {
+        self.handler.run(context).await
+    }
+}
+
+impl<const INIT: bool> Drop for CleanupProbe<INIT> {
+    fn drop(&mut self) {
+        let _ = self.teardown.send(std::thread::current().id());
+    }
+}
+
+async fn assert_callback_error_is_retained_during_cancelled_cleanup<const INIT: bool>() {
+    let (release, blocked) = mpsc::channel();
+    let (guard, completion) = tokio::sync::oneshot::channel();
+    let (dropped, disposal) = mpsc::sync_channel(1);
+    let (torn_down, teardown) = mpsc::sync_channel(1);
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "cleanup",
+            RawOnceDef::new(CleanupProbe {
+                handler: Handler::new(ErrorDuringCleanup::<INIT> {
+                    release: Some(blocked),
+                    guard: Some(guard),
+                    error_dropped: dropped,
+                }),
+                teardown: torn_down,
+            })
+            .shutdown(Shutdown::Abort),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    if !INIT {
+        actor.send(()).await.expect("handler trigger is accepted");
+    }
+    let guard = tokio::time::timeout(PROBE_WAIT, completion)
+        .await
+        .expect("callback starts offload")
+        .expect("callback exports guard");
+    tokio::time::timeout(PROBE_WAIT, guard.finished())
+        .await
+        .expect("error cleanup freezes resources");
+    // Work is still inside its poll. Finished proves that error cleanup has
+    // requested cancellation; its join cannot finish until we release work.
+    system
+        .shutdown(Duration::from_secs(2))
+        .await
+        .expect("hard abort completes despite the pending resource join");
+    release
+        .send(())
+        .expect("offload remains blocked until release");
+    assert_disposed_off_the_teardown_thread(&teardown, &disposal);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn initializer_error_is_retained_when_cleanup_is_hard_aborted() {
+    assert_callback_error_is_retained_during_cancelled_cleanup::<true>().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handler_error_is_retained_when_cleanup_is_hard_aborted() {
+    assert_callback_error_is_retained_during_cancelled_cleanup::<false>().await;
 }

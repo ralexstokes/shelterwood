@@ -8,7 +8,8 @@ use crate::{
     ActorRef, Blocking, ChildId, DeadlineBudget, DeadlineElapsed, ExitError, ExitResult, Guard,
     Incarnation, Mailbox, MailboxShutdown, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
     ReadinessDeadline, Rejected, RestartPolicy, Retention, ScopeRef, Shutdown,
-    cells::CancellationToken, policy::CommonOptions,
+    cells::{CancellationToken, RetainedExitResult},
+    policy::CommonOptions,
 };
 
 /// Callback-oriented actor contract.
@@ -753,9 +754,13 @@ async fn fail_after_teardown<M: Send + 'static>(
     raw: &mut RawContext<M>,
     error: ExitError,
 ) -> ExitResult {
+    // A hard abort can cancel the resource join before the outer raw runner
+    // receives this result. Keep its application error on the retained
+    // disposal path throughout that earlier cleanup window too.
+    let result = RetainedExitResult::new(Err(error));
     raw.freeze_resources();
     raw.join_resources().await;
-    Err(error)
+    result.into_result()
 }
 
 type ArgsFactory<A> = Box<dyn Fn() -> <A as Actor>::Args + Send + Sync + 'static>;

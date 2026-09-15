@@ -24,6 +24,71 @@ use shelterwood::{
 };
 
 #[tokio::test]
+async fn panicking_initial_scope_observer_cannot_strand_nested_terminality() {
+    use std::{
+        future::Future,
+        task::{Context, Wake, Waker},
+    };
+
+    struct PanicWake;
+    impl Wake for PanicWake {
+        fn wake(self: Arc<Self>) {
+            panic!("injected initial scope observer panic");
+        }
+    }
+
+    for one_shot in [true, false] {
+        let mut root = Tree::new();
+        let nested = if one_shot {
+            root.add_subtree_once("nested", SubtreeOnceDef::new(Tree::new()))
+        } else {
+            root.add_subtree(
+                "nested",
+                SubtreeDef::factory(Tree::new).restart(RestartPolicy::new(
+                    RestartCondition::Never,
+                    Backoff::Immediate,
+                )),
+            )
+        }
+        .expect("valid subtree");
+        let mut events = nested.subscribe_lifecycle();
+        let mut next = Box::pin(events.recv());
+        let waker = Waker::from(Arc::new(PanicWake));
+        assert!(
+            next.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        let system = root.spawn().expect("runtime is available");
+        let startup = tokio::time::timeout(POLL_TIMEOUT, system.wait_started())
+            .await
+            .expect("the parent classifies the observer panic");
+        assert!(matches!(startup, Err(StartupError::StartupFailed(failure))
+            if matches!(&failure.cause, StartupFailureCause::Child { exit, .. }
+                if matches!(exit.kind(), ExitKind::Panicked { .. }))));
+        drop(next);
+
+        assert_eq!(
+            tokio::time::timeout(POLL_TIMEOUT, nested.wait_stopped())
+                .await
+                .expect("startup publication cannot orphan the nested epoch"),
+            StopReason::ShutdownRequested,
+        );
+        assert!(matches!(
+            nested.snapshot().state,
+            shelterwood::ScopeState::Stopped { .. }
+        ));
+        while events.try_recv().is_ok() {}
+        assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
+        system
+            .shutdown(Duration::ZERO)
+            .await
+            .expect("root shuts down");
+    }
+}
+
+#[tokio::test]
 async fn static_subtree_slot_preserves_its_handle_through_definition_and_spawn() {
     let mut nested = Tree::new();
     nested

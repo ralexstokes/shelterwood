@@ -1184,14 +1184,17 @@ fn close_never_started_scope_body(scope: Arc<ScopeCell>) {
 
 impl ScopeEpochGuard {
     fn begin(scope: &Arc<ScopeCell>) -> Option<Self> {
-        let lifecycle = ScopeLifecycle::starting();
-        let epoch = scope.begin_incarnation(lifecycle.state())?;
-        Some(Self {
+        // Own the epoch before startup publication can wake user observers.
+        // The cell fills this slot while its transaction is held; on panic,
+        // that transaction unlocks before this outer guard runs its epilogue.
+        let mut guard = Self {
             scope: Arc::clone(scope),
-            epoch: Some(epoch),
-            lifecycle,
+            epoch: None,
+            lifecycle: ScopeLifecycle::starting(),
             retained_exits: Vec::new(),
-        })
+        };
+        scope.begin_incarnation_into(guard.lifecycle.state(), &mut guard.epoch);
+        guard.epoch.map(|_| guard)
     }
 
     fn lifecycle(&self) -> ScopeLifecycle {

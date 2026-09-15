@@ -431,7 +431,7 @@ impl BuilderCore {
         self.armed = false;
         Ok(ScopePlan {
             root,
-            config: self.config.clone(),
+            intensity: self.config.intensity,
             defaults,
             children,
             terminality: Some(ScopePlanTerminality),
@@ -463,7 +463,7 @@ impl Drop for BuilderCore {
 /// Fully lowered scope plan whose construction payloads still have one owner.
 pub(crate) struct ScopePlan {
     pub(crate) root: Arc<ScopeCell>,
-    config: ScopeConfig,
+    intensity: Intensity,
     pub(crate) defaults: ResolvedDefaults,
     pub(crate) children: Vec<ChildPlan>,
     terminality: Option<ScopePlanTerminality>,
@@ -473,7 +473,7 @@ struct ScopePlanTerminality;
 
 impl ScopePlan {
     pub(crate) fn intensity_policy(&self) -> Intensity {
-        self.config.intensity
+        self.intensity
     }
 }
 

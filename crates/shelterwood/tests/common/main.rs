@@ -108,9 +108,9 @@ async fn eventual_assertion_context_is_evaluated_only_on_failure() {
     assert!(!evaluated.get());
 }
 
-/// The integration-side raw-waker probe is a hand-written vtable restated from
-/// the crate-internal twin, and every fixture built on it -- `hostile_waker`
-/// above all -- is consumed by abort-class regressions that assert only that
+/// The raw-waker probe is shared with internal tests, and every fixture built
+/// on it -- `hostile_waker` above all -- is consumed by abort-class regressions
+/// that assert only that
 /// the process survives. A probe that silently stopped invoking its callbacks
 /// would therefore leave those suites passing with nothing injected. These
 /// pins are what makes that drift loud.

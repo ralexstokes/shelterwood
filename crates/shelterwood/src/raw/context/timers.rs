@@ -151,6 +151,7 @@ impl<M> TimerStore<M> {
         arming_order
     }
 
+    #[cfg(test)]
     fn take<K>(&mut self, key: &K) -> Option<TimerEntry<M>>
     where
         K: Hash + Eq + 'static,
@@ -183,11 +184,8 @@ impl<M> TimerStore<M> {
     where
         K: Hash + Eq + 'static,
     {
-        let Some(entry) = self.take(key) else {
-            return false;
-        };
-        self.dispose_entry(entry);
-        true
+        let hash = self.hash_key(key);
+        self.remove_hashed(hash, key)
     }
 
     fn remove_hashed<K>(&mut self, hash: KeyHash, key: &K) -> bool

@@ -44,19 +44,9 @@ runtime-api-check:
 book:
     mdbook build book
 
-# Examples are smoke tests: each ends in assertions and a nonzero exit fails
-# the recipe. Keep the list in sync with crates/shelterwood/examples/ and the
-# flake's examples-run check.
+# Examples are asserting smoke tests. The runner also serves the clean Nix check.
 examples:
-    cargo run --locked -p shelterwood --example quickstart
-    cargo run --locked -p shelterwood --example request_reply
-    cargo run --locked -p shelterwood --example supervision_restart
-    cargo run --locked -p shelterwood --example ordered_startup
-    cargo run --locked -p shelterwood --example dynamic_scope
-    cargo run --locked -p shelterwood --example graceful_shutdown
-    cargo run --locked -p shelterwood --example observation
-    cargo run --locked -p shelterwood --example cyclic_wiring
-    cargo run --locked -p shelterwood --example embedding
+    ./tools/run-examples.sh
 
 external-consumer-check:
     ./tools/check-external-consumer.sh

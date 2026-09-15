@@ -72,7 +72,7 @@ pub(crate) struct ObservationTxn<'a> {
     #[cfg(debug_assertions)]
     gate: Option<&'a ObservationGate>,
     effects: Vec<Box<dyn FnOnce()>>,
-    surrender_effects: usize,
+    surrender_effects: Vec<Box<dyn FnOnce()>>,
     snapshots: Vec<SnapshotPublication>,
 }
 
@@ -85,7 +85,7 @@ impl<'a> ObservationTxn<'a> {
             #[cfg(debug_assertions)]
             gate: Some(gate),
             effects: Vec::new(),
-            surrender_effects: 0,
+            surrender_effects: Vec::new(),
             snapshots: Vec::new(),
         }
     }
@@ -97,7 +97,7 @@ impl<'a> ObservationTxn<'a> {
             #[cfg(debug_assertions)]
             gate: None,
             effects: Vec::new(),
-            surrender_effects: 0,
+            surrender_effects: Vec::new(),
             snapshots: Vec::new(),
         }
     }
@@ -128,9 +128,7 @@ impl<'a> ObservationTxn<'a> {
     /// the front is load-bearing: a later ordinary effect may hand the
     /// surrender's co-owner to a concurrent disposal worker.
     pub(super) fn defer_surrender(&mut self, operation: impl FnOnce() + 'static) {
-        self.effects
-            .insert(self.surrender_effects, Box::new(operation));
-        self.surrender_effects += 1;
+        self.surrender_effects.push(Box::new(operation));
     }
 
     /// Defers a watch-channel wake. The driver reaches its own senders
@@ -184,12 +182,15 @@ impl<'a> ObservationTxn<'a> {
             self.effects.push(Box::new(move || drop(publication)));
         }
         drop(self.guard.take());
-        for effect in self.effects.drain(..) {
+        for effect in self
+            .surrender_effects
+            .drain(..)
+            .chain(self.effects.drain(..))
+        {
             // One hostile waker must not prevent the remaining committed
             // observation edges from notifying their waiters.
             panics.run(effect);
         }
-        self.surrender_effects = 0;
     }
 }
 
@@ -392,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn observation_txn_unwind_drains_panicking_surrender_prefix_after_unlock() {
+    fn observation_txn_unwind_drains_surrenders_before_ordinary_effects_after_unlock() {
         let gate = ObservationGate::new();
         let observed = Arc::new(Mutex::new(Vec::new()));
         let payload = catch_unwind(AssertUnwindSafe({
@@ -437,7 +438,7 @@ mod tests {
         assert_eq!(
             *observed.lock().expect("probe mutex remains healthy"),
             [(1, false), (2, false), (3, false)],
-            "surrender effects stay ahead of the ordinary suffix, all run after unlock, and a \
+            "surrender effects stay ahead of ordinary effects, all run after unlock, and a \
              hostile surrender cannot strand later effects during unwind"
         );
     }

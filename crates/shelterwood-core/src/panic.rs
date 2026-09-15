@@ -52,11 +52,6 @@ pub fn keep_first_panic(first: &mut Option<PanicPayload>, candidate: Option<Pani
 
 /// Resumes the primary panic, or the cleanup panic when there is no primary.
 /// During an existing unwind both are contained to prevent a double panic.
-///
-/// Containment is only correct where losing the diagnostic is the lesser
-/// outcome, which is true in a destructor and false on a normal return path.
-/// Callers that own the sole surviving copy of an authoritative panic must use
-/// [`resume_preferred_panic_outside_unwind`] instead.
 pub fn resume_preferred_panic(panics: UnwindPanics) {
     let UnwindPanics { primary, cleanup } = panics;
     if std::thread::panicking() {
@@ -68,19 +63,6 @@ pub fn resume_preferred_panic(panics: UnwindPanics) {
     } else if let Some(payload) = cleanup {
         resume_panic(payload);
     }
-}
-
-/// Resumes exactly as [`resume_preferred_panic`] on its ordinary non-unwinding
-/// call path.
-///
-/// This is the variant for call sites that are not destructors and have
-/// already taken sole ownership of the panic. Silently discarding there would
-/// erase the authoritative diagnostic and let the caller continue past a
-/// failure it believes it re-raised. A defensive unwinding call is nonetheless
-/// contained: asserting that precondition would itself be a double panic and
-/// could abort before either opaque payload was safely retired.
-pub fn resume_preferred_panic_outside_unwind(panics: UnwindPanics) {
-    resume_preferred_panic(panics);
 }
 
 /// Collects independent cleanup panics while allowing every cleanup step to
@@ -127,7 +109,7 @@ mod tests {
 
     use super::{
         PanicAccumulator, PanicPayload, UnwindPanics, discard_panic, keep_first_panic,
-        resume_preferred_panic, resume_preferred_panic_outside_unwind,
+        resume_preferred_panic,
     };
 
     fn panic_message(payload: &PanicPayload) -> Option<&str> {
@@ -163,20 +145,6 @@ mod tests {
         cleanup_drops: Arc<AtomicUsize>,
     }
 
-    struct OutsideResumeDuringUnwind {
-        primary_drops: Arc<AtomicUsize>,
-        cleanup_drops: Arc<AtomicUsize>,
-    }
-
-    impl Drop for OutsideResumeDuringUnwind {
-        fn drop(&mut self) {
-            resume_preferred_panic_outside_unwind(UnwindPanics {
-                primary: Some(Box::new(DropCount(Arc::clone(&self.primary_drops)))),
-                cleanup: Some(Box::new(DropCount(Arc::clone(&self.cleanup_drops)))),
-            });
-        }
-    }
-
     impl Drop for ResumeDuringUnwind {
         fn drop(&mut self) {
             resume_preferred_panic(UnwindPanics {
@@ -209,43 +177,9 @@ mod tests {
     }
 
     #[test]
-    fn outside_unwind_variant_defensively_contains_a_reentrant_unwind() {
-        let primary_drops = Arc::new(AtomicUsize::new(0));
-        let cleanup_drops = Arc::new(AtomicUsize::new(0));
-        let payload = catch_unwind(AssertUnwindSafe({
-            let primary_drops = Arc::clone(&primary_drops);
-            let cleanup_drops = Arc::clone(&cleanup_drops);
-            move || {
-                let _resume = OutsideResumeDuringUnwind {
-                    primary_drops,
-                    cleanup_drops,
-                };
-                std::panic::panic_any("outer panic");
-            }
-        }))
-        .expect_err("the original unwind reaches its boundary");
-
-        assert_eq!(payload.downcast_ref::<&str>(), Some(&"outer panic"));
-        assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
-        assert_eq!(cleanup_drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn primary_panic_takes_precedence_over_cleanup_outside_an_unwind() {
-        let payload = catch_unwind(AssertUnwindSafe(|| {
-            resume_preferred_panic(UnwindPanics {
-                primary: Some(Box::new("primary panic")),
-                cleanup: Some(Box::new("cleanup panic")),
-            });
-        }))
-        .expect_err("the primary panic is resumed");
-        assert_eq!(panic_message(&payload), Some("primary panic"));
-    }
-
-    #[test]
-    fn outside_unwind_resumption_preserves_primary_and_cleanup_precedence() {
+    fn resumption_preserves_primary_and_cleanup_precedence() {
         let primary = catch_unwind(AssertUnwindSafe(|| {
-            resume_preferred_panic_outside_unwind(UnwindPanics {
+            resume_preferred_panic(UnwindPanics {
                 primary: Some(Box::new("primary panic")),
                 cleanup: Some(Box::new("cleanup panic")),
             });
@@ -254,7 +188,7 @@ mod tests {
         assert_eq!(panic_message(&primary), Some("primary panic"));
 
         let cleanup = catch_unwind(AssertUnwindSafe(|| {
-            resume_preferred_panic_outside_unwind(UnwindPanics {
+            resume_preferred_panic(UnwindPanics {
                 primary: None,
                 cleanup: Some(Box::new("cleanup panic")),
             });
@@ -262,7 +196,7 @@ mod tests {
         .expect_err("cleanup stands in when there is no primary panic");
         assert_eq!(panic_message(&cleanup), Some("cleanup panic"));
 
-        resume_preferred_panic_outside_unwind(UnwindPanics {
+        resume_preferred_panic(UnwindPanics {
             primary: None,
             cleanup: None,
         });

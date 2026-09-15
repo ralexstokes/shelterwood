@@ -49,7 +49,6 @@ fi
 # complete. The trailing backtick keeps prefixes distinct (e.g.
 # `MailboxSignal` vs `MailboxSignalWatcher`).
 for seam in \
-    ActorIdentity \
     DynamicRoute \
     ErasedOneShotClose \
     ErasedOneShotReceiver \

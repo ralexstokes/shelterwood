@@ -10,9 +10,9 @@ wakers, destructors, message drops — ever runs under a mailbox mutex.
 ## The handle
 
 `ActorRef<M>` (`crates/shelterwood/src/mailbox/futures.rs`) is the only
-send surface. It holds exactly two `Arc`s: a `dyn ActorIdentity` (the
-restart-stable membership identity, implemented by `MemberCell`) and the
-`MailboxCell<M>` itself. Equality and hashing go by membership, which is
+send surface. It holds exactly two `Arc`s: the restart-stable
+`MemberCell` and the `MailboxCell<M>` itself. Equality and hashing use
+the member cell pointer, which is
 why a handle keeps working across restarts: it addresses the slot, not
 the incarnation. Handles are minted only through the crate-private
 `actor_ref_from_parts` seam — at declaration time in `tree/slots.rs`,

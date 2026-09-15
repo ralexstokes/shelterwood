@@ -12,10 +12,7 @@ use std::{
 };
 
 use crate::{
-    mailbox::{
-        ActorIdentity, ActorRef, ChildId, Incarnation, MailboxControl, MailboxReceiver,
-        SendErrorKind,
-    },
+    mailbox::{ActorRef, ChildId, Incarnation, MailboxControl, MailboxReceiver, SendErrorKind},
     policy::{ResolvedDefaults, ResolvedMailbox},
     test_support::{mint_actor_incarnation, mint_actor_membership},
 };
@@ -290,30 +287,14 @@ impl Drop for ReentrantPanicDrop {
     }
 }
 
-struct TestIdentity {
-    id: ChildId,
-    membership: crate::Membership,
-}
-
-impl ActorIdentity for TestIdentity {
-    fn id(&self) -> &ChildId {
-        &self.id
-    }
-
-    fn membership(&self) -> crate::Membership {
-        self.membership
-    }
-}
-
 pub(crate) fn actor_for_with_runtime<M: Send + 'static>(
     runtime: Arc<dyn crate::mailbox::MailboxRuntime>,
 ) -> (Arc<MailboxCell<M>>, ActorRef<M>) {
     let id = ChildId::from("actor");
-    let (membership, _) = mint_actor_membership();
-    let member = Arc::new(TestIdentity {
-        id: id.clone(),
-        membership,
-    });
+    let identity = crate::identity::ScopeIdentity::new()
+        .mint_membership(&id)
+        .expect("test membership is available");
+    let member = crate::cells::MemberCell::new(identity);
     let mailbox = MailboxCell::new(id, runtime);
     (
         Arc::clone(&mailbox),

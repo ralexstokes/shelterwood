@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    mailbox::{ActorIdentity, MailboxControl, MailboxTermination},
+    mailbox::{MailboxControl, MailboxTermination},
     runtime,
 };
 use shelterwood_core::{
@@ -194,16 +194,6 @@ pub(crate) struct MemberCell {
     // fixture shape — so a missing value surfaces there as an internal
     // admission-order bug.
     options: OnceLock<ResolvedCommonOptions>,
-}
-
-impl ActorIdentity for MemberCell {
-    fn id(&self) -> &ChildId {
-        self.id()
-    }
-
-    fn membership(&self) -> Membership {
-        self.membership()
-    }
 }
 
 #[derive(Default)]

@@ -726,24 +726,6 @@ impl<T> DisposingReceiver<T> {
             Poll::is_pending,
         )
     }
-
-    /// Staged parity with the mailbox receiver's timeout arbitration: no
-    /// production path closes a runtime `DisposingReceiver` today. It matters
-    /// to the venue split anyway, because a receiver-initiated close is the
-    /// one ready edge no sender wake precedes — the proxy can still hold an
-    /// installed caller clone when inline retirement runs, which every
-    /// sender-side completion consumes through the wake first. The
-    /// ready-edge containment test below is that path's pin.
-    pub fn close_and_poll_receive(&mut self, context: &mut Context<'_>) -> OneShotClose<T> {
-        self.caller_poll.poll(
-            self.inner
-                .as_mut()
-                .expect("a live disposing receiver retains its channel"),
-            context,
-            OneShotReceiver::close_and_poll_receive,
-            |result| matches!(result, OneShotClose::Pending),
-        )
-    }
 }
 
 impl<T> Drop for DisposingReceiver<T> {
@@ -1538,37 +1520,6 @@ mod tests {
             destructor_name.as_deref(),
             Some(DISPOSAL_THREAD),
             "drop glue must not destroy a caller waker on the holder's thread"
-        );
-    }
-
-    #[test]
-    fn receiver_close_ready_edge_contains_the_installed_caller_waker() {
-        let closing_thread = std::thread::current().id();
-        let (_sender, receiver) = oneshot::<u8>();
-        let mut receiver = DisposingReceiver::new(receiver);
-        let (dropped, observed_drop) = mpsc::channel();
-        let caller = ManuallyDrop::new(record_panicking_drop_waker(dropped));
-
-        assert!(matches!(
-            receiver.poll_receive(&mut Context::from_waker(&caller)),
-            Poll::Pending
-        ));
-        // A receiver-initiated close reaches the ready edge with the caller
-        // clone still installed: no sender wake preceded it to consume the
-        // slot. Retirement must destroy that hostile clone synchronously on
-        // this thread and contain its panic so the close outcome is handed
-        // back intact.
-        assert!(matches!(
-            receiver.close_and_poll_receive(&mut Context::from_waker(&caller)),
-            OneShotClose::Empty
-        ));
-
-        let (destructor_thread, _destructor_name) = observed_drop
-            .recv_timeout(Duration::from_secs(1))
-            .expect("the ready edge retires the installed caller clone");
-        assert_eq!(
-            destructor_thread, closing_thread,
-            "ready-path retirement is synchronous on the closing thread"
         );
     }
 

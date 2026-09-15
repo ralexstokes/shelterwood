@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    future::{Future, poll_fn},
+    future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -9,7 +9,7 @@ use std::{
 use crate::{
     cells::{RemoveOutcome, ReserveError},
     driver::DynamicReservation,
-    runtime::Latch,
+    runtime::{DisposingReceiver, Latch},
 };
 
 #[cfg(test)]
@@ -38,7 +38,7 @@ pub struct Admission<H> {
     state: AdmissionState<H>,
 }
 
-type AdmissionWait = Pin<Box<dyn Future<Output = Result<(), ReserveError>> + Send + 'static>>;
+type AdmissionWait = DisposingReceiver<Result<(), ReserveError>>;
 
 struct PendingAdmission<H> {
     reservation: DynamicReservation,
@@ -53,19 +53,7 @@ impl<H> PendingAdmission<H> {
             Arc::clone(&self.reservation.slot),
             self.fused_cancel.clone(),
         )?;
-        let mut response = crate::runtime::DisposingReceiver::new(response);
-        Ok(Box::pin(async move {
-            poll_fn(|context| response.poll_receive(context))
-                .await
-                .unwrap_or_else(|| {
-                    // The driver's admission `Obligation` publishes an outcome on
-                    // every path, including its drop fallback. Treat a missing
-                    // response as the scope having gone terminal so a caller is
-                    // never stranded, but fail loudly: silence here would mask
-                    // an obligation regression.
-                    panic!("admission response obligation must complete");
-                })
-        }))
+        Ok(DisposingReceiver::new(response))
     }
 
     fn cancel_reservation(&self) {
@@ -187,8 +175,9 @@ impl<H> Future for Admission<H> {
                     };
                     this.state = AdmissionState::InFlight { pending, wait };
                 }
-                AdmissionState::InFlight { wait, .. } => match wait.as_mut().poll(context) {
+                AdmissionState::InFlight { wait, .. } => match wait.poll_receive(context) {
                     Poll::Ready(result) => {
+                        let result = result.expect("admission response obligation must complete");
                         let previous = std::mem::replace(&mut this.state, AdmissionState::Done);
                         let AdmissionState::InFlight { pending, .. } = previous else {
                             unreachable!("the matched admission state was replaced in place")
@@ -232,7 +221,7 @@ impl<H> Drop for Admission<H> {
 /// condition callers can encounter or handle.
 #[must_use]
 pub struct Removal {
-    inner: Pin<Box<dyn Future<Output = RemoveOutcome> + Send + 'static>>,
+    inner: DisposingReceiver<RemoveOutcome>,
 }
 
 impl fmt::Debug for Removal {
@@ -243,20 +232,8 @@ impl fmt::Debug for Removal {
 
 impl Removal {
     pub(super) fn new(response: crate::driver::RemovalResponse) -> Self {
-        let mut response = crate::runtime::DisposingReceiver::new(response);
         Self {
-            inner: Box::pin(async move {
-                poll_fn(|context| response.poll_receive(context))
-                    .await
-                    .unwrap_or_else(|| {
-                        // The driver's removal `Obligation` publishes `Removed`
-                        // on every destruction path. A missing response therefore
-                        // means the terminal route vanished after removal latched:
-                        // preserve the removal goal, but flag the invariant break
-                        // just as admission does above.
-                        panic!("removal response obligation must complete");
-                    })
-            }),
+            inner: DisposingReceiver::new(response),
         }
     }
 }
@@ -265,7 +242,9 @@ impl Future for Removal {
     type Output = RemoveOutcome;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        self.inner.as_mut().poll(context)
+        self.inner
+            .poll_receive(context)
+            .map(|result| result.expect("removal response obligation must complete"))
     }
 }
 

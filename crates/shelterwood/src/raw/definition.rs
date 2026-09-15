@@ -13,7 +13,6 @@ use crate::{
     runtime::{
         CompletionGatedLatch, Isolated, Latch, PanicAccumulator, PanicPayload, UnwindPanics,
         catch_panic, keep_first_panic, resume_preferred_panic,
-        resume_preferred_panic_outside_unwind,
     },
     scope::ScopeRef,
 };
@@ -286,11 +285,11 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
             keep_first_panic(&mut cleanup_panic, actor_drop);
             // Once actor execution has panicked, teardown is secondary: never
             // replace the actor's original diagnostic. This is the incarnation
-            // body's normal return path, so the resume must be unconditional:
-            // containing the primary payload here would strand `result` at
+            // body's normal return path, so the helper resumes the panic:
+            // discarding the primary payload here would strand `result` at
             // `None` and report the actor's panic as the framework expect
             // below.
-            resume_preferred_panic_outside_unwind(UnwindPanics {
+            resume_preferred_panic(UnwindPanics {
                 primary: owner.take_primary_panic(),
                 cleanup: cleanup_panic,
             });

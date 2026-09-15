@@ -80,16 +80,7 @@ pub fn resume_preferred_panic(panics: UnwindPanics) {
 /// contained: asserting that precondition would itself be a double panic and
 /// could abort before either opaque payload was safely retired.
 pub fn resume_preferred_panic_outside_unwind(panics: UnwindPanics) {
-    if std::thread::panicking() {
-        return resume_preferred_panic(panics);
-    }
-    let UnwindPanics { primary, cleanup } = panics;
-    if let Some(payload) = primary {
-        discard_panic(cleanup);
-        resume_panic(payload);
-    } else if let Some(payload) = cleanup {
-        resume_panic(payload);
-    }
+    resume_preferred_panic(panics);
 }
 
 /// Collects independent cleanup panics while allowing every cleanup step to

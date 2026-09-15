@@ -429,18 +429,13 @@ impl MemberCell {
         mut report_capture: impl FnMut(),
         operation: impl FnOnce(&mut ObservationTxn<'_>) -> R,
     ) -> R {
-        let mut operation = Some(operation);
         loop {
             let gate = self.current_observation_gate();
             report_capture();
             let guard = gate.lock();
             if gate.shares_gate(&self.current_observation_gate()) {
                 let mut txn = ObservationTxn::new(&gate, guard);
-                return operation
-                    .take()
-                    .expect("member observation operation runs exactly once")(
-                    &mut txn
-                );
+                return operation(&mut txn);
             }
             drop(guard);
         }
@@ -526,24 +521,15 @@ impl MemberCell {
         mut report_capture: impl FnMut(),
         attempt: impl FnOnce(&ObservationGate) -> bool,
     ) -> bool {
-        let mut attempt = Some(attempt);
         loop {
             let current = self.current_observation_gate();
             if current.shares_gate(gate) {
-                return attempt
-                    .take()
-                    .expect("an observation gate handoff attempt runs exactly once")(
-                    &current
-                );
+                return attempt(&current);
             }
             report_capture();
             let current_guard = current.lock();
             if current.shares_gate(&self.current_observation_gate()) {
-                let accepted = attempt
-                    .take()
-                    .expect("an observation gate handoff attempt runs exactly once")(
-                    &current
-                );
+                let accepted = attempt(&current);
                 drop(current_guard);
                 return accepted;
             }

@@ -634,8 +634,7 @@ impl<M: Send + 'static> RawContext<M> {
     /// from the next [`recv`](Self::recv)/[`try_recv`](Self::try_recv) or
     /// from the epilogue.
     pub fn stop(&mut self) {
-        self.receiver.freeze();
-        self.freeze_resources();
+        self.freeze_intake();
         self.local_stop.fire();
     }
 
@@ -650,8 +649,7 @@ impl<M: Send + 'static> RawContext<M> {
         // Record the request before cleanup so an unwind from cleanup still
         // publishes it through the initializer context's Drop fallback.
         self.deferred_init_stop = true;
-        self.receiver.freeze();
-        self.freeze_resources();
+        self.freeze_intake();
     }
 
     /// Closes the callback initializer boundary. Consuming the pending bit
@@ -674,7 +672,7 @@ impl<M: Send + 'static> RawContext<M> {
 
     /// Queues an actor-local continuation ahead of external input.
     pub fn continue_with(&mut self, message: M) -> Result<(), Rejected<M>> {
-        if self.is_stopping() || !self.resources.accepting {
+        if self.rejects_new_work() {
             return Err(Rejected::new(message));
         }
         self.resources.continuations.push_back(message);
@@ -691,7 +689,7 @@ impl<M: Send + 'static> RawContext<M> {
     where
         K: Hash + Eq + Send + 'static,
     {
-        if self.is_stopping() || !self.resources.accepting {
+        if self.rejects_new_work() {
             return Err(Rejected::new((key, message)));
         }
         self.replace_timer(key, TimerMessage::Once(message), after);
@@ -709,7 +707,7 @@ impl<M: Send + 'static> RawContext<M> {
         K: Hash + Eq + Send + 'static,
         M: Clone,
     {
-        if self.is_stopping() || !self.resources.accepting {
+        if self.rejects_new_work() {
             return Err(Rejected::new((key, message)));
         }
         if period.is_zero() {
@@ -858,8 +856,7 @@ impl<M: Send + 'static> RawContext<M> {
     pub async fn recv(&mut self) -> Option<M> {
         loop {
             if self.local_stop.is_fired() {
-                self.receiver.freeze();
-                self.freeze_resources();
+                self.freeze_intake();
                 // `stop()` originates on this task, but the configured
                 // shutdown ladder is owned by the driver. The driver's helper
                 // only observes the local-stop latch and forwards
@@ -875,8 +872,7 @@ impl<M: Send + 'static> RawContext<M> {
                 // Freeze locally as part of observing shutdown. The driver
                 // also freezes before cancellation, but correctness of this
                 // receive boundary does not depend on that remote ordering.
-                self.receiver.freeze();
-                self.freeze_resources();
+                self.freeze_intake();
                 self.resources.resume_pending_panic();
                 return None;
             }
@@ -924,8 +920,7 @@ impl<M: Send + 'static> RawContext<M> {
             // Establish the receive boundary locally just as `recv` does. Do
             // not rely on the driver's mailbox-freeze ordering relative to
             // the shutdown latch this call observes.
-            self.receiver.freeze();
-            self.freeze_resources();
+            self.freeze_intake();
             self.resources.resume_pending_panic();
             self.receiver.try_recv()
         } else {
@@ -953,7 +948,7 @@ impl<M: Send + 'static> RawContext<M> {
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> M + Send + 'static,
     {
-        if self.is_stopping() || !self.resources.accepting {
+        if self.rejects_new_work() {
             return Err(Rejected::new((work, continuation)));
         }
         let work = Contained::new(work, self.resources.disposal.clone());
@@ -1287,6 +1282,15 @@ impl<M: Send + 'static> RawContext<M> {
         } else {
             let _ = event.await;
         }
+    }
+
+    fn freeze_intake(&mut self) {
+        self.receiver.freeze();
+        self.freeze_resources();
+    }
+
+    fn rejects_new_work(&self) -> bool {
+        self.is_stopping() || !self.resources.accepting
     }
 
     /// Freezes incarnation resources on the exit path, discarding §6.2's

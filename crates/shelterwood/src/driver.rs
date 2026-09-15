@@ -989,6 +989,23 @@ impl ScopeRuntime {
         });
     }
 
+    fn reject_reserved_admission(
+        &self,
+        request: AdmissionRequest,
+        control: &DynamicControl,
+        cause: NotAdmittingCause,
+    ) {
+        let (definition, removed) = self.root.with_observation_gate(|txn| {
+            cancel_dynamic_reservation_parts(&self.root, control, &request.slot, txn)
+        });
+        reject_admission_after_disposal(
+            request,
+            definition,
+            removed,
+            ReserveError::NotAdmitting(cause),
+        );
+    }
+
     fn handle_admission(&mut self, mut request: AdmissionRequest) {
         let Some(control) = request.control.upgrade() else {
             request.complete(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
@@ -1009,41 +1026,23 @@ impl ScopeRuntime {
             None
         };
         if let Some(cause) = not_admitting {
-            let (definition, removed) = self.root.with_observation_gate(|txn| {
-                cancel_dynamic_reservation_parts(&self.root, &control, &request.slot, txn)
-            });
-            reject_admission_after_disposal(
-                request,
-                definition,
-                removed,
-                ReserveError::NotAdmitting(cause),
-            );
+            self.reject_reserved_admission(request, &control, cause);
             return;
         }
         if request.fused_cancel.as_ref().is_some_and(Latch::is_fired) {
-            let (definition, removed) = self.root.with_observation_gate(|txn| {
-                cancel_dynamic_reservation_parts(&self.root, &control, &request.slot, txn)
-            });
-            reject_admission_after_disposal(
-                request,
-                definition,
-                removed,
-                ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
-            );
+            self.reject_reserved_admission(request, &control, NotAdmittingCause::ReservationEnded);
             return;
         }
 
         let (definition, resolved) = match request.slot.resolve_and_take_defined(&self.defaults) {
             Some(claimed) => claimed,
             None => {
-                let (_, removed) = self.root.with_observation_gate(|txn| {
-                    cancel_dynamic_reservation_parts(&self.root, &control, &request.slot, txn)
-                });
-                reject_admission_after_disposal(
+                // An admission request follows definition. A lost claim leaves
+                // the slot Lowered, so cancellation cannot recover a new definition.
+                self.reject_reserved_admission(
                     request,
-                    None,
-                    removed,
-                    ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
+                    &control,
+                    NotAdmittingCause::ReservationEnded,
                 );
                 return;
             }

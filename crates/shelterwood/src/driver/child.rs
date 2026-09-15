@@ -318,6 +318,19 @@ struct SpawnDispatch {
     construction_spent: bool,
 }
 
+impl SpawnDispatch {
+    fn new(body: SpawnBody, construction_spent: bool) -> Self {
+        Self {
+            body: if construction_spent {
+                PendingSpawnBody::one_shot(body)
+            } else {
+                PendingSpawnBody::restartable(body)
+            },
+            construction_spent,
+        }
+    }
+}
+
 /// Latches have deliberately separate ownership:
 ///
 /// - `shutdown`/`abort` are the child-facing cooperative ladder;
@@ -437,14 +450,7 @@ fn dispatch_child_construction(
                 },
                 readiness: child.options.readiness,
             };
-            SpawnDispatch {
-                body: if construction_spent {
-                    PendingSpawnBody::one_shot(body)
-                } else {
-                    PendingSpawnBody::restartable(body)
-                },
-                construction_spent,
-            }
+            SpawnDispatch::new(body, construction_spent)
         }
         ChildConstruction::Task(definition) => {
             let context = TaskContext::new(id, incarnation, latches.task_context());
@@ -467,14 +473,7 @@ fn dispatch_child_construction(
                     true,
                 )
             };
-            SpawnDispatch {
-                body: if construction_spent {
-                    PendingSpawnBody::one_shot(body)
-                } else {
-                    PendingSpawnBody::restartable(body)
-                },
-                construction_spent,
-            }
+            SpawnDispatch::new(body, construction_spent)
         }
         ChildConstruction::Scope(definition) => {
             let inherited = match definition.defaults {
@@ -513,14 +512,7 @@ fn dispatch_child_construction(
                     true,
                 )
             };
-            SpawnDispatch {
-                body: if construction_spent {
-                    PendingSpawnBody::one_shot(body)
-                } else {
-                    PendingSpawnBody::restartable(body)
-                },
-                construction_spent,
-            }
+            SpawnDispatch::new(body, construction_spent)
         }
     }
 }

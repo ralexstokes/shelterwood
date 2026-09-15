@@ -17,7 +17,7 @@ use crate::{
     mailbox::{AcceptedSequence, MailboxCell, MailboxReceiver},
     runtime::{
         self, CompletionGatedLatch, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher,
-        UnwindPanics, catch_panic, resume_preferred_panic_outside_unwind,
+        UnwindPanics, catch_panic, resume_preferred_panic,
     },
     scope::ScopeRef,
 };
@@ -447,7 +447,7 @@ impl<M> RawResources<M> {
         // Reached from the actor's own receive path, never from cleanup. The
         // take is destructive, so containment here would drop the retained
         // offload diagnostic and let the loop keep running.
-        resume_preferred_panic_outside_unwind(UnwindPanics {
+        resume_preferred_panic(UnwindPanics {
             primary: self.disposal.panic.take(),
             cleanup: None,
         });
@@ -1337,8 +1337,7 @@ mod tests {
         },
         policy::{ResolvedDefaults, ScopeFlavor},
         runtime::{
-            CompletionGatedLatch, Latch, PanicPayload, Signal, UnwindPanics,
-            resume_preferred_panic, resume_preferred_panic_outside_unwind,
+            CompletionGatedLatch, Latch, PanicPayload, Signal, UnwindPanics, resume_preferred_panic,
         },
         scope::ScopeRef,
     };
@@ -1432,7 +1431,7 @@ mod tests {
     #[test]
     fn the_incarnation_return_path_resumes_a_primary_panic_it_solely_owns() {
         let payload = catch_unwind(AssertUnwindSafe(|| {
-            resume_preferred_panic_outside_unwind(UnwindPanics {
+            resume_preferred_panic(UnwindPanics {
                 primary: Some(Box::new("primary actor panic")),
                 cleanup: None,
             });
@@ -1441,7 +1440,7 @@ mod tests {
         assert_eq!(panic_message(&payload), Some("primary actor panic"));
 
         let payload = catch_unwind(AssertUnwindSafe(|| {
-            resume_preferred_panic_outside_unwind(UnwindPanics {
+            resume_preferred_panic(UnwindPanics {
                 primary: None,
                 cleanup: Some(Box::new("cleanup panic")),
             });
@@ -1449,7 +1448,7 @@ mod tests {
         .expect_err("cleanup stands in when there is no primary panic");
         assert_eq!(panic_message(&payload), Some("cleanup panic"));
 
-        resume_preferred_panic_outside_unwind(UnwindPanics {
+        resume_preferred_panic(UnwindPanics {
             primary: None,
             cleanup: None,
         });

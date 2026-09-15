@@ -10,7 +10,7 @@ use std::{
 use shelterwood_core::DeadlineBudget;
 
 use crate::mailbox::{
-    ActorIdentity, ChildId, Incarnation, MailboxRuntime, Membership, capability::DisposingReceiver,
+    ChildId, Incarnation, MailboxRuntime, Membership, capability::DisposingReceiver,
 };
 
 use super::{
@@ -115,7 +115,7 @@ impl<T: Send + 'static> Future for ReplyReceive<T> {
 /// # }
 /// ```
 pub struct ActorRef<M> {
-    member: Arc<dyn ActorIdentity>,
+    member: Arc<crate::cells::MemberCell>,
     mailbox: Arc<MailboxCell<M>>,
 }
 
@@ -143,13 +143,10 @@ impl<M> ActorRef<M> {
 /// This crate-private seam is not a supported constructor. The identity and
 /// mailbox must belong to the same member; violating that invariant produces
 /// a handle whose equality and error identity disagree with its route.
-pub(crate) fn actor_ref_from_parts<I, M>(
-    member: Arc<I>,
+pub(crate) fn actor_ref_from_parts<M>(
+    member: Arc<crate::cells::MemberCell>,
     mailbox: Arc<MailboxCell<M>>,
-) -> ActorRef<M>
-where
-    I: ActorIdentity + 'static,
-{
+) -> ActorRef<M> {
     ActorRef { member, mailbox }
 }
 

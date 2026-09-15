@@ -199,14 +199,3 @@ pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
         effects: &mut dyn MailboxEffectSink,
     ) -> Option<Box<dyn MailboxTermination>>;
 }
-
-/// Restart-stable identity capability retained by an actor handle.
-///
-/// # Implementation boundary
-///
-/// This trait is implemented only by Shelterwood's restart-stable member cell
-/// and is not a user extension point.
-pub(crate) trait ActorIdentity: Send + Sync {
-    fn id(&self) -> &ChildId;
-    fn membership(&self) -> Membership;
-}

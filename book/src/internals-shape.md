@@ -104,7 +104,7 @@ shell:
   (`ActorRef<M>` and its futures); the module root declares the
   crate-private control traits a `MemberCell` uses to drive a mailbox it
   cannot name generically (`MailboxControl`, `MailboxTermination`,
-  `ActorIdentity`, and friends).
+  and `MailboxEffectSink`).
 - **`raw/`** — loop-owning raw actors (L2's execution half): the
   `RawActor` trait, the per-incarnation `RawContext<M>` with its keyed
   timers, offloads, and panic containment.

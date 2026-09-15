@@ -118,33 +118,11 @@ pub async fn timeout<F>(duration: Duration, future: F) -> Timeout<F::Output>
 where
     F: Future,
 {
-    // tokio's timeout only falls back to its internal far future when the
-    // deadline addition overflows outright; a representable deadline flush
-    // against the clock limit would still panic at arming. Route the
-    // budget through Deadline so an unarmable timeout never elapses,
-    // matching the runtime's absolute-deadline overflow semantics.
+    // An unarmable budget never elapses, matching absolute-deadline
+    // overflow semantics. A due deadline needs no timer arming.
     let Some(deadline) = deadline(duration).instant() else {
         return Timeout::Completed(future.await);
     };
-    // Deadline's zero-budget carve-out keeps an exact zero budget
-    // representable even when its clock value is too close to Instant's
-    // ceiling for the timer to arm safely. Handing that instant to tokio's
-    // timeout would still arm it — the tick conversion rounds the deadline
-    // up with a panicking add — so apply the carve-out's own due-check here
-    // instead of arming: the budget is already due, and exact-boundary
-    // arbitration gives an immediately ready operation its one poll before
-    // the elapse. Every other zero budget stays on tokio's timeout below,
-    // keeping the normal regime's semantics untouched.
-    if duration.is_zero() && Deadline::at(deadline).instant().is_none() {
-        tokio::pin!(future);
-        return std::future::poll_fn(|context| {
-            std::task::Poll::Ready(match future.as_mut().poll(context) {
-                std::task::Poll::Ready(value) => Timeout::Completed(value),
-                std::task::Poll::Pending => Timeout::Elapsed,
-            })
-        })
-        .await;
-    }
     timeout_at(deadline, future).await
 }
 #[cfg(test)]

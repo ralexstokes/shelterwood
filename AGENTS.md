@@ -18,9 +18,9 @@ Two types implement the rule and are the shapes to reach for:
 
 - **`ObservationTxn`** (`crates/shelterwood/src/cells/gate.rs`) holds the
   observation-gate guard plus a deferred-effect list. `defer`/`pulse` queue
-  work; `surrender` queues framework-internal `RetainedExit` raw drops at the
-  front, so they run after unlock but before an ordinary effect can hand their
-  co-owner to concurrent disposal. `commit` drops the guard *then* runs the
+  work; `surrender` queues framework-internal `RetainedExit` raw drops in a
+  separate priority queue, so they run after unlock but before an ordinary
+  effect can hand their co-owner to concurrent disposal. `commit` drops the guard *then* runs the
   queue through a `PanicAccumulator`. Its `Drop` runs the same path during an
   unwind, so a poisoned transaction cannot strand already-committed wakes.
   Every retained control-plane writer takes the token, which makes both an
@@ -102,7 +102,7 @@ rests on:
   nested residency and on `ScopeCell`'s own drop glue, which is what SPEC §5.5
   asks of this lane.
 - **Framework `dyn` seams.** `MailboxControl`, `MailboxTermination`,
-  `MailboxEffectSink`, `ActorIdentity` and `DynamicRoute` are `pub(crate)`
+  `MailboxEffectSink` and `DynamicRoute` are `pub(crate)`
   implementation seams inside the façade, not user traits. Their only
   implementations are framework-owned, and a foreign implementation is
   unrepresentable. `MailboxRuntime` and the sub-capabilities it mints —
@@ -126,7 +126,7 @@ rests on:
   observation gate and `MemberCell::mailbox`. It and `MailboxEffectQueue` are
   now crate-private, so an unsupported direct dependent can neither construct
   a sink nor supply its own. The same construction-held boundary covers
-  `MailboxControl`, `MailboxTermination`, `ActorIdentity`, and `DynamicRoute`;
+  `MailboxControl`, `MailboxTermination`, and `DynamicRoute`;
   what remains conventional is the core-to-runtime capability family plus the
   waker machinery that moved to core beside the proxy — `WakerSlot`,
   `WakerAction`, and `WakerEffects` are public doc-hidden core items a direct

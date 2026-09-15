@@ -2654,7 +2654,7 @@ concrete runtime.
 
 **The supported boundary.** The cells, mailbox, and façade share one crate,
 so locked-path implementation traits (`MailboxControl`,
-`MailboxTermination`, `MailboxEffectSink`, `ActorIdentity`, and
+`MailboxTermination`, `MailboxEffectSink`, and
 `DynamicRoute`) and every installer are crate-private: foreign
 implementations are excluded by construction. Cross-crate core/runtime
 capability traits remain technically public so the adapter can implement

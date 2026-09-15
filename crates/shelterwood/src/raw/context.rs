@@ -1112,10 +1112,28 @@ impl<M: Send + 'static> RawContext<M> {
             }
 
             if batch.mailbox_is_eligible() {
-                let message = self.receiver.try_recv_live_through(batch.mailbox_through);
+                let cutoff = batch.mailbox_through;
+                let (restored, message) = self.with_ready_batch_installed(batch, |this| {
+                    let result = catch_panic(|| this.receiver.try_recv_live_through(cutoff));
+                    // Receive runs caller code only in its post-consumption
+                    // effects: a sender wake can panic after the selected
+                    // message has left the queue and been sent to disposal.
+                    // Spend that mailbox turn before resuming the panic, so
+                    // a caught wake cannot bypass offload fairness. Failures
+                    // before consumption are internal invariant/poison paths,
+                    // not recoverable user callbacks.
+                    if !matches!(result, Ok(None)) {
+                        this.resources
+                            .ready_batch
+                            .as_mut()
+                            .expect("mailbox selection keeps its ready batch installed")
+                            .record_mailbox_delivery();
+                        this.resources.last_delivery_was_continuation = false;
+                    }
+                    result.unwrap_or_else(|panic| runtime::resume_panic(panic))
+                });
+                batch = restored;
                 if let Some(message) = message {
-                    batch.record_mailbox_delivery();
-                    self.resources.last_delivery_was_continuation = false;
                     self.resources.ready_batch = Some(batch);
                     return Some(message);
                 }
@@ -2153,6 +2171,71 @@ mod tests {
             panic_message(&payload),
             Some("contained raw payload destructor panic")
         );
+    }
+
+    #[test]
+    fn a_caught_mailbox_wake_panic_preserves_fired_timers_and_their_cutoff() {
+        let (mut context, actor) = bound_raw_context();
+        for message in 0..64 {
+            actor.try_send(message).expect("fill the default mailbox");
+        }
+        let mut pending = Box::pin(actor.send(64));
+        let hostile = Waker::from(Arc::new(PanickingWake("mailbox sender wake panic")));
+        assert!(
+            pending
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        context.set_timeout("timer", 100, Duration::ZERO).unwrap();
+
+        let panic = catch_unwind(AssertUnwindSafe(|| context.try_recv()))
+            .expect_err("promoting the sender resumes its wake panic");
+        assert_eq!(panic_message(&panic), Some("mailbox sender wake panic"));
+        for expected in 1..64 {
+            assert_eq!(context.try_recv(), Some(expected));
+        }
+        assert_eq!(
+            context.try_recv(),
+            Some(100),
+            "the fired timer precedes post-cutoff promotion"
+        );
+        assert_eq!(context.try_recv(), Some(64));
+        assert_eq!(context.try_recv(), None);
+        assert!(
+            !context.clear_timer(&"timer"),
+            "the one-shot timer was delivered"
+        );
+    }
+
+    #[test]
+    fn a_caught_mailbox_wake_panic_spends_the_steady_mailbox_turn() {
+        let (mut context, actor) = bound_raw_context();
+        for message in 0..64 {
+            actor.try_send(message).expect("fill the default mailbox");
+        }
+        let mut pending = Box::pin(actor.send(64));
+        let hostile = Waker::from(Arc::new(PanickingWake("mailbox sender wake panic")));
+        assert!(
+            pending
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        context.resources.events.push(QueuedEvent {
+            cancellation: Latch::default(),
+            make_message: Box::new(|| 100),
+        });
+
+        let panic = catch_unwind(AssertUnwindSafe(|| context.try_recv()))
+            .expect_err("promoting the sender resumes its wake panic");
+        assert_eq!(panic_message(&panic), Some("mailbox sender wake panic"));
+        assert_eq!(
+            context.try_recv(),
+            Some(100),
+            "consumed mailbox input spends its fairness turn even when its wake panics"
+        );
+        assert_eq!(context.try_recv(), Some(1));
     }
 
     #[test]

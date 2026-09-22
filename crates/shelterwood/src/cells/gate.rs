@@ -74,6 +74,7 @@ pub(crate) struct ObservationTxn<'a> {
     effects: Vec<Box<dyn FnOnce()>>,
     surrender_effects: Vec<Box<dyn FnOnce()>>,
     snapshots: Vec<SnapshotPublication>,
+    shared_releases: Vec<Box<dyn FnOnce()>>,
 }
 
 impl<'a> ObservationTxn<'a> {
@@ -87,6 +88,7 @@ impl<'a> ObservationTxn<'a> {
             effects: Vec::new(),
             surrender_effects: Vec::new(),
             snapshots: Vec::new(),
+            shared_releases: Vec::new(),
         }
     }
 
@@ -99,6 +101,7 @@ impl<'a> ObservationTxn<'a> {
             effects: Vec::new(),
             surrender_effects: Vec::new(),
             snapshots: Vec::new(),
+            shared_releases: Vec::new(),
         }
     }
 
@@ -129,6 +132,21 @@ impl<'a> ObservationTxn<'a> {
     /// surrender's co-owner to a concurrent disposal worker.
     pub(super) fn defer_surrender(&mut self, operation: impl FnOnce() + 'static) {
         self.surrender_effects.push(Box::new(operation));
+    }
+
+    /// Keeps an upgraded handle alive through bookkeeping and deferred effects.
+    ///
+    /// Install the co-owner immediately after upgrade, before any fallible
+    /// work. Local handles can then unwind under the gate as refcount traffic.
+    /// Release these co-owners last: snapshot producers and other effects may
+    /// also capture the same scope, and must not become its inline last owner.
+    pub(crate) fn retain_shared<T: Send + Sync + 'static>(&mut self, handle: &Arc<T>) {
+        let retained = Arc::clone(handle);
+        self.shared_releases.push(Box::new(move || {
+            if let Some(last) = Arc::into_inner(retained) {
+                runtime::dispose_detached(last);
+            }
+        }));
     }
 
     /// Defers a watch-channel wake. The driver reaches its own senders
@@ -190,6 +208,9 @@ impl<'a> ObservationTxn<'a> {
             // One hostile waker must not prevent the remaining committed
             // observation edges from notifying their waiters.
             panics.run(effect);
+        }
+        for release in self.shared_releases.drain(..) {
+            panics.run(release);
         }
     }
 }
@@ -293,6 +314,83 @@ mod tests {
     impl Drop for GatePresenceProbe {
         fn drop(&mut self) {
             let _ = self.observed.send(self.gate.is_held());
+        }
+    }
+
+    #[test]
+    fn released_last_shared_handle_is_destroyed_after_unlock_off_thread() {
+        let gate = ObservationGate::new();
+        let (released, observed) = mpsc::sync_channel(2);
+        let last = Arc::new(GatePresenceProbe {
+            gate: gate.clone(),
+            observed: released.clone(),
+        });
+        let shared = Arc::new(GatePresenceProbe {
+            gate: gate.clone(),
+            observed: released,
+        });
+        let kept = Arc::clone(&shared);
+        let mut txn = ObservationTxn::new(&gate, gate.lock());
+
+        txn.retain_shared(&last);
+        txn.retain_shared(&shared);
+        drop((last, shared));
+        assert!(
+            observed.try_recv().is_err(),
+            "nothing is destroyed under the gate"
+        );
+        drop(txn);
+
+        assert!(
+            !observed
+                .recv_timeout(TEST_WAIT)
+                .expect("the last owner is destroyed"),
+            "the last owner is destroyed only after the gate is unlocked"
+        );
+        assert!(
+            observed.try_recv().is_err(),
+            "a handle with another owner is only a refcount release"
+        );
+        drop(kept);
+    }
+
+    #[test]
+    fn retained_shared_handles_survive_unwind_and_later_effect_captures() {
+        struct Probe {
+            gate: ObservationGate,
+            observed: mpsc::Sender<(bool, std::thread::ThreadId)>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self
+                    .observed
+                    .send((self.gate.is_held(), std::thread::current().id()));
+            }
+        }
+
+        for unwind in [false, true] {
+            let gate = ObservationGate::new();
+            let (observed, received) = mpsc::channel();
+            let submitter = std::thread::current().id();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let mut txn = ObservationTxn::new(&gate, gate.lock());
+                let handle = Arc::new(Probe {
+                    gate: gate.clone(),
+                    observed,
+                });
+                txn.retain_shared(&handle);
+                if unwind {
+                    // The local handle unwinds before the transaction.
+                    panic!("injected bookkeeping failure");
+                }
+                // Models a snapshot producer captured after ancestor upgrade.
+                // Its later release must still have a retained co-owner.
+                txn.defer(move || drop(handle));
+            }));
+            assert_eq!(result.is_err(), unwind);
+            let (held, destructor) = received.recv_timeout(TEST_WAIT).expect("probe disposed");
+            assert!(!held, "bookkeeping unwind must release the gate first");
+            assert_ne!(destructor, submitter, "the last owner must leave the task");
         }
     }
 

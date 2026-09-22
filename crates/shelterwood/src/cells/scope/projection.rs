@@ -236,10 +236,11 @@ impl ScopeCell {
         (snapshot, retained_exits)
     }
 
-    fn ancestors_locked(&self) -> Vec<Arc<ScopeCell>> {
+    fn ancestors_locked(&self, txn: &mut ObservationTxn<'_>) -> Vec<Arc<ScopeCell>> {
         let mut ancestors = Vec::new();
         let mut current = self.parent();
         while let Some(scope) = current {
+            txn.retain_shared(&scope);
             current = scope.parent();
             ancestors.push(scope);
         }
@@ -272,7 +273,7 @@ impl ScopeCell {
     }
 
     pub(super) fn publish_snapshot_chain_locked(&self, wakes: &mut ObservationTxn<'_>) {
-        let ancestors = self.ancestors_locked();
+        let ancestors = self.ancestors_locked(wakes);
         self.publish_snapshot_chain_through_locked(wakes, &ancestors);
     }
 
@@ -286,7 +287,7 @@ impl ScopeCell {
         // Parent links cannot change under the resident-tree observation gate.
         // Resolve them once for snapshot and lifecycle propagation so one leaf
         // edge does not repeatedly lock every ancestor's parent mutex.
-        let ancestors = self.ancestors_locked();
+        let ancestors = self.ancestors_locked(wakes);
         // The resident-tree observation gate serializes every mint; the
         // atomic is the published watermark as well as the counter, avoiding
         // a second, provably uncontended lock on every lifecycle edge. The
@@ -334,7 +335,7 @@ impl ScopeCell {
         let mut event = RetainedLifecycleEvent::from_parts(scope, seq, kind, guards);
         self.observation.lifecycle.publish(wakes, event.clone());
         let mut child_id = self.member.id().clone();
-        for ancestor in ancestors {
+        for ancestor in &ancestors {
             event.prepend_scope(child_id);
             child_id = ancestor.member.id().clone();
             ancestor.observation.lifecycle.publish(wakes, event.clone());

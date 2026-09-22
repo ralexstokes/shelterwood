@@ -2419,3 +2419,110 @@ async fn incarnation_offloads_are_destroyed_before_actor_state_on_error() {
         .await
         .expect("tree shuts down");
 }
+
+enum EpilogueJoinMessage {
+    #[allow(dead_code)]
+    Panicky(FreezeSignal),
+    Done,
+}
+
+/// Reports its destruction — which only the epilogue's freeze performs —
+/// and then panics.
+struct FreezeSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for FreezeSignal {
+    fn drop(&mut self) {
+        if let Some(frozen) = self.0.take() {
+            let _ = frozen.send(());
+        }
+        panic!("continuation destructor panic");
+    }
+}
+
+/// Returns `Ok` with a panicking continuation queued and an offload blocked
+/// on a worker, so the raw epilogue retains the continuation's destructor
+/// panic at freeze and then parks in its resource join.
+struct EpilogueJoinPanicActor {
+    release: Option<std::sync::mpsc::Receiver<()>>,
+    frozen: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl RawActor for EpilogueJoinPanicActor {
+    type Msg = EpilogueJoinMessage;
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        let release = self.release.take().expect("run once");
+        let (started, running) = tokio::sync::oneshot::channel();
+        let _guard = context
+            .offload_scoped(
+                async move {
+                    // Wake the actor from a non-runtime thread: a wake from
+                    // this worker would park the actor in the worker's
+                    // unstealable LIFO slot, behind the block below.
+                    std::thread::spawn(move || started.send(()))
+                        .join()
+                        .expect("the start signal thread does not panic")
+                        .expect("the actor awaits the start");
+                    // Block the worker, not the future: cancellation cannot
+                    // destroy this poll, so the epilogue's join stays pending.
+                    let _ = release.recv_timeout(Duration::from_secs(10));
+                },
+                |_| EpilogueJoinMessage::Done,
+                Duration::MAX,
+            )
+            .expect("offload accepted");
+        running.await.expect("the offload starts");
+        let signal = FreezeSignal(self.frozen.take());
+        if let Err(rejected) = context.continue_with(EpilogueJoinMessage::Panicky(signal)) {
+            std::mem::forget(rejected);
+            panic!("a live context accepts continuations");
+        }
+        Ok(())
+    }
+}
+
+async fn epilogue_join_exit(hard_abort: bool) -> ExitKind {
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (frozen_sender, frozen) = tokio::sync::oneshot::channel();
+    let mut tree = Tree::new();
+    tree.add_raw_once(
+        "epilogue",
+        RawOnceDef::new(EpilogueJoinPanicActor {
+            release: Some(blocked),
+            frozen: Some(frozen_sender),
+        })
+        .shutdown(Shutdown::Abort),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    let mut events = system.scope().subscribe_lifecycle();
+    // The epilogue's freeze destroys the continuation. Nothing between that
+    // freeze and the resource join awaits, so a hard abort requested from
+    // here can only land at the join, which the blocked offload holds open.
+    tokio::time::timeout(POLL_TIMEOUT, frozen)
+        .await
+        .expect("the epilogue freezes")
+        .expect("the continuation reports its destruction");
+    if hard_abort {
+        system
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("hard abort bounds shutdown");
+    }
+    release.send(()).expect("the offload is still blocked");
+    next_exit_of(&mut events, "epilogue").await.kind().clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn epilogue_join_reports_a_retained_freeze_panic() {
+    let kind = epilogue_join_exit(false).await;
+    assert!(matches!(kind, ExitKind::Panicked { .. }), "{kind:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_abort_at_the_epilogue_join_keeps_the_retained_freeze_panic() {
+    // §8: a panic is never masked. The freeze already retained the
+    // continuation's destructor panic when the abort destroys the epilogue.
+    let kind = epilogue_join_exit(true).await;
+    assert!(matches!(kind, ExitKind::Panicked { .. }), "{kind:?}");
+}

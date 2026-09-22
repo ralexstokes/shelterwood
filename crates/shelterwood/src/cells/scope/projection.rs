@@ -274,6 +274,7 @@ impl ScopeCell {
     pub(super) fn publish_snapshot_chain_locked(&self, wakes: &mut ObservationTxn<'_>) {
         let ancestors = self.ancestors_locked();
         self.publish_snapshot_chain_through_locked(wakes, &ancestors);
+        wakes.release_shared(ancestors);
     }
 
     pub(super) fn emit_locked(&self, wakes: &mut ObservationTxn<'_>, kind: LifecycleEventKind) {
@@ -309,6 +310,7 @@ impl ScopeCell {
             for ancestor in &ancestors {
                 ancestor.observation.lifecycle.publish_lagged(wakes, 1);
             }
+            wakes.release_shared(ancestors);
             return;
         };
         self.publish_snapshot_chain_through_locked(wakes, &ancestors);
@@ -327,6 +329,7 @@ impl ScopeCell {
                 drop(kind);
                 drop(guards);
             });
+            wakes.release_shared(ancestors);
             return;
         }
 
@@ -334,11 +337,12 @@ impl ScopeCell {
         let mut event = RetainedLifecycleEvent::from_parts(scope, seq, kind, guards);
         self.observation.lifecycle.publish(wakes, event.clone());
         let mut child_id = self.member.id().clone();
-        for ancestor in ancestors {
+        for ancestor in &ancestors {
             event.prepend_scope(child_id);
             child_id = ancestor.member.id().clone();
             ancestor.observation.lifecycle.publish(wakes, event.clone());
         }
+        wakes.release_shared(ancestors);
         // The producer's own copy still owns a retained exit. Retiring it here
         // would submit a disposal job — and can start a native thread — with
         // the observation gate held. This caller owns an effects sink, so it

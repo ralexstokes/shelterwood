@@ -1296,6 +1296,7 @@ impl ScopeCell {
                     },
                     txn,
                 );
+                txn.release_shared([parent]);
             }
         }
         Some(target)

@@ -131,6 +131,30 @@ impl<'a> ObservationTxn<'a> {
         self.surrender_effects.push(Box::new(operation));
     }
 
+    /// Releases shared framework handles after unlock.
+    ///
+    /// A handle upgraded from a weak link under the gate can turn out to be
+    /// the last owner once a concurrent owner lets go, and a scope's drop
+    /// glue reaches resident graphs and unread user messages. So the release
+    /// runs after unlock, and a handle that is the last owner is destroyed on
+    /// the detached disposal lane; any other release is refcount traffic.
+    pub(crate) fn release_shared<T: Send + Sync + 'static>(
+        &mut self,
+        handles: impl IntoIterator<Item = Arc<T>>,
+    ) {
+        let handles: Vec<_> = handles.into_iter().collect();
+        if handles.is_empty() {
+            return;
+        }
+        self.defer(move || {
+            for handle in handles {
+                if let Some(last) = Arc::into_inner(handle) {
+                    runtime::dispose_detached(last);
+                }
+            }
+        });
+    }
+
     /// Defers a watch-channel wake. The driver reaches its own senders
     /// through [`Self::defer`], so this stays inside the cell layer.
     pub(crate) fn pulse<T: 'static>(&mut self, sender: &runtime::WatchSender<T>) {
@@ -294,6 +318,41 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.observed.send(self.gate.is_held());
         }
+    }
+
+    #[test]
+    fn released_last_shared_handle_is_destroyed_after_unlock_off_thread() {
+        let gate = ObservationGate::new();
+        let (released, observed) = mpsc::sync_channel(2);
+        let last = Arc::new(GatePresenceProbe {
+            gate: gate.clone(),
+            observed: released.clone(),
+        });
+        let shared = Arc::new(GatePresenceProbe {
+            gate: gate.clone(),
+            observed: released,
+        });
+        let kept = Arc::clone(&shared);
+        let mut txn = ObservationTxn::new(&gate, gate.lock());
+
+        txn.release_shared([last, shared]);
+        assert!(
+            observed.try_recv().is_err(),
+            "nothing is destroyed under the gate"
+        );
+        drop(txn);
+
+        assert!(
+            !observed
+                .recv_timeout(TEST_WAIT)
+                .expect("the last owner is destroyed"),
+            "the last owner is destroyed only after the gate is unlocked"
+        );
+        assert!(
+            observed.try_recv().is_err(),
+            "a handle with another owner is only a refcount release"
+        );
+        drop(kept);
     }
 
     #[test]

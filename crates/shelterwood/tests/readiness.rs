@@ -1689,3 +1689,70 @@ async fn immediate_raw_construction_panic_classifies_post_ready() {
         .await
         .expect("clean shutdown");
 }
+
+/// Blocks its destructor until released, holding a retained construction's
+/// disposal open on the blocking pool.
+struct SlowDrop {
+    disposing: Option<std::sync::mpsc::Sender<()>>,
+    release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl Drop for SlowDrop {
+    fn drop(&mut self) {
+        if let Some(disposing) = self.disposing.take() {
+            let _ = disposing.send(());
+        }
+        let _ = self
+            .release
+            .lock()
+            .expect("release lock")
+            .recv_timeout(Duration::from_secs(10));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_failure_is_decided_at_dispatch_not_after_construction_disposal() {
+    // §7: the scope leaves `Starting` the moment the terminal pre-ready exit
+    // is dispatched. A shutdown request landing while the failed child's
+    // retained factory is still being destroyed must not replace the verdict.
+    let (disposing_sender, disposing) = std::sync::mpsc::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let slow = SlowDrop {
+        disposing: Some(disposing_sender),
+        release: Arc::new(Mutex::new(blocked)),
+    };
+    let mut tree = Tree::new();
+    tree.add_task(
+        "failure",
+        TaskDef::new(move |_| {
+            let _captured = &slow;
+            async { Err(ExitError::message("pre-ready failure")) }
+        })
+        .restart(never())
+        .readiness(Readiness::Manual)
+        .expect("manual readiness"),
+    )
+    .expect("valid failing task");
+    let system = tree.spawn().expect("runtime is available");
+
+    tokio::task::spawn_blocking(move || disposing.recv_timeout(POLL_TIMEOUT))
+        .await
+        .expect("the wait does not panic")
+        .expect("the failed child's construction is being disposed");
+    system.scope().request_shutdown();
+    release.send(()).expect("the disposal is still blocked");
+
+    let startup = system.wait_started().await.expect_err("startup fails");
+    assert!(
+        matches!(
+            startup,
+            StartupError::StartupFailed(ref failure)
+                if matches!(failure.cause, StartupFailureCause::Child { ref id, .. } if id.as_str() == "failure")
+        ),
+        "{startup:?}"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("the requested shutdown completes");
+}

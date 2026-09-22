@@ -760,9 +760,11 @@ async fn settlement_terminates_when_the_first_spawn_exhausts_incarnations() {
     // construction, the funnel exhausts, and the child terminalizes in place.
     scope.settle_supervisor();
     assert!(scope.children[key].is_disposing());
+    // §7: the pre-readiness terminal fails startup at dispatch; only the
+    // member's terminal publication waits for the construction disposal.
     assert!(
-        scope.supervisor.lifecycle().is_starting(),
-        "disposal is still in flight, so startup has not yet failed"
+        scope.supervisor.lifecycle().startup_failed(),
+        "the pre-readiness position routes the scope's startup failure at dispatch"
     );
 
     // Settling again over that state must still reach a fixed point: the
@@ -777,8 +779,6 @@ async fn settlement_terminates_when_the_first_spawn_exhausts_incarnations() {
     .await;
     scope.handle_construction_disposed(child, panic);
     scope.settle_supervisor();
-    assert!(
-        scope.supervisor.lifecycle().startup_failed(),
-        "the pre-readiness position routes the scope's startup failure"
-    );
+    assert!(scope.children[key].is_terminal());
+    assert!(scope.supervisor.lifecycle().startup_failed());
 }

@@ -514,10 +514,16 @@ established in the construction-path types, before erasure:
   synchronization claims such as disposal completion, where losing the
   claim race is an ordinary no-op rather than a re-asserted construction
   capability. A reserved slot's definition cell (§9's split
-  reserve/define) is such a claim too: it moves a definition in once and
-  out once, a losing `define` gets its payload back as an ordinary value
-  and a second lowering is a typed refusal. It never panics, and it never
-  mints a capability the owned construction value did not already carry.
+  reserve/define) is not such a claim, and it needs no carve-out. Its
+  once-ness is the owned-token shape: every public `define` consumes the
+  reservation, and lowering consumes the plan. So a second definition or
+  a second lowering is unrepresentable to callers. The cell underneath
+  is an internal state machine, and its duplicate-definition and
+  second-lowering branches are unreachable invariant assertions, not
+  outcomes of a race. Such an assertion MAY panic, but only after
+  releasing the cell's lock and with any rejected definition handed to
+  isolated disposal. It never mints a capability the owned construction
+  value did not already carry.
   The independent owned-token and consuming rules for
   readiness (§7), exit reports (§8), guards (B.7), and public
   exactly-once operations (B.10) remain mandatory (§1 principle 3).
@@ -2880,9 +2886,29 @@ by a scope driver (a parked sender woken by a rebind) are this case, so
 a waker that panics on `wake` can fail the scope that woke it. §11's driver-death rule and
 §15.5's owned completions then discharge every outstanding promise, so
 the failure is observable and bounded. It is never a wedge, a poisoned
-lock, or an abort. An implementation MAY route a given wake through a
-proxy that retires the caller's waker on the caller's own task, and so
-confine the panic to that task instead; nothing requires it.
+lock, or an abort.
+
+Two flush sites discard the contained panic instead of resuming it:
+
+- **By-value delivery seams.** The flushing frame may own a completed
+  result or a recovered user value that it is about to hand back. Examples
+  are a ready edge retiring the caller's waker, a timed send withdrawing
+  after expiry, and a call closing its reply channel over a recovered
+  `SendError`. At such a seam the panic is caught and discarded, and the
+  value is returned as if the flush had succeeded. For example, a timed
+  send still reports `TimedOut` with its message. Resuming there would
+  destroy that value during the unwind, and a second hostile destructor
+  would turn that into an abort. Losing the diagnostic is the accepted
+  cost.
+- **Post-classification framework observers.** Once a driver's exit is
+  classified and joined, a panic from the terminal flush cannot change
+  the verdict. It is discarded rather than raised as a second failure
+  over a completed one.
+
+An implementation MAY route a given wake through a proxy that retires
+the caller's waker on the caller's own task. The proxy's ready-edge
+retirement is then a by-value delivery seam as above. Nothing requires
+a proxy.
 
 Applied to the mailbox layer (§5): mailbox and send-operation mutexes
 protect only synchronous state transitions. A transition records signal

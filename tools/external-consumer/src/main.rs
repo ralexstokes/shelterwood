@@ -8,6 +8,13 @@ use shelterwood::LIFECYCLE_EVENT_CAPACITY;
 
 fn accepts_supported_token(_: &CancellationToken) {}
 
+// A private supertrait's methods are still callable through a public generic
+// bound. The conversion must require a capability unavailable to this crate.
+#[cfg(feature = "subtree-ref-conversion")]
+fn retype_scope<T: shelterwood::Subtree>(scope: shelterwood::ScopeRef) -> T::Ref {
+    T::make_ref(scope)
+}
+
 #[cfg(feature = "installable-seams")]
 use shelterwood::{
     DynamicRoute, ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, MailboxCell,

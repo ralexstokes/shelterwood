@@ -124,10 +124,15 @@ impl<T: Subtree> SubtreeOnceDef<T> {
 pub(super) mod sealed {
     use super::{BuilderCore, DynamicScopeRef, ScopeFlavor, ScopeRef, Subtree};
 
+    // A private supertrait still exposes its methods to generic callers of
+    // Subtree. Require a token they cannot construct so a plain ScopeRef
+    // cannot be upgraded to DynamicScopeRef through T::make_ref.
+    pub(in crate::tree) struct RefToken;
+
     pub trait Sealed {
         const FLAVOR: ScopeFlavor;
         fn into_core(self) -> BuilderCore;
-        fn make_ref(scope: ScopeRef) -> <Self as Subtree>::Ref
+        fn make_ref(scope: ScopeRef, token: RefToken) -> <Self as Subtree>::Ref
         where
             Self: Subtree;
     }
@@ -139,7 +144,7 @@ pub(super) mod sealed {
             self.core
         }
 
-        fn make_ref(scope: ScopeRef) -> ScopeRef {
+        fn make_ref(scope: ScopeRef, _: RefToken) -> ScopeRef {
             scope
         }
     }
@@ -151,7 +156,7 @@ pub(super) mod sealed {
             self.core
         }
 
-        fn make_ref(scope: ScopeRef) -> DynamicScopeRef {
+        fn make_ref(scope: ScopeRef, _: RefToken) -> DynamicScopeRef {
             DynamicScopeRef(scope)
         }
     }

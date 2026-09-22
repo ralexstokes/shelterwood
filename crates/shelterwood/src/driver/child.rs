@@ -857,27 +857,10 @@ impl ScopeRuntime {
             }
             return;
         }
-        if let Some(active) = &child.active {
-            let incarnation = active.incarnation;
-            if forced.is_none() && active.ready_signal.is_fired() {
-                // The Shutdown step below disarms the gate, and a queued
-                // readiness signal ranks behind the stop that got here (§13).
-                // Credit a latch that already fired now, while the member is
-                // still `Starting`, so a `mark_ready` preceding the stop
-                // counts exactly as `handle_self_stop` makes it count (§7).
-                // A self-stop credited its latch before calling here and a
-                // removal suppresses the edge, so the edge this can publish
-                // belongs to a drain: startup has already left `Starting`,
-                // and the caller's settlement owns any follow-up.
-                let effect = self
-                    .children
-                    .get_mut(key)
-                    .and_then(|child| child.active.as_mut())
-                    .and_then(|active| active.readiness.step(ReadinessEvent::Signal));
-                if let Some(effect) = effect {
-                    let _ = self.apply_readiness_effect(key, incarnation, effect);
-                }
-            }
+        // Shutdown outranks queued readiness (§13). Disarm below without
+        // replaying a fired latch: readiness cannot publish during drain.
+        // Local self-stop credits readiness in its own handler before this.
+        if child.active.is_some() {
             self.reduce(SupervisorEvent::StopStarted { child: key });
             let child = self
                 .children

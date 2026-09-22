@@ -782,14 +782,10 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
     );
 }
 
-/// A shutdown request outranks the readiness signal in arbitration, so a
-/// `mark_ready` whose latch fired just before the shutdown batch still has
-/// its Ready event queued when the drain stops the child. The stop's Shutdown
-/// step disarms the gate, and the queued signal and the exit's
-/// `readiness_signal_seen` both land on a disarmed gate afterwards; the stop
-/// itself must credit the fired latch (§7).
+/// Shutdown outranks a queued readiness signal (§13). Once drain begins,
+/// even an already-fired latch cannot publish readiness (B.1/B.2).
 #[crate::runtime::test]
-async fn drain_stop_credits_an_already_fired_readiness_latch() {
+async fn drain_stop_suppresses_an_already_fired_readiness_latch() {
     let mut tree = Tree::new();
     tree.add_task(
         "gate",
@@ -814,10 +810,13 @@ async fn drain_stop_credits_an_already_fired_readiness_latch() {
         .expect("spawned child is active");
     // The application task marked ready; the driver has not yet drained the
     // corresponding Ready event.
+    let incarnation = active.incarnation;
     assert!(active.ready_signal.fire());
     let mut lifecycle = root.subscribe_lifecycle();
 
     scope.begin_drain(StopReason::ShutdownRequested);
+    // The queued signal must remain inert when arbitration delivers it later.
+    scope.handle_ready(key, incarnation);
 
     assert!(
         matches!(
@@ -827,18 +826,18 @@ async fn drain_stop_credits_an_already_fired_readiness_latch() {
         "the regression premise: the drain stopped the gated child"
     );
     assert!(
-        scope.supervisor.initial_ready(key),
-        "a latch fired before the stop counts as the child's readiness"
+        !scope.supervisor.initial_ready(key),
+        "shutdown wins before the queued readiness can be credited"
     );
     let mut published = Vec::new();
     while let Ok(crate::cells::LifecycleItem::Event(event)) = lifecycle.try_recv() {
         published.push(event.kind);
     }
     assert!(
-        published
+        !published
             .iter()
             .any(|kind| matches!(kind, LifecycleEventKind::Ready { .. })),
-        "the credited latch publishes its readiness edge: {published:?}"
+        "readiness must not be published after drain begins: {published:?}"
     );
 }
 

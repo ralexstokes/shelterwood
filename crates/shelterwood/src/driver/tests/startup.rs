@@ -782,6 +782,65 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
     );
 }
 
+/// Shutdown outranks a queued readiness signal (§13). Once drain begins,
+/// even an already-fired latch cannot publish readiness (B.1/B.2).
+#[crate::runtime::test]
+async fn drain_stop_suppresses_an_already_fired_readiness_latch() {
+    let mut tree = Tree::new();
+    tree.add_task(
+        "gate",
+        TaskDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness is valid")
+        .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid task");
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
+
+    scope.spawn_child(key);
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("spawned child is active");
+    // The application task marked ready; the driver has not yet drained the
+    // corresponding Ready event.
+    let incarnation = active.incarnation;
+    assert!(active.ready_signal.fire());
+    let mut lifecycle = root.subscribe_lifecycle();
+
+    scope.begin_drain(StopReason::ShutdownRequested);
+    // The queued signal must remain inert when arbitration delivers it later.
+    scope.handle_ready(key, incarnation);
+
+    assert!(
+        matches!(
+            scope.children[key].slot.member.record().stage,
+            MemberStage::Stopping
+        ),
+        "the regression premise: the drain stopped the gated child"
+    );
+    assert!(
+        !scope.supervisor.initial_ready(key),
+        "shutdown wins before the queued readiness can be credited"
+    );
+    let mut published = Vec::new();
+    while let Ok(crate::cells::LifecycleItem::Event(event)) = lifecycle.try_recv() {
+        published.push(event.kind);
+    }
+    assert!(
+        !published
+            .iter()
+            .any(|kind| matches!(kind, LifecycleEventKind::Ready { .. })),
+        "readiness must not be published after drain begins: {published:?}"
+    );
+}
+
 /// `next_ordered_start` is held across `spawn_child` and is never cleared by
 /// `reclaim_child`, so `progress_startup` must treat a reclaimed key the way
 /// `stop_next_ordered` treats its own cursor: already gone, advance past it.
@@ -1015,4 +1074,76 @@ async fn queued_removal_suppresses_replayed_self_stop_readiness() {
         "startup waits for the removal to shrink the declared set"
     );
     assert_eq!(root.record().state, ScopeState::Starting);
+}
+
+/// A removal mark wins even before its control event reaches the driver.
+/// The terminal record must agree with the successful startup recomputation:
+/// withdrawing a pre-ready initial member is not a startup failure (§7/B.6).
+#[crate::runtime::test]
+async fn removal_before_pre_ready_exit_does_not_publish_startup_abort() {
+    let mut tree = DynamicTree::new();
+    let _ = tree
+        .add_task_once(
+            "gate",
+            TaskOnceDef::new(|_| future::pending::<crate::ExitResult>())
+                .readiness(Readiness::Manual)
+                .expect("manual readiness is valid")
+                .readiness_deadline(ReadinessDeadline::Unbounded),
+        )
+        .expect("valid initial member");
+
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (control_events, _control_event_receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(control_events);
+    let mut children = ChildArena::default();
+    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    let key = children.insert(child);
+    let member = Arc::clone(&children[key].slot.member);
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
+        .with_defaults(plan.defaults.clone())
+        .with_children(children)
+        .with_dynamic(Some(control))
+        .with_transferred_plan(plan)
+        .build();
+
+    scope.spawn_child(key);
+    let active = scope.children[key].active.as_ref().expect("active child");
+    let incarnation = active.incarnation;
+    active.abort_handle.abort();
+    let mut removal = super::super::remove_dynamic(&root, member.id(), Some(member.membership()));
+    assert_eq!(
+        member.record().membership_status,
+        MembershipStatus::Removing
+    );
+    assert_eq!(
+        scope.supervisor.membership_status(key),
+        MembershipStatus::Active
+    );
+
+    scope.handle_exit(
+        key,
+        incarnation,
+        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+            Err(ExitError::message("pre-ready failure racing removal")),
+        ))),
+        crate::runtime::JoinOutcome::Ok { value: () },
+        Cancellation::NotObserved,
+        false,
+    );
+
+    assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
+    assert!(
+        !member.record().startup_aborted,
+        "removal is not a startup abort"
+    );
+    scope.handle_removal(RemovalRequest { key });
+    scope.progress_startup();
+    scope.publish_startup_removals();
+    assert_eq!(removal.try_receive(), Some(RemoveOutcome::Removed));
+    assert!(scope.supervisor.lifecycle().startup_complete());
 }

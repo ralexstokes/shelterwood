@@ -857,6 +857,9 @@ impl ScopeRuntime {
             }
             return;
         }
+        // Shutdown outranks queued readiness (§13). Disarm below without
+        // replaying a fired latch: readiness cannot publish during drain.
+        // Local self-stop credits readiness in its own handler before this.
         if child.active.is_some() {
             self.reduce(SupervisorEvent::StopStarted { child: key });
             let child = self
@@ -1204,8 +1207,16 @@ impl ScopeRuntime {
         // §7's startup abort is a startup-sequence property: the membership
         // failed before its *initial* readiness edge. A later incarnation
         // stopped pre-ready (for example during drain) does not rewind it.
+        // A drain has already taken the startup verdict — an owner or
+        // ancestor shutdown, or this scope's own rollback — and dispatches
+        // every exit terminal regardless of policy, so an exit it dispatches
+        // is the drain's, never the §7 terminal pre-ready failure (B.6).
+        // Likewise, removal sampled before dispatch owns the terminal: §7
+        // shrinks the initial set instead of reporting a startup failure.
         if self.supervisor.is_initial(key)
             && !self.supervisor.lifecycle().startup_complete()
+            && !self.supervisor.lifecycle().is_draining()
+            && self.supervisor.membership_status(key) != MembershipStatus::Removing
             && !self.supervisor.initial_ready(key)
         {
             StartupDisposition::Aborted

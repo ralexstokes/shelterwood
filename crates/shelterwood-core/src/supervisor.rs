@@ -573,13 +573,14 @@ impl SupervisorState {
                     &[IncarnationState::Complete],
                     IncarnationState::RestartPending,
                 ) && let Some(record) = self.children.get_mut(&child)
-                    // Deliberately the *consumers'* predicate, not
-                    // `is_starting`: a startup-failed or draining scope has
-                    // not completed startup either, and every reader of this
-                    // flag gates on `startup_complete`. Narrowing it here
-                    // would let a pre-ready exit publish `NotAborted` where a
-                    // scope that already failed startup published `Aborted`.
-                    && !self.lifecycle.startup_complete()
+                    // Only `Starting` re-arms: there the restarted incarnation
+                    // must hold the aggregate open again (§7). A root parked
+                    // in `StartupFailed` dispatches its started prefix as
+                    // `Running` (§12) and has no aggregate left to hold, so a
+                    // member's initial readiness edge stays spent and a later
+                    // pre-ready exit is not a startup abort (B.6). A draining
+                    // scope schedules no restart.
+                    && self.lifecycle.is_starting()
                     && let StartupMembership::Initial { ready } = &mut record.startup
                 {
                     *ready = false;

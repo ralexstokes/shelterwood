@@ -11,6 +11,7 @@ exit-new = []
 from-latch = []
 installable-seams = []
 lifecycle-capacity = []
+subtree-ref-conversion = []
 
 [dependencies]
 shelterwood = { path = "../../crates/shelterwood" }

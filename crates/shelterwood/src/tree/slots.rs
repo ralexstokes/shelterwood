@@ -291,15 +291,18 @@ impl<T: Send + 'static> Definition for TaskOnceDef<T> {
 
 impl<E: SlotEndpoint, T: Subtree> SlotCore<E, SubtreeKind<T>> {
     fn scope_ref(&self) -> T::Ref {
-        <T as sealed::Sealed>::make_ref(ScopeRef {
-            cell: Arc::clone(
-                self.endpoint
-                    .slot()
-                    .scope
-                    .as_ref()
-                    .expect("subtree slot must carry a scope cell"),
-            ),
-        })
+        <T as sealed::Sealed>::make_ref(
+            ScopeRef {
+                cell: Arc::clone(
+                    self.endpoint
+                        .slot()
+                        .scope
+                        .as_ref()
+                        .expect("subtree slot must carry a scope cell"),
+                ),
+            },
+            sealed::RefToken,
+        )
     }
 }
 

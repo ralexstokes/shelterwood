@@ -9,6 +9,16 @@ trap 'rm -f "$diagnostics"' EXIT
 cargo check --locked --manifest-path "$manifest"
 cargo test --locked --manifest-path "$manifest"
 
+if cargo check --locked --manifest-path "$manifest" --features subtree-ref-conversion >"$diagnostics" 2>&1; then
+    echo "external consumers can retype a ScopeRef through Subtree's supertrait" >&2
+    exit 1
+fi
+if ! grep -Fq 'argument #2 of type' "$diagnostics" || ! grep -Fq 'RefToken' "$diagnostics"; then
+    cat "$diagnostics" >&2
+    echo "subtree-ref-conversion probe failed for an unexpected reason" >&2
+    exit 1
+fi
+
 if cargo check --locked --manifest-path "$manifest" --features exit-new >"$diagnostics" 2>&1; then
     echo "external consumers can construct an Exit from an arbitrary ExitKind" >&2
     exit 1

@@ -122,48 +122,60 @@ impl<T: Subtree> SubtreeOnceDef<T> {
 /// Private dispatch that seals subtree flavor conversion inside the façade.
 #[allow(private_interfaces)]
 pub(super) mod sealed {
-    use super::{BuilderCore, DynamicScopeRef, ScopeFlavor, ScopeRef};
+    use super::{BuilderCore, DynamicScopeRef, ScopeFlavor, ScopeRef, Subtree};
+
+    // A private supertrait still exposes its methods to generic callers of
+    // Subtree. Require a token they cannot construct so a plain ScopeRef
+    // cannot be upgraded to DynamicScopeRef through T::make_ref.
+    pub(in crate::tree) struct RefToken;
 
     pub trait Sealed {
-        type Ref;
         const FLAVOR: ScopeFlavor;
         fn into_core(self) -> BuilderCore;
-        fn make_ref(scope: ScopeRef) -> Self::Ref;
+        fn make_ref(scope: ScopeRef, token: RefToken) -> <Self as Subtree>::Ref
+        where
+            Self: Subtree;
     }
 
     impl Sealed for super::Tree {
-        type Ref = ScopeRef;
         const FLAVOR: ScopeFlavor = ScopeFlavor::Ordered;
 
         fn into_core(self) -> BuilderCore {
             self.core
         }
 
-        fn make_ref(scope: ScopeRef) -> Self::Ref {
+        fn make_ref(scope: ScopeRef, _: RefToken) -> ScopeRef {
             scope
         }
     }
 
     impl Sealed for super::DynamicTree {
-        type Ref = DynamicScopeRef;
         const FLAVOR: ScopeFlavor = ScopeFlavor::Dynamic;
 
         fn into_core(self) -> BuilderCore {
             self.core
         }
 
-        fn make_ref(scope: ScopeRef) -> Self::Ref {
+        fn make_ref(scope: ScopeRef, _: RefToken) -> DynamicScopeRef {
             DynamicScopeRef(scope)
         }
     }
 }
 
 /// Sealed dispatch from a tree flavor to its capability-preserving handle.
-pub trait Subtree: sealed::Sealed + fmt::Debug + Send + 'static {}
+pub trait Subtree: sealed::Sealed + fmt::Debug + Send + 'static {
+    /// The handle a subtree of this flavor is addressed by: [`ScopeRef`] for
+    /// an ordered [`Tree`], [`DynamicScopeRef`] for a [`DynamicTree`].
+    type Ref: Clone + fmt::Debug + Eq + std::hash::Hash + Send + Sync + 'static;
+}
 
-impl Subtree for Tree {}
+impl Subtree for Tree {
+    type Ref = ScopeRef;
+}
 
-impl Subtree for DynamicTree {}
+impl Subtree for DynamicTree {
+    type Ref = DynamicScopeRef;
+}
 
 /// The sole owning handle for a running root system.
 ///

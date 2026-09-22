@@ -1228,9 +1228,12 @@ impl ScopeRuntime {
         // ancestor shutdown, or this scope's own rollback — and dispatches
         // every exit terminal regardless of policy, so an exit it dispatches
         // is the drain's, never the §7 terminal pre-ready failure (B.6).
+        // Likewise, removal sampled before dispatch owns the terminal: §7
+        // shrinks the initial set instead of reporting a startup failure.
         if self.supervisor.is_initial(key)
             && !self.supervisor.lifecycle().startup_complete()
             && !self.supervisor.lifecycle().is_draining()
+            && self.supervisor.membership_status(key) != MembershipStatus::Removing
             && !self.supervisor.initial_ready(key)
         {
             StartupDisposition::Aborted

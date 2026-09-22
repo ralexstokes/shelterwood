@@ -1076,3 +1076,75 @@ async fn queued_removal_suppresses_replayed_self_stop_readiness() {
     );
     assert_eq!(root.record().state, ScopeState::Starting);
 }
+
+/// A removal mark wins even before its control event reaches the driver.
+/// The terminal record must agree with the successful startup recomputation:
+/// withdrawing a pre-ready initial member is not a startup failure (§7/B.6).
+#[crate::runtime::test]
+async fn removal_before_pre_ready_exit_does_not_publish_startup_abort() {
+    let mut tree = DynamicTree::new();
+    let _ = tree
+        .add_task_once(
+            "gate",
+            TaskOnceDef::new(|_| future::pending::<crate::ExitResult>())
+                .readiness(Readiness::Manual)
+                .expect("manual readiness is valid")
+                .readiness_deadline(ReadinessDeadline::Unbounded),
+        )
+        .expect("valid initial member");
+
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (control_events, _control_event_receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(control_events);
+    let mut children = ChildArena::default();
+    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    let key = children.insert(child);
+    let member = Arc::clone(&children[key].slot.member);
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
+        .with_defaults(plan.defaults.clone())
+        .with_children(children)
+        .with_dynamic(Some(control))
+        .with_transferred_plan(plan)
+        .build();
+
+    scope.spawn_child(key);
+    let active = scope.children[key].active.as_ref().expect("active child");
+    let incarnation = active.incarnation;
+    active.abort_handle.abort();
+    let mut removal = super::super::remove_dynamic(&root, member.id(), Some(member.membership()));
+    assert_eq!(
+        member.record().membership_status,
+        MembershipStatus::Removing
+    );
+    assert_eq!(
+        scope.supervisor.membership_status(key),
+        MembershipStatus::Active
+    );
+
+    scope.handle_exit(
+        key,
+        incarnation,
+        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+            Err(ExitError::message("pre-ready failure racing removal")),
+        ))),
+        crate::runtime::JoinOutcome::Ok { value: () },
+        Cancellation::NotObserved,
+        false,
+    );
+
+    assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
+    assert!(
+        !member.record().startup_aborted,
+        "removal is not a startup abort"
+    );
+    scope.handle_removal(RemovalRequest { key });
+    scope.progress_startup();
+    scope.publish_startup_removals();
+    assert_eq!(removal.try_receive(), Some(RemoveOutcome::Removed));
+    assert!(scope.supervisor.lifecycle().startup_complete());
+}

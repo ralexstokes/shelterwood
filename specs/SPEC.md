@@ -2745,8 +2745,10 @@ observable rules in §7, §8, §11, and §12.
 - **R2.** Readiness is incarnation-local and monotone until restart: an accepted
   readiness transition flips an initial member's bit `false → true`;
   duplicate readiness is a no-op; a restart-pending transition resets the
-  bit only while startup is incomplete; once the aggregate has fired it
-  never rewinds.
+  bit only while the scope is `Starting` (startup is still in progress).
+  A root parked in `StartupFailed` keeps the started prefix's readiness
+  bits across restarts, consistent with its `Running` dispatch (§12);
+  once the aggregate has fired it never rewinds.
 - **R3.** Removal is sampled at the publication transition: the readiness event
   carries the synchronous removal-latch sample; a true sample first marks
   the membership `Removing` and the readiness edge is then rejected. A

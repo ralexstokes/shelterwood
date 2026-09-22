@@ -231,9 +231,13 @@ impl<T> Drop for DisposingReceiver<T> {
         // it requires a destructor that has already panicked, and the
         // alternative is retrying a step that just failed.
         panics.run(|| value = inner.close_and_take_erased());
-        // `dispose` can fall back to destroying the value on this thread when
-        // task and native-thread creation are exhausted, so submission belongs
-        // inside the boundary too.
+        // `MailboxRuntime::dispose` is the non-critical lane: the Tokio
+        // adapter routes it through `dispose_detached`, which (unlike
+        // `dispose_critical`) finishes the value on this thread once task and
+        // native-thread creation are both exhausted. That inline destruction
+        // contains its own destructor panic, but the capability is a trait
+        // seam whose submission can still unwind, so it belongs inside the
+        // boundary too.
         panics.run(|| {
             if let Some(value) = value {
                 self.runtime.dispose(value);

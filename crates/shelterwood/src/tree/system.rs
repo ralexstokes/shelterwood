@@ -16,7 +16,8 @@ use super::{DynamicTree, Tree};
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("tree startup failed and was rolled back")]
 pub struct StartOrShutdownError {
-    /// Original startup error.
+    /// Original startup error; also this error's [`source`](std::error::Error::source).
+    #[source]
     pub startup: StartupError,
     /// Stragglers forced down after the rollback bound, if any.
     pub rollback_timeout: Option<ShutdownTimeout>,
@@ -315,8 +316,21 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    use super::{DynamicTree, StopReason, Tree, sealed::Sealed};
-    use crate::identity::ScopeIdentity;
+    use super::{DynamicTree, StartOrShutdownError, StopReason, Tree, sealed::Sealed};
+    use crate::{exit::StartupError, identity::ScopeIdentity};
+
+    #[test]
+    fn rollback_error_chains_to_its_startup_cause() {
+        let error = StartOrShutdownError {
+            startup: StartupError::ShutdownRequested,
+            rollback_timeout: None,
+        };
+        let source = std::error::Error::source(&error).expect("the startup cause is the source");
+        assert_eq!(
+            source.downcast_ref::<StartupError>(),
+            Some(&StartupError::ShutdownRequested)
+        );
+    }
 
     #[test]
     fn subtree_conversion_moves_without_minting_a_phantom_scope() {

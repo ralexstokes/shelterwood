@@ -1,5 +1,4 @@
 use std::{
-    mem,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     task::{Context, Wake, Waker},
 };
@@ -136,12 +135,13 @@ pub struct WakerProxy {
     state: Arc<WakerProxyState>,
 }
 
-/// The proxy's mutable half: the caller's waker beside the record of a wake
-/// that has not yet reached the caller who is polling now.
+/// The proxy's mutable half: the caller's waker beside a count of every wake
+/// the proxy has received, which lets [`WakerProxy::register`] detect a wake
+/// landing while it clones outside the mutex.
 #[derive(Default)]
 struct Registration {
     caller: WakerSlot,
-    woken: bool,
+    wakes: u64,
 }
 
 #[derive(Default)]
@@ -154,15 +154,9 @@ impl WakerProxyState {
     /// panic into a second panic at a later proxy operation.
     ///
     /// No user code runs under this mutex: every critical section here only
-    /// compares waker pointers, sets a `bool`, or moves a `Waker` between the
-    /// slot and an effects sink that was built before the guard. Nothing the
-    /// pair holds is therefore mid-update at a panic point, and what a
-    /// recovered guard can expose is bounded to an unconsumed `woken` record,
-    /// which costs the next caller one spurious poll. The converse — a
-    /// cleared record beside an already-removed waker, the lost wake this
-    /// proxy exists to prevent — is not producible: [`Wake::wake_by_ref`]
-    /// sets the record and empties the slot in one critical section with no
-    /// panic point between them.
+    /// compares waker pointers, bumps a counter, or moves a `Waker` between
+    /// the slot and an effects sink that was built before the guard, so a
+    /// recovered guard never exposes a half-applied update.
     ///
     /// Every acquisition goes through this helper so the non-panicking policy
     /// is structural, including drop-glue retirement, where an `.expect` on a
@@ -183,64 +177,31 @@ impl WakerProxy {
     /// Installs the current caller without cloning or dropping its waker
     /// while the proxy mutex is held.
     ///
-    /// # The lost-wake handshake
-    ///
-    /// Cloning `current` dispatches a caller-owned vtable, so it has to happen
-    /// between two critical sections. A wake landing in that window finds
-    /// either an empty slot or the *previous* poll's waker, and once a future
-    /// has migrated between tasks that previous waker no longer wakes the task
-    /// polling now. Installing the fresh waker on top of that would leave no
-    /// record the wake ever happened, and the future would never be polled
-    /// again.
-    ///
-    /// So [`Wake::wake_by_ref`] records `woken` in the same critical section in
-    /// which it takes the slot, and every registration that installs a waker
-    /// reads-and-clears that flag: a set flag takes the just-installed waker
-    /// straight back out and hands it to the effects sink, which wakes it after
-    /// unlock. No waker vtable is invoked or cloned under the mutex, and no
-    /// wake is lost. The cost is a spurious re-poll, which the `Future`
-    /// contract permits — a lost wake is not.
-    ///
-    /// The `will_wake` short-circuit rides the same read-and-clear rather than
-    /// returning early. It cannot in fact observe a set flag: `wake_by_ref`
-    /// empties the slot in the critical section that sets the flag, so a slot
-    /// still holding a matching waker proves nothing has woken since that waker
-    /// was installed. Handling it anyway costs one branch and keeps the "no
-    /// wake is lost" claim from resting on that invariant.
+    /// Every wake after this returns reaches `current`. A wake that lands
+    /// while `current` is cloned outside the mutex — when the slot is empty
+    /// or still holds a previous poll's waker — is detected by the moved
+    /// wake count and delivered to `current` after unlock. Wakes before this
+    /// call are the caller's to observe: it must poll its level-readiness
+    /// target after registering, as [`ProxiedPoll`]'s re-poll does.
     #[doc(hidden)]
     pub fn register(&self, current: &Waker) {
-        let mut replacement = None;
-        loop {
-            // Effects precede the guard, so a bookkeeping unwind still
-            // releases the mutex before a displaced RawWaker vtable runs.
-            let mut effects = WakerEffects::default();
-            let needs_clone = {
-                let mut registration = self.state.registration();
-                let installed = if registration.caller.will_wake(current) {
-                    true
-                } else if let Some(replacement) = replacement.take() {
-                    registration.caller.replace(replacement, &mut effects);
-                    true
-                } else {
-                    // Nothing was installed, so the flag stays set for the
-                    // registration that eventually succeeds.
-                    false
-                };
-                if installed && mem::take(&mut registration.woken) {
-                    registration.caller.take(WakerAction::Wake, &mut effects);
-                }
-                !installed
-            };
-            drop(effects);
-
-            if !needs_clone {
+        let observed = {
+            let registration = self.state.registration();
+            if registration.caller.will_wake(current) {
                 return;
             }
-            // `Waker::clone` dispatches through a caller-owned RawWaker
-            // vtable, so it belongs outside the proxy mutex. Re-check after
-            // cloning because a concurrent wake can empty the slot between
-            // the two critical sections.
-            replacement = Some(current.clone());
+            registration.wakes
+        };
+        // `Waker::clone` dispatches through a caller-owned vtable, so it runs
+        // between the two critical sections.
+        let replacement = current.clone();
+        // Effects precede the guard, so every exit — an unwind included —
+        // releases the mutex before a displaced or woken vtable runs.
+        let mut effects = WakerEffects::default();
+        let mut registration = self.state.registration();
+        registration.caller.replace(replacement, &mut effects);
+        if registration.wakes != observed {
+            registration.caller.take(WakerAction::Wake, &mut effects);
         }
     }
 
@@ -263,19 +224,9 @@ impl WakerProxy {
         effects.flush(panics);
     }
 
-    /// Moves the caller waker into an explicitly chosen post-unlock effect,
-    /// discarding any unconsumed wake record with it.
-    ///
-    /// `retire` tears the registration down rather than replacing it: its
-    /// callers have either observed the readiness the wake would have announced
-    /// or are abandoning the registration outright, so there is no later poll
-    /// for a retained flag to reach. Keeping the flag would only mean the next
-    /// caller to register on a reused proxy is woken once for an event that
-    /// predates it.
+    /// Moves the caller waker into an explicitly chosen post-unlock effect.
     pub(crate) fn retire(&self, action: WakerAction, effects: &mut WakerEffects) {
-        let mut registration = self.state.registration();
-        registration.woken = false;
-        registration.caller.take(action, effects);
+        self.state.registration().caller.take(action, effects);
     }
 }
 
@@ -305,17 +256,9 @@ impl Wake for WakerProxyState {
         let mut effects = WakerEffects::default();
         {
             let mut registration = self.registration();
-            // Record every wake, whether or not a caller is installed. An
-            // empty slot can mean the wake landed in `register`'s clone
-            // window; an occupied slot can hold the previous task's waker
-            // after migration. This leaf state cannot distinguish either case
-            // from an ordinary wake of the caller polling now, so it leaves
-            // the flag set after delivering that wake too. The next
-            // registration therefore installs, reads the flag, and takes its
-            // fresh waker straight back out: one extra clone and one spurious
-            // poll per delivered wake, which the `Future` contract permits —
-            // a lost wake is not. See `WakerProxy::register`.
-            registration.woken = true;
+            // Counted whether or not a caller is installed: an in-flight
+            // `register` compares the count across its clone window.
+            registration.wakes = registration.wakes.wrapping_add(1);
             registration.caller.take(WakerAction::Wake, &mut effects);
         }
     }
@@ -447,7 +390,7 @@ mod tests {
     ///
     /// `register` clones outside the proxy mutex, so this is a single-threaded
     /// replica of a driver thread waking between `register`'s two critical
-    /// sections — the window the `woken` handshake exists to close.
+    /// sections — the window the wake count exists to close.
     struct WindowWake {
         proxy: Weak<WakerProxyState>,
         armed: AtomicBool,
@@ -631,8 +574,8 @@ mod tests {
         let wakes = Arc::new(AtomicUsize::new(0));
         let caller = window_wake_waker(Arc::downgrade(&proxy.state), Arc::clone(&wakes));
 
-        // The wake fires while the slot is still empty, so the `woken` record
-        // is the only thing that can carry it forward.
+        // The wake fires while the slot is still empty, so the moved wake
+        // count is the only thing that can carry it forward.
         proxy.register(&caller);
 
         assert_eq!(
@@ -664,48 +607,76 @@ mod tests {
     }
 
     #[test]
-    fn a_delivered_wake_leaves_its_record_set_for_the_next_registration() {
+    fn a_delivered_wake_does_not_wake_the_next_registration() {
         let proxy = WakerProxy::new();
         let delivered = Arc::new(CountWake::default());
         proxy.register(&Waker::from(Arc::clone(&delivered)));
 
-        // An ordinary delivered wake: the caller polling now is installed, so
-        // nothing raced the registration and nothing is stale.
         proxy.waker().wake_by_ref();
         assert_eq!(delivered.0.load(Ordering::SeqCst), 1);
 
         let next = Arc::new(CountWake::default());
         proxy.register(&Waker::from(Arc::clone(&next)));
 
-        // The record is nonetheless left set, because this leaf state cannot
-        // tell that delivery apart from the racing one
-        // `a_window_wake_consuming_the_previous_caller_still_reaches_the_new_one`
-        // covers. That indistinguishability is what forces the spurious wake
-        // onto the ordinary path too, so the common case is pinned beside the
-        // race rather than left to the comment.
+        // The wake completed before this registration began, so the caller's
+        // own poll after registering observes its cause.
         assert_eq!(
             next.0.load(Ordering::SeqCst),
-            1,
-            "a delivered wake still wakes the caller that registers after it"
+            0,
+            "a wake delivered before registration is not replayed to the next caller"
         );
     }
 
     #[test]
-    fn retirement_discards_an_unconsumed_wake_record() {
+    fn a_wake_into_an_empty_slot_is_not_replayed_to_a_later_caller() {
         let proxy = WakerProxy::new();
         proxy.waker().wake_by_ref();
-
-        let mut effects = WakerEffects::default();
-        proxy.retire(WakerAction::DropInline, &mut effects);
-        drop(effects);
 
         let target = Arc::new(CountWake::default());
         proxy.register(&Waker::from(Arc::clone(&target)));
 
+        assert_eq!(target.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn an_ordinary_delivery_wakes_the_proxied_caller_exactly_once() {
+        let wakes = Arc::new(CountWake::default());
+        let caller = Waker::from(Arc::clone(&wakes));
+        let mut context = Context::from_waker(&caller);
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let mut target = PendingThenPayload {
+            polls: 0,
+            payload_drops: Arc::clone(&payload_drops),
+        };
+        let mut proxied = ProxiedPoll::new();
+        let registered = std::cell::RefCell::new(None);
+        let mut poll = |target: &mut PendingThenPayload, context: &mut Context<'_>| {
+            *registered.borrow_mut() = Some(context.waker().clone());
+            target.poll(context)
+        };
+
+        // Probe and proxied re-poll are both pending.
+        assert!(
+            proxied
+                .poll(&mut target, &mut context, &mut poll, Poll::is_pending)
+                .is_pending()
+        );
+        registered
+            .take()
+            .expect("the pending target registered the proxy")
+            .wake();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+
+        // The woken task polls once and finds the result ready.
+        assert!(
+            proxied
+                .poll(&mut target, &mut context, &mut poll, Poll::is_pending)
+                .is_ready()
+        );
         assert_eq!(
-            target.0.load(Ordering::SeqCst),
-            0,
-            "a retired registration leaves no wake for the next caller to inherit"
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "delivering a result must not schedule a further, empty poll of the caller"
         );
     }
 
@@ -737,12 +708,6 @@ mod tests {
             1,
             "registration and wake delivery both recover the poisoned leaf"
         );
-
-        // Clear the wake record that delivery leaves set, so the callers
-        // installed below are not woken by an event predating them.
-        let mut effects = WakerEffects::default();
-        proxy.retire(WakerAction::DropInline, &mut effects);
-        drop(effects);
 
         // Then each retirement seam in turn, because every one of them is
         // reachable from drop glue, where a panicking acquisition during an
@@ -882,6 +847,161 @@ mod tests {
         // The first (proxied) clone was the hostile drop. The original caller
         // can now be reclaimed without raising a second panic.
         drop(unsafe { ManuallyDrop::take(&mut caller) });
+    }
+
+    /// A per-poll caller waker for the stress test: it records its own wake
+    /// and unparks the polling thread. Its `clone` yields first, widening the
+    /// window `register` leaves between its two critical sections.
+    struct ParkWake {
+        woken: AtomicBool,
+        poller: std::thread::Thread,
+    }
+
+    unsafe fn clone_park(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable came from an Arc of the
+        // matching type. ManuallyDrop preserves the reference represented by
+        // `data`; the returned raw waker owns only the new clone.
+        let state = ManuallyDrop::new(unsafe { Arc::<ParkWake>::from_raw(data.cast()) });
+        std::thread::yield_now();
+        RawWaker::new(Arc::into_raw(Arc::clone(&state)).cast(), &PARK_VTABLE)
+    }
+
+    unsafe fn wake_park(data: *const ()) {
+        // SAFETY: wake consumes the Arc reference represented by this waker.
+        let state = unsafe { Arc::<ParkWake>::from_raw(data.cast()) };
+        state.woken.store(true, Ordering::SeqCst);
+        state.poller.unpark();
+    }
+
+    unsafe fn wake_by_ref_park(data: *const ()) {
+        // SAFETY: wake_by_ref borrows the Arc reference represented by this
+        // waker, which ManuallyDrop preserves.
+        let state = ManuallyDrop::new(unsafe { Arc::<ParkWake>::from_raw(data.cast()) });
+        state.woken.store(true, Ordering::SeqCst);
+        state.poller.unpark();
+    }
+
+    unsafe fn drop_park(data: *const ()) {
+        // SAFETY: drop consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<ParkWake>::from_raw(data.cast()) });
+    }
+
+    static PARK_VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_park, wake_park, wake_by_ref_park, drop_park);
+
+    fn park_waker(state: &Arc<ParkWake>) -> Waker {
+        let raw = RawWaker::new(Arc::into_raw(Arc::clone(state)).cast(), &PARK_VTABLE);
+        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
+        // ownership across clone, wake, and drop.
+        unsafe { Waker::from_raw(raw) }
+    }
+
+    /// A level-readiness primitive: a monotonic event count plus the one
+    /// waker its latest pending poll registered, which it keeps (rather than
+    /// takes) so every later wake re-enters the same proxy.
+    #[derive(Default)]
+    struct LevelCounter {
+        produced: AtomicUsize,
+        registered: std::sync::Mutex<Option<Waker>>,
+    }
+
+    impl LevelCounter {
+        fn poll(&self, seen: usize, context: &mut Context<'_>) -> Poll<usize> {
+            // Register before reading, as a real primitive does, so a
+            // producer that publishes after the read finds this waker.
+            *self.registered.lock().expect("unpoisoned") = Some(context.waker().clone());
+            let produced = self.produced.load(Ordering::SeqCst);
+            if produced > seen {
+                Poll::Ready(produced)
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn wake(&self) {
+            let waker = self.registered.lock().expect("unpoisoned").clone();
+            if let Some(waker) = waker {
+                waker.wake_by_ref();
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_wakes_across_re_registration_are_never_lost() {
+        const EVENTS: usize = 10_000;
+        const STALL: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let target = Arc::new(LevelCounter::default());
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let producer = {
+            let target = Arc::clone(&target);
+            let consumed = Arc::clone(&consumed);
+            std::thread::spawn(move || {
+                for event in 1..=EVENTS {
+                    // One state change and exactly one wake per event, issued
+                    // only once the previous event is consumed: no later wake
+                    // can rescue one that goes astray, so a lost wake stalls
+                    // the poller below.
+                    let started = std::time::Instant::now();
+                    while consumed.load(Ordering::SeqCst) < event - 1 {
+                        assert!(started.elapsed() < STALL, "the poller stalled");
+                        std::thread::yield_now();
+                    }
+                    for _ in 0..event % 5 {
+                        std::thread::yield_now();
+                    }
+                    target.produced.store(event, Ordering::SeqCst);
+                    target.wake();
+                }
+            })
+        };
+
+        let mut proxied = ProxiedPoll::new();
+        let mut seen = 0;
+        let mut polls = 0usize;
+        while seen < EVENTS {
+            // A few pending re-polls per round, each under a fresh caller
+            // identity, as when a future migrates between tasks: the proxy
+            // persists, so every one re-registers and clones outside the
+            // lock, and a wake landing on an earlier identity reaches a
+            // "task" that is no longer waiting. Only the last identity is
+            // waited on.
+            let mut caller = None;
+            for _ in 0..=polls % 4 {
+                let fresh = Arc::new(ParkWake {
+                    woken: AtomicBool::new(false),
+                    poller: std::thread::current(),
+                });
+                let waker = park_waker(&fresh);
+                let mut context = Context::from_waker(&waker);
+                polls += 1;
+                let result = proxied.poll(
+                    &mut &*target,
+                    &mut context,
+                    |target, context| target.poll(seen, context),
+                    Poll::is_pending,
+                );
+                if let Poll::Ready(produced) = result {
+                    seen = produced;
+                    consumed.store(seen, Ordering::SeqCst);
+                    caller = None;
+                    break;
+                }
+                caller = Some(fresh);
+            }
+            let Some(caller) = caller else { continue };
+            let started = std::time::Instant::now();
+            while !caller.woken.load(Ordering::SeqCst) {
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed < STALL,
+                    "lost wakeup: pending at {seen}/{EVENTS} with {} produced after {polls} polls",
+                    target.produced.load(Ordering::SeqCst),
+                );
+                std::thread::park_timeout(STALL - elapsed);
+            }
+        }
+        producer.join().expect("the producer thread completes");
     }
 
     #[test]

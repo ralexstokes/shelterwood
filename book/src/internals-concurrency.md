@@ -109,12 +109,14 @@ user-code effect for after unlock.
 
 The subtle part is the lost-wake handshake: cloning the caller's waker
 happens *between* two critical sections, and a wake landing in that
-window would find the previous poll's waker. So the proxy's `wake_by_ref`
-records a `woken` flag in the same critical section that takes the slot,
-and every registration reads-and-clears the flag after installing — a set
-flag takes the just-installed waker straight back out to be woken after
-unlock. The cost is a spurious re-poll, which `Future` permits; the
-alternative is a lost wake, which it does not.
+window would find an empty slot or the previous poll's waker. So the
+proxy's `wake_by_ref` bumps a wake count under the leaf mutex, and a
+registration snapshots the count before cloning: if it moved by the time
+the fresh waker is installed, that waker is taken straight back out and
+woken after unlock. A wake that completed before registration began is
+not replayed — the caller's poll of its level-readiness target after
+registering observes its cause — so an ordinary delivery costs no extra
+poll.
 
 `ProxiedPoll` wraps the proxy in a probe/install/re-poll state machine:
 first poll with a noop waker (preserving the already-ready fast path with

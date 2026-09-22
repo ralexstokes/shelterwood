@@ -178,6 +178,9 @@ pub(super) struct PendingTerminal {
     exit: RetainedExit,
     exited_incarnation: Option<Incarnation>,
     startup: StartupDisposition,
+    /// Set once this terminal's startup failure has been decided at exit
+    /// dispatch, so disposal completion does not route it a second time.
+    startup_routed: bool,
 }
 
 impl ChildRuntime {
@@ -1250,6 +1253,7 @@ impl ScopeRuntime {
                     .expect("terminal disposal installs its retained exit once"),
                 exited_incarnation,
                 startup,
+                startup_routed: false,
             });
             child.slot.member.set_terminal_disposal_pending(true);
             child.construction.take()
@@ -1281,6 +1285,30 @@ impl ScopeRuntime {
                 signal.pulse();
             }
         });
+
+        // §7: the scope leaves `Starting` the moment the exit funnel
+        // dispatches a terminal pre-ready exit, and that exit names the
+        // failure. Disposal of a retained construction completes on the
+        // blocking pool at an arbitrary later time, so decide the startup
+        // failure now: otherwise a same-wake sibling's faster disposal, a
+        // shutdown request or an intensity trip landing in the gap would take
+        // the verdict instead. Only the member's terminal publication waits
+        // for disposal.
+        let startup_exit = self
+            .children
+            .get_mut(key)
+            .and_then(|child| child.pending_terminal.as_mut())
+            .filter(|pending| pending.startup == StartupDisposition::Aborted)
+            .map(|pending| {
+                pending.startup_routed = true;
+                pending.exit.clone()
+            });
+        if let Some(exit) = startup_exit
+            && self.supervisor.membership_status(key) != MembershipStatus::Removing
+            && !self.supervisor.lifecycle().is_draining()
+        {
+            self.fail_startup(key, &exit);
+        }
     }
 
     pub(super) fn handle_construction_disposed(
@@ -1334,6 +1362,7 @@ impl ScopeRuntime {
             self.flush_supervisor_effects();
         } else {
             if terminal.startup == StartupDisposition::Aborted
+                && !terminal.startup_routed
                 && !self.supervisor.lifecycle().is_draining()
             {
                 self.fail_startup(key, &exit);

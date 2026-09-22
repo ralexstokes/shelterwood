@@ -74,7 +74,6 @@ pub(crate) use admission_control::{
     reserve_dynamic, signal_fused_cancel, start_admission,
 };
 
-#[cfg(test)]
 pub(crate) use admission_control::{LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR};
 
 #[cfg(test)]

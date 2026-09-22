@@ -513,7 +513,18 @@ established in the construction-path types, before erasure:
   path. This prohibition does not cover internal, non-panicking
   synchronization claims such as disposal completion, where losing the
   claim race is an ordinary no-op rather than a re-asserted construction
-  capability. The independent owned-token and consuming rules for
+  capability. A reserved slot's definition cell (§9's split
+  reserve/define) is not such a claim, and it needs no carve-out. Its
+  once-ness is the owned-token shape: every public `define` consumes the
+  reservation, and lowering consumes the plan. So a second definition or
+  a second lowering is unrepresentable to callers. The cell underneath
+  is an internal state machine, and its duplicate-definition and
+  second-lowering branches are unreachable invariant assertions, not
+  outcomes of a race. Such an assertion MAY panic, but only after
+  releasing the cell's lock and with any rejected definition handed to
+  isolated disposal. It never mints a capability the owned construction
+  value did not already carry.
+  The independent owned-token and consuming rules for
   readiness (§7), exit reports (§8), guards (B.7), and public
   exactly-once operations (B.10) remain mandatory (§1 principle 3).
 - **Every user-supplied construction source executes inside the single
@@ -1261,16 +1272,28 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   the aggregate has fired holds it open until the fresh incarnation's
   re-armed gate releases (the re-arm rule above); once fired, later churn
   is invisible to it. Per-child readiness is likewise once per
-  incarnation — the `mark_ready` token — re-armed by each restart.
+  incarnation — the `mark_ready` latch — re-armed by each restart.
 - Kind defaults and valid modes: blanket `Actor` children default
   `AfterInit` with all three modes valid; raw actors and tasks default
   `Immediate` and may declare `Manual` (`AfterInit` is meaningless
-  without an `init` and is rejected eagerly, §10.3); subtree children
+  without an `init`, so a raw or task *definition override* naming it is
+  rejected eagerly, §10.3). A raw actor's type-level readiness is trusted
+  definition metadata rather than an override. Declaring `AfterInit`
+  there is how an init-owning wrapper — `Handler<A>`, or a decorator
+  delegating to one — states that it performs the post-init mark itself.
+  The engine cannot tell such a wrapper from a plain raw actor, so a raw
+  actor that declares `AfterInit` without marking is gated exactly as
+  `Manual` would be, and its readiness deadline applies. Subtree children
   have no mode knob — their readiness is structural (the recursive rule
   above), bounded by the resolved readiness deadline.
 - Manual readiness is reported through a public context operation
-  (`mark_ready`), one-shot per incarnation **by construction** (an owned
-  token or equivalent — not a runtime take-once flag; §1 principle 3). It
+  (`mark_ready`), whose readiness **effect** is one-shot per incarnation
+  by construction (§1 principle 3): the call reaches the incarnation's
+  single readiness latch, which fires at most once and makes every later
+  call an observable no-op. The call itself is idempotent rather than
+  consuming, so a context may be `Clone` (the task context is); what
+  cannot exist is a second readiness edge, or an edge credited to another
+  incarnation. It
   is reachable from the raw context, the task context (B.2), and the live
   handler `Context` (B.1) — a `Manual` handler actor completes its
   handshake in `init` or `handle` and marks ready right there. Where the
@@ -2852,6 +2875,41 @@ shapes, and moving a value out (rather than dropping it in place) is the
 degenerate case. What the rule buys is that a hostile waker or destructor
 is an ordinary, testable outcome instead of a liveness failure (§16.18).
 
+That outcome is pinned, not left to the flush site. A panic raised by
+user code the framework runs after unlock is contained until the effects
+value has discharged every other queued effect, then resumed on the task
+that ran the flush. When that task is a user task — a sender, a caller,
+an actor — the panic is that task's own, and for an incarnation it
+classifies through §8 like any other panic. When it is a framework task,
+the panic is a driver death. Wakes of caller-registered wakers flushed
+by a scope driver (a parked sender woken by a rebind) are this case, so
+a waker that panics on `wake` can fail the scope that woke it. §11's driver-death rule and
+§15.5's owned completions then discharge every outstanding promise, so
+the failure is observable and bounded. It is never a wedge, a poisoned
+lock, or an abort.
+
+Two flush sites discard the contained panic instead of resuming it:
+
+- **By-value delivery seams.** The flushing frame may own a completed
+  result or a recovered user value that it is about to hand back. Examples
+  are a ready edge retiring the caller's waker, a timed send withdrawing
+  after expiry, and a call closing its reply channel over a recovered
+  `SendError`. At such a seam the panic is caught and discarded, and the
+  value is returned as if the flush had succeeded. For example, a timed
+  send still reports `TimedOut` with its message. Resuming there would
+  destroy that value during the unwind, and a second hostile destructor
+  would turn that into an abort. Losing the diagnostic is the accepted
+  cost.
+- **Post-classification framework observers.** Once a driver's exit is
+  classified and joined, a panic from the terminal flush cannot change
+  the verdict. It is discarded rather than raised as a second failure
+  over a completed one.
+
+An implementation MAY route a given wake through a proxy that retires
+the caller's waker on the caller's own task. The proxy's ready-edge
+retirement is then a by-value delivery seam as above. Nothing requires
+a proxy.
+
 Applied to the mailbox layer (§5): mailbox and send-operation mutexes
 protect only synchronous state transitions. A transition records signal
 pulses, waker wake/drop actions, displaced payloads, and
@@ -3439,9 +3497,9 @@ or immediately under `Abort` policy; the tidy-abort beat runs after it
 fires, and §11's classification rule applies: a task that yields an
 outcome during the beat classifies by that outcome, while a future
 destroyed by the ensuing hard abort records `Aborted { phase }`),
-`mark_ready()` (one-shot by construction; no-op only where declared
-readiness makes it meaningless, and that is a documented no-op, not a
-silent state change — the same rule covers a stopping incarnation: once
+`mark_ready()` (its readiness edge is one-shot per incarnation, §7;
+no-op only where declared readiness makes it meaningless, and that is a
+documented no-op, not a silent state change — the same rule covers a stopping incarnation: once
 either cooperative shutdown or escalation has begun, readiness can no
 longer be published and the call is likewise a documented no-op, matching
 B.1's during-drain rule for the actor contexts).
@@ -3490,7 +3548,11 @@ retry discipline consumes it:
 - Pre-acceptance expiries (`TimedOut`, `AcceptanceTimedOut`) carry the
   **newest incarnation observed bound during the attempt**, `None` if
   none ever was — never an "accepting" incarnation, since successful
-  withdrawal proved there is none.
+  withdrawal proved there is none. "Bound" here includes an incarnation
+  whose intake was frozen at stop (§5.4). That is the same observation
+  `try_send`'s `NotRunning` reports as `Some` above, and it tells a
+  retrier which incarnation it must see superseded (§3.3). Only a rebind
+  window or a pre-spawn membership contributes nothing.
 
 `ReplyReceiver<T>` is an owned at-most-once value (B.10): `Send`, not
 `Clone`, and `recv` is **consuming** — one receiver, one wait, per B.10's

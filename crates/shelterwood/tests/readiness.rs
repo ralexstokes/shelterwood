@@ -1756,3 +1756,226 @@ async fn startup_failure_is_decided_at_dispatch_not_after_construction_disposal(
         .await
         .expect("the requested shutdown completes");
 }
+
+/// A started task that, once cancelled, holds its stop open until `release`,
+/// so an ordered drain's reverse walk parks on it and the members it already
+/// stopped stay resident and observable before scope exit clears them.
+fn drain_hold(release: ReleaseGate) -> TaskDef {
+    TaskDef::new(move |context| {
+        let release = release.clone();
+        async move {
+            context.shutdown_token().cancelled().await;
+            release.wait().await;
+            Ok(())
+        }
+    })
+    .shutdown(Shutdown::graceful(Duration::from_secs(60)).expect("grace is non-zero"))
+}
+
+/// B.6 reserves `StartupAborted` for §7's terminal pre-ready failure. An owner
+/// shutdown during `Starting` stops the root's still-starting child, and the
+/// ancestor shutdown reaching the nested scope stops its gated child; neither
+/// stop is a startup failure, so both terminals are `Stopped`.
+#[tokio::test]
+async fn shutdown_during_starting_stops_gated_children_without_startup_abort() {
+    let started = Arc::new(AtomicBool::new(false));
+    let root_hold = ReleaseGate::default();
+    let nested_hold = ReleaseGate::default();
+    let mut nested = Tree::new();
+    nested
+        .add_task("hold", drain_hold(nested_hold.clone()))
+        .expect("valid held task");
+    nested
+        .add_task(
+            "gate",
+            start_signalled_waiting_task(Arc::clone(&started))
+                .readiness(Readiness::Manual)
+                .expect("manual readiness")
+                .readiness_deadline(ReadinessDeadline::Unbounded),
+        )
+        .expect("valid gated task");
+    let mut tree = Tree::new();
+    tree.add_task("hold", drain_hold(root_hold.clone()))
+        .expect("valid held task");
+    tree.add_subtree_once(
+        "inner",
+        SubtreeOnceDef::new(nested)
+            .readiness_deadline(ReadinessDeadline::Unbounded)
+            .retention(Retention::Retain),
+    )
+    .expect("valid nested scope");
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    assert_eventually!(|| started.load(Ordering::SeqCst)).await;
+    assert!(matches!(scope.snapshot().state, ScopeState::Starting));
+
+    scope.request_shutdown();
+    let inner = scope
+        .wait_for_child(
+            "inner",
+            |child| {
+                child
+                    .nested
+                    .as_ref()
+                    .and_then(|nested| nested.child("gate"))
+                    .is_some_and(|gate| gate.state.is_terminal())
+            },
+            POLL_TIMEOUT,
+        )
+        .await
+        .expect("the nested gate terminalizes while the nested hold drains");
+    let gate = inner
+        .nested
+        .as_ref()
+        .and_then(|nested| nested.child("gate"))
+        .expect("the predicate matched the nested gate");
+    assert!(
+        matches!(gate.state, ChildState::Stopped { .. }),
+        "an ancestor shutdown during Starting is not a startup abort: {gate:?}"
+    );
+
+    nested_hold.release();
+    let inner = scope
+        .wait_for_child("inner", |child| child.state.is_terminal(), POLL_TIMEOUT)
+        .await
+        .expect("the nested scope terminalizes while the root hold drains");
+    assert!(
+        matches!(inner.state, ChildState::Stopped { .. }),
+        "an owner shutdown during Starting is not a startup abort: {inner:?}"
+    );
+
+    root_hold.release();
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("the requested shutdown completes");
+}
+
+/// A root parked in `StartupFailed` keeps dispatching its started prefix as
+/// `Running` (§12). A prefix child that was ready, fails, and restarts during
+/// the park has spent its initial readiness edge, so an owner shutdown that
+/// stops the restarted incarnation before it marks ready is not a startup
+/// abort (B.6).
+#[tokio::test]
+async fn parked_prefix_restart_stopped_by_shutdown_is_not_a_startup_abort() {
+    let hold = ReleaseGate::default();
+    let fail = ReleaseGate::default();
+    let tree = parked_prefix_tree(hold.clone(), fail.clone(), |context| async move {
+        context.shutdown_token().cancelled().await;
+        Ok(())
+    });
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    assert!(matches!(
+        system.wait_started().await,
+        Err(StartupError::StartupFailed(_))
+    ));
+
+    fail.release();
+    assert_eventually!(|| scope.child("prefix").is_some_and(|child| {
+        child.restart_count.get() == 1 && matches!(child.state, ChildState::Starting)
+    }))
+    .await;
+    assert!(matches!(scope.snapshot().state, ScopeState::StartupFailed));
+
+    scope.request_shutdown();
+    let prefix = scope
+        .wait_for_child("prefix", |child| child.state.is_terminal(), POLL_TIMEOUT)
+        .await
+        .expect("the prefix terminalizes while the hold drains");
+    assert!(
+        matches!(prefix.state, ChildState::Stopped { .. }),
+        "a restarted prefix stopped by shutdown is not a startup abort: {prefix:?}"
+    );
+
+    hold.release();
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("the requested shutdown completes");
+}
+
+/// The park's exit funnel dispatches as `Running` (§12), so a restarted prefix
+/// incarnation that completes before marking ready is an ordinary terminal
+/// exit under its restart policy. Its initial readiness edge already fired
+/// before the park; the restart does not rewind it (§7, B.6).
+#[tokio::test]
+async fn parked_prefix_restart_completing_pre_ready_is_not_a_startup_abort() {
+    let hold = ReleaseGate::default();
+    let fail = ReleaseGate::default();
+    let tree = parked_prefix_tree(hold.clone(), fail.clone(), |_| async { Ok(()) });
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    assert!(matches!(
+        system.wait_started().await,
+        Err(StartupError::StartupFailed(_))
+    ));
+
+    fail.release();
+    let prefix = scope
+        .wait_for_child("prefix", |child| child.state.is_terminal(), POLL_TIMEOUT)
+        .await
+        .expect("the restarted prefix completes");
+    assert!(
+        matches!(
+            &prefix.state,
+            ChildState::Stopped { exit } if matches!(exit.kind(), ExitKind::Completed)
+        ),
+        "a restarted prefix completing in the park is not a startup abort: {prefix:?}"
+    );
+    assert!(matches!(scope.snapshot().state, ScopeState::StartupFailed));
+
+    hold.release();
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("the parked root stops");
+}
+
+/// An ordered root led by a [`drain_hold`], then a `prefix` that marks ready,
+/// fails once `fail` is released and restarts under `OnFailure` into
+/// `restarted`, then a sibling whose terminal pre-ready failure parks the root
+/// in `StartupFailed`.
+fn parked_prefix_tree<F, Fut>(hold: ReleaseGate, fail: ReleaseGate, restarted: F) -> Tree
+where
+    F: Fn(shelterwood::TaskContext) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ExitResult> + Send + 'static,
+{
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    tree.add_task("hold", drain_hold(hold))
+        .expect("valid held task");
+    tree.add_task(
+        "prefix",
+        TaskDef::new(move |context| {
+            let first = runs.fetch_add(1, Ordering::SeqCst) == 0;
+            let fail = fail.clone();
+            let restarted = restarted.clone();
+            async move {
+                if !first {
+                    return restarted(context).await;
+                }
+                context.mark_ready();
+                fail.wait().await;
+                Err(ExitError::message("post-ready failure"))
+            }
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded)
+        .restart(RestartPolicy::new(
+            RestartCondition::OnFailure,
+            Backoff::Immediate,
+        )),
+    )
+    .expect("valid prefix task");
+    tree.add_task(
+        "failing",
+        TaskDef::new(|_| async { Err(ExitError::message("pre-ready failure")) })
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .restart(never()),
+    )
+    .expect("valid failing task");
+    tree
+}

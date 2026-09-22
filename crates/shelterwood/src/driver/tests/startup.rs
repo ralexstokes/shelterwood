@@ -782,6 +782,66 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
     );
 }
 
+/// A shutdown request outranks the readiness signal in arbitration, so a
+/// `mark_ready` whose latch fired just before the shutdown batch still has
+/// its Ready event queued when the drain stops the child. The stop's Shutdown
+/// step disarms the gate, and the queued signal and the exit's
+/// `readiness_signal_seen` both land on a disarmed gate afterwards; the stop
+/// itself must credit the fired latch (§7).
+#[crate::runtime::test]
+async fn drain_stop_credits_an_already_fired_readiness_latch() {
+    let mut tree = Tree::new();
+    tree.add_task(
+        "gate",
+        TaskDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness is valid")
+        .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid task");
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
+
+    scope.spawn_child(key);
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("spawned child is active");
+    // The application task marked ready; the driver has not yet drained the
+    // corresponding Ready event.
+    assert!(active.ready_signal.fire());
+    let mut lifecycle = root.subscribe_lifecycle();
+
+    scope.begin_drain(StopReason::ShutdownRequested);
+
+    assert!(
+        matches!(
+            scope.children[key].slot.member.record().stage,
+            MemberStage::Stopping
+        ),
+        "the regression premise: the drain stopped the gated child"
+    );
+    assert!(
+        scope.supervisor.initial_ready(key),
+        "a latch fired before the stop counts as the child's readiness"
+    );
+    let mut published = Vec::new();
+    while let Ok(crate::cells::LifecycleItem::Event(event)) = lifecycle.try_recv() {
+        published.push(event.kind);
+    }
+    assert!(
+        published
+            .iter()
+            .any(|kind| matches!(kind, LifecycleEventKind::Ready { .. })),
+        "the credited latch publishes its readiness edge: {published:?}"
+    );
+}
+
 /// `next_ordered_start` is held across `spawn_child` and is never cleared by
 /// `reclaim_child`, so `progress_startup` must treat a reclaimed key the way
 /// `stop_next_ordered` treats its own cursor: already gone, advance past it.

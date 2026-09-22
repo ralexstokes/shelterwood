@@ -857,7 +857,27 @@ impl ScopeRuntime {
             }
             return;
         }
-        if child.active.is_some() {
+        if let Some(active) = &child.active {
+            let incarnation = active.incarnation;
+            if forced.is_none() && active.ready_signal.is_fired() {
+                // The Shutdown step below disarms the gate, and a queued
+                // readiness signal ranks behind the stop that got here (§13).
+                // Credit a latch that already fired now, while the member is
+                // still `Starting`, so a `mark_ready` preceding the stop
+                // counts exactly as `handle_self_stop` makes it count (§7).
+                // A self-stop credited its latch before calling here and a
+                // removal suppresses the edge, so the edge this can publish
+                // belongs to a drain: startup has already left `Starting`,
+                // and the caller's settlement owns any follow-up.
+                let effect = self
+                    .children
+                    .get_mut(key)
+                    .and_then(|child| child.active.as_mut())
+                    .and_then(|active| active.readiness.step(ReadinessEvent::Signal));
+                if let Some(effect) = effect {
+                    let _ = self.apply_readiness_effect(key, incarnation, effect);
+                }
+            }
             self.reduce(SupervisorEvent::StopStarted { child: key });
             let child = self
                 .children
@@ -1204,8 +1224,13 @@ impl ScopeRuntime {
         // §7's startup abort is a startup-sequence property: the membership
         // failed before its *initial* readiness edge. A later incarnation
         // stopped pre-ready (for example during drain) does not rewind it.
+        // A drain has already taken the startup verdict — an owner or
+        // ancestor shutdown, or this scope's own rollback — and dispatches
+        // every exit terminal regardless of policy, so an exit it dispatches
+        // is the drain's, never the §7 terminal pre-ready failure (B.6).
         if self.supervisor.is_initial(key)
             && !self.supervisor.lifecycle().startup_complete()
+            && !self.supervisor.lifecycle().is_draining()
             && !self.supervisor.initial_ready(key)
         {
             StartupDisposition::Aborted

@@ -483,8 +483,8 @@ fn check_r3_removal_is_sampled_at_publication(transition: &Transition<'_>) {
 }
 
 /// R1/R2/R6 — the startup aggregate is derived from initial memberships only,
-/// readiness is monotone until a restart rearms it while startup is
-/// incomplete, and a completed startup never rewinds.
+/// readiness is monotone until a restart rearms it while the scope is
+/// still `Starting`, and a completed startup never rewinds.
 fn check_r1_r2_r6_startup_aggregate(transition: &Transition<'_>) {
     assert!(
         !transition.before.lifecycle().startup_complete()
@@ -530,8 +530,8 @@ fn check_r1_r2_r6_startup_aggregate(transition: &Transition<'_>) {
                 transition.event
             );
             assert!(
-                !transition.before.lifecycle().startup_complete(),
-                "a restart cannot rearm the gate once startup has completed"
+                transition.before.lifecycle().is_starting(),
+                "a restart rearms the gate only while startup is in progress"
             );
         }
     }

@@ -12,10 +12,23 @@ use crate::{
     runtime::{DisposingReceiver, Latch},
 };
 
-#[cfg(test)]
 use crate::driver::{LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR};
 
 use super::slots::AdmissionOwnership;
+
+/// Resolves a driver response that may have been lost.
+///
+/// The driver's owned completion publishes on every path, including its own
+/// drop fallback, so `None` means that obligation regressed. SPEC B.8: debug
+/// builds expose the regression by panicking; release builds fail closed to
+/// `fallback`.
+fn fail_closed<T>(response: Option<T>, fallback: T, debug_panics: bool, what: &str) -> T {
+    match response {
+        Some(response) => response,
+        None if debug_panics => panic!("{what} response obligation must complete"),
+        None => fallback,
+    }
+}
 
 /// An admission future.
 ///
@@ -25,14 +38,12 @@ use super::slots::AdmissionOwnership;
 /// and releases the reservation.
 ///
 /// The driver's admission obligation publishes an outcome on every path,
-/// including its own drop fallback, so this future always resolves through
-/// [`ReserveError`]. If that obligation is ever destroyed without publishing,
-/// awaiting the admission **panics** rather than resolving: reporting a
-/// terminal scope would be a false outcome for a reservation that may still be
-/// live, and a caller that reconciles on it would be reconciling against a
-/// lie. The panic is a framework invariant failure in every profile, not a
-/// condition callers can encounter or handle.
-/// Like a fused future, it remains pending if polled again after completion.
+/// including its own drop fallback, so this future always resolves to the
+/// admitted handles or a [`ReserveError`]. Should that obligation ever be
+/// destroyed without publishing — a framework invariant failure, not a
+/// condition callers can provoke — debug builds panic and release builds
+/// resolve [`ReserveError::NotAdmitting`] with a terminal cause (SPEC B.8).
+/// Once complete, further polls return `Pending`.
 #[must_use]
 pub struct Admission<H> {
     state: AdmissionState<H>,
@@ -177,7 +188,12 @@ impl<H> Future for Admission<H> {
                 }
                 AdmissionState::InFlight { wait, .. } => match wait.poll_receive(context) {
                     Poll::Ready(result) => {
-                        let result = result.expect("admission response obligation must complete");
+                        let result = fail_closed(
+                            result,
+                            Err(LOST_ADMISSION_RESPONSE_ERROR),
+                            cfg!(debug_assertions),
+                            "admission",
+                        );
                         let previous = std::mem::replace(&mut this.state, AdmissionState::Done);
                         let AdmissionState::InFlight { pending, .. } = previous else {
                             unreachable!("the matched admission state was replaced in place")
@@ -213,12 +229,11 @@ impl<H> Drop for Admission<H> {
 }
 /// Observation future for a synchronously latched dynamic removal.
 ///
-/// The driver publishes the latched outcome on every destruction path. If that
-/// obligation is ever destroyed without publishing, awaiting the removal
-/// **panics** rather than resolving, for the same reason as [`Admission`]: a
-/// synthesized `Removed` would report a completed withdrawal that no driver
-/// performed. It is a framework invariant failure in every profile, not a
-/// condition callers can encounter or handle.
+/// The driver publishes the latched outcome on every destruction path. Should
+/// that obligation ever be destroyed without publishing — a framework
+/// invariant failure — debug builds panic and release builds resolve
+/// [`RemoveOutcome::Removed`]: the removal latched at the call, and its route
+/// becoming terminal satisfies the removal goal (SPEC B.8).
 #[must_use]
 pub struct Removal {
     inner: DisposingReceiver<RemoveOutcome>,
@@ -242,9 +257,14 @@ impl Future for Removal {
     type Output = RemoveOutcome;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        self.inner
-            .poll_receive(context)
-            .map(|result| result.expect("removal response obligation must complete"))
+        self.inner.poll_receive(context).map(|result| {
+            fail_closed(
+                result,
+                LATCHED_REMOVAL_OUTCOME,
+                cfg!(debug_assertions),
+                "removal",
+            )
+        })
     }
 }
 
@@ -311,7 +331,15 @@ mod tests {
     }
 
     #[test]
-    fn closed_removal_response_panics_in_every_profile() {
+    fn lost_response_panics_in_debug_and_fails_closed_in_release() {
+        let debug = catch_unwind(|| super::fail_closed(None, 0, true, "test"));
+        assert!(debug.is_err(), "debug builds expose the lost response");
+        assert_eq!(super::fail_closed(None, 7, false, "test"), 7);
+        assert_eq!(super::fail_closed(Some(3), 7, true, "test"), 3);
+    }
+
+    #[test]
+    fn closed_removal_response_follows_the_build_profile() {
         let (sender, response) = crate::runtime::oneshot();
         drop(sender);
         let mut removal = Removal::new(response);
@@ -320,10 +348,14 @@ mod tests {
             Pin::new(&mut removal).poll(&mut context)
         }));
 
-        assert!(
-            observed.is_err(),
-            "every profile exposes the broken removal response obligation"
-        );
+        if cfg!(debug_assertions) {
+            assert!(observed.is_err(), "debug builds expose the lost response");
+        } else {
+            assert!(matches!(
+                observed,
+                Ok(Poll::Ready(crate::RemoveOutcome::Removed))
+            ));
+        }
     }
 
     #[crate::runtime::test]

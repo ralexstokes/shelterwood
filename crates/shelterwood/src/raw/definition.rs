@@ -182,6 +182,11 @@ struct RawIncarnationOwner<R: RawActor> {
     raw: Option<RawContext<R::Msg>>,
     actor: Option<R>,
     primary_panic: Option<PanicPayload>,
+    /// Teardown panics the epilogue has already taken out of the resource
+    /// slot. They live here, not in an epilogue local, because a hard abort
+    /// at the resource join destroys the future without running the rest of
+    /// the epilogue; `Drop` must still see them (§8: a panic is never masked).
+    cleanup_panic: Option<PanicPayload>,
 }
 
 impl<R: RawActor> RawIncarnationOwner<R> {
@@ -190,6 +195,7 @@ impl<R: RawActor> RawIncarnationOwner<R> {
             raw: Some(raw),
             actor: Some(actor),
             primary_panic: None,
+            cleanup_panic: None,
         }
     }
 
@@ -222,6 +228,14 @@ impl<R: RawActor> RawIncarnationOwner<R> {
     fn take_primary_panic(&mut self) -> Option<PanicPayload> {
         self.primary_panic.take()
     }
+
+    fn record_cleanup_panic(&mut self, payload: Option<PanicPayload>) {
+        keep_first_panic(&mut self.cleanup_panic, payload);
+    }
+
+    fn take_cleanup_panic(&mut self) -> Option<PanicPayload> {
+        self.cleanup_panic.take()
+    }
 }
 
 impl<R: RawActor> Drop for RawIncarnationOwner<R> {
@@ -233,6 +247,7 @@ impl<R: RawActor> Drop for RawIncarnationOwner<R> {
         // panic that completed before cancellation was requested.
         let primary_panic = self.take_primary_panic();
         let mut cleanup = PanicAccumulator::default();
+        cleanup.record(self.take_cleanup_panic());
         cleanup.run(|| self.drop_raw());
         cleanup.run(|| self.drop_actor());
         resume_preferred_panic(UnwindPanics {
@@ -270,19 +285,20 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
             })
             .err();
             let resource_freeze_panic = catch_panic(|| owner.raw().freeze_resources()).err();
-            let mut cleanup_panic = owner.raw().take_resource_panic();
-            keep_first_panic(&mut cleanup_panic, mailbox_freeze_panic);
-            keep_first_panic(&mut cleanup_panic, resource_freeze_panic);
+            let retained = owner.raw().take_resource_panic();
+            owner.record_cleanup_panic(retained);
+            owner.record_cleanup_panic(mailbox_freeze_panic);
+            owner.record_cleanup_panic(resource_freeze_panic);
 
             let joined = CatchUnwindFuture::new(owner.raw().join_resources()).await;
-            keep_first_panic(&mut cleanup_panic, joined.err());
+            owner.record_cleanup_panic(joined.err());
             let pending = owner.raw().take_resource_panic();
-            keep_first_panic(&mut cleanup_panic, pending);
+            owner.record_cleanup_panic(pending);
             let raw_drop = catch_panic(|| owner.drop_raw()).err();
-            keep_first_panic(&mut cleanup_panic, raw_drop);
+            owner.record_cleanup_panic(raw_drop);
 
             let actor_drop = catch_panic(|| owner.drop_actor()).err();
-            keep_first_panic(&mut cleanup_panic, actor_drop);
+            owner.record_cleanup_panic(actor_drop);
             // Once actor execution has panicked, teardown is secondary: never
             // replace the actor's original diagnostic. This is the incarnation
             // body's normal return path, so the helper resumes the panic:
@@ -291,7 +307,7 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
             // below.
             resume_preferred_panic(UnwindPanics {
                 primary: owner.take_primary_panic(),
-                cleanup: cleanup_panic,
+                cleanup: owner.take_cleanup_panic(),
             });
             result
                 .expect("an incarnation without a primary panic returns a result")

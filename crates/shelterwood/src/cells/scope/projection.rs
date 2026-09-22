@@ -236,10 +236,11 @@ impl ScopeCell {
         (snapshot, retained_exits)
     }
 
-    fn ancestors_locked(&self) -> Vec<Arc<ScopeCell>> {
+    fn ancestors_locked(&self, txn: &mut ObservationTxn<'_>) -> Vec<Arc<ScopeCell>> {
         let mut ancestors = Vec::new();
         let mut current = self.parent();
         while let Some(scope) = current {
+            txn.retain_shared(&scope);
             current = scope.parent();
             ancestors.push(scope);
         }
@@ -272,9 +273,8 @@ impl ScopeCell {
     }
 
     pub(super) fn publish_snapshot_chain_locked(&self, wakes: &mut ObservationTxn<'_>) {
-        let ancestors = self.ancestors_locked();
+        let ancestors = self.ancestors_locked(wakes);
         self.publish_snapshot_chain_through_locked(wakes, &ancestors);
-        wakes.release_shared(ancestors);
     }
 
     pub(super) fn emit_locked(&self, wakes: &mut ObservationTxn<'_>, kind: LifecycleEventKind) {
@@ -287,7 +287,7 @@ impl ScopeCell {
         // Parent links cannot change under the resident-tree observation gate.
         // Resolve them once for snapshot and lifecycle propagation so one leaf
         // edge does not repeatedly lock every ancestor's parent mutex.
-        let ancestors = self.ancestors_locked();
+        let ancestors = self.ancestors_locked(wakes);
         // The resident-tree observation gate serializes every mint; the
         // atomic is the published watermark as well as the counter, avoiding
         // a second, provably uncontended lock on every lifecycle edge. The
@@ -310,7 +310,6 @@ impl ScopeCell {
             for ancestor in &ancestors {
                 ancestor.observation.lifecycle.publish_lagged(wakes, 1);
             }
-            wakes.release_shared(ancestors);
             return;
         };
         self.publish_snapshot_chain_through_locked(wakes, &ancestors);
@@ -329,7 +328,6 @@ impl ScopeCell {
                 drop(kind);
                 drop(guards);
             });
-            wakes.release_shared(ancestors);
             return;
         }
 
@@ -342,7 +340,6 @@ impl ScopeCell {
             child_id = ancestor.member.id().clone();
             ancestor.observation.lifecycle.publish(wakes, event.clone());
         }
-        wakes.release_shared(ancestors);
         // The producer's own copy still owns a retained exit. Retiring it here
         // would submit a disposal job — and can start a native thread — with
         // the observation gate held. This caller owns an effects sink, so it

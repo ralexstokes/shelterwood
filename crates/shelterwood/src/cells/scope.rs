@@ -1289,6 +1289,7 @@ impl ScopeCell {
         if published {
             txn.pulse(&self.member.record);
             if pending_incarnation && let Some(parent) = self.parent() {
+                txn.retain_shared(&parent);
                 parent.publish_control_event_locked(
                     ScopeControlEvent::RestartShutdown {
                         membership: self.member.membership(),
@@ -1296,7 +1297,6 @@ impl ScopeCell {
                     },
                     txn,
                 );
-                txn.release_shared([parent]);
             }
         }
         Some(target)

@@ -51,8 +51,8 @@ rests on:
   carrier all encode that.
 - **`Arc` traffic that cannot reach zero.** Cloning an `Arc` under a lock is
   refcount work; dropping one is only refcount work while another owner is
-  provable. Prefer restructuring over the proof — every violation the #235
-  audit confirmed was a drop that *looked* like refcount traffic. Resident
+  provable. Prefer restructuring over the proof — the usual violation is a
+  drop that *looks* like refcount traffic. Resident
   member records, scope records, lifecycle events, snapshot projections and
   driver completions protect failed exits through `RetainedExit`; its drop
   transfers destruction to `runtime::dispose_critical`, whose every path —
@@ -78,9 +78,9 @@ rests on:
   `RetainedLifecycleEvent::into_public`, the one genuine hand-off to a
   user-owned value, and `RetainedStopReason::into_public`, whose two call
   sites release a framework copy beside an installed co-owner and therefore
-  still rest on the older conventional proof. Every other framework-internal
-  raw refcount drop goes through `ObservationTxn::surrender`.
-  `RetainedExitResult` closes the earlier raw-incarnation window: the completed
+  rest on that co-owner proof rather than on construction. Every other
+  framework-internal raw refcount drop goes through `ObservationTxn::surrender`.
+  `RetainedExitResult` covers the raw incarnation's epilogue: the completed
   callback result stays in that carrier across the fallible teardown epilogue,
   so an epilogue panic transfers a failed result to critical disposal instead
   of destroying its application error during the unwind. The normal path takes
@@ -121,14 +121,14 @@ rests on:
   ready-edge retirement flushes the stored caller waker through the same
   post-unlock effects path. The supported façade re-exports neither type
   nor anything that could install one.
-  `MailboxEffectSink` was the sharpest open case before the fold: the
-  framework calls `defer_mailbox_effect` while holding both the resident-tree
-  observation gate and `MemberCell::mailbox`. It and `MailboxEffectQueue` are
-  now crate-private, so an unsupported direct dependent can neither construct
-  a sink nor supply its own. The same construction-held boundary covers
-  `MailboxControl`, `MailboxTermination`, and `DynamicRoute`;
-  what remains conventional is the core-to-runtime capability family plus the
-  waker machinery that moved to core beside the proxy — `WakerSlot`,
+  `MailboxEffectSink` is the sharpest case: the framework calls
+  `defer_mailbox_effect` while holding both the resident-tree observation gate
+  and `MemberCell::mailbox`. It and `MailboxEffectQueue` are crate-private, so
+  an unsupported direct dependent can neither construct a sink nor supply its
+  own. The same construction-held boundary covers `MailboxControl`,
+  `MailboxTermination`, and `DynamicRoute`; what remains conventional is the
+  core-to-runtime capability family plus the waker machinery that lives in
+  core beside the proxy — `WakerSlot`,
   `WakerAction`, and `WakerEffects` are public doc-hidden core items a direct
   core dependent could construct. They ride under the same framework-only
   ruling; the supported façade re-exports none of them, and the
@@ -207,9 +207,9 @@ struct, or the caller.
 ## Runtime naming
 
 Non-test façade implementation imports and invokes only the runtime capability
-layer, never a concrete Tokio API. After the crate fold, façade tests, doctests
-and examples may use the pinned Tokio dev-dependency for executor control,
-test-only synchronization or runnable example syntax; internal unit tests
+layer, never a concrete Tokio API. Façade tests, doctests and examples may
+use the pinned Tokio dev-dependency for executor control, test-only
+synchronization or runnable example syntax; internal unit tests
 still prefer `crate::runtime` when it exposes the behavior under test. This
 dev-only allowance does not widen the public API or the core crate's dependency
 boundary.

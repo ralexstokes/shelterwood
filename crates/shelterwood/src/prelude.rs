@@ -69,8 +69,8 @@
 //!
 //! # Composing upward
 //!
-//! Utility-tier crates (`specs/non-core.md` §27) depend only on the
-//! supported façade and re-export their items through preludes of their
+//! Utility-tier crates — companion libraries layered on top of shelterwood
+//! — depend only on the supported façade and re-export their items through preludes of their
 //! own. Those preludes are expected to glob `shelterwood::prelude::*` into
 //! themselves, so this module is the base of that stack and its admission
 //! rule is what keeps the stack's ground floor small.

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 /// The value deliberately permits zero. Zero is not interpreted by the
 /// caller: each operation fixes one of the three library-defined behaviors in
 /// its own contract—no attempt, one observation pass, or immediate
-/// escalation—and SPEC Appendix B tabulates which operation takes which.
+/// escalation.
 /// Public surfaces accept `impl Into<DeadlineBudget>`, so a plain `Duration`
 /// still reads naturally at the call site while the semantics have one name.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]

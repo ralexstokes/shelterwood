@@ -42,7 +42,8 @@ fn fail_closed<T>(response: Option<T>, fallback: T, debug_panics: bool, what: &s
 /// admitted handles or a [`ReserveError`]. Should that obligation ever be
 /// destroyed without publishing — a framework invariant failure, not a
 /// condition callers can provoke — debug builds panic and release builds
-/// resolve [`ReserveError::NotAdmitting`] with a terminal cause (SPEC B.8).
+/// fail closed, resolving [`ReserveError::NotAdmitting`] with a terminal
+/// cause.
 /// Once complete, further polls return `Pending`.
 #[must_use]
 pub struct Admission<H> {
@@ -233,7 +234,7 @@ impl<H> Drop for Admission<H> {
 /// that obligation ever be destroyed without publishing — a framework
 /// invariant failure — debug builds panic and release builds resolve
 /// [`RemoveOutcome::Removed`]: the removal latched at the call, and its route
-/// becoming terminal satisfies the removal goal (SPEC B.8).
+/// becoming terminal satisfies the removal goal.
 /// Once complete, further polls return `Pending`, as on [`Admission`].
 #[must_use]
 pub struct Removal {

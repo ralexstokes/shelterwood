@@ -9,12 +9,12 @@ use std::{
 };
 
 use crate::common::{
-    DestructorBlocker, DestructorGate, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually,
-    assert_eventually_frozen, policy::never, poll_once,
+    DestructorBlocker, DestructorGate, ReleaseGate, SHUTDOWN_BUDGET, advance_time,
+    assert_eventually, assert_eventually_frozen, policy::never, poll_once,
 };
 use shelterwood::{
-    Backoff, CallErrorKind, ExitError, ExitResult, Jitter, Mailbox, RawActor, RawContext, RawDef,
-    Reply, RestartCondition, RestartPolicy, SendErrorKind, Tree,
+    Backoff, CallErrorKind, ExitError, ExitResult, Incarnation, Jitter, Mailbox, RawActor,
+    RawContext, RawDef, Reply, RestartCondition, RestartPolicy, SendErrorKind, Tree,
 };
 
 struct RestartActor {
@@ -438,4 +438,300 @@ async fn dropping_a_parked_send_in_the_rebind_window_withdraws_it() {
     )
     .await;
     system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
+}
+
+/// A restartable actor whose rebind window is held open by a fixed restart
+/// backoff under a paused clock, and whose replacement does not read until
+/// released.
+///
+/// Holding the window on virtual time, rather than on a blocked destructor,
+/// keeps every step on one thread and puts the rebind at an exact virtual
+/// instant. Holding the replacement's first receive means anything the
+/// replacement's mailbox holds when the test looks was accepted by bind
+/// promotion, not by a receive making room.
+struct WindowActor {
+    generation: usize,
+    fail_first: ReleaseGate,
+    hold_replacement: ReleaseGate,
+    deliveries: Arc<Mutex<Vec<(usize, usize)>>>,
+}
+
+impl RawActor for WindowActor {
+    type Msg = usize;
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        if self.generation == 1 {
+            self.fail_first.wait().await;
+            return Err(ExitError::message("open the rebind window"));
+        }
+        self.hold_replacement.wait().await;
+        while let Some(message) = context.recv().await {
+            self.deliveries
+                .lock()
+                .expect("deliveries mutex poisoned")
+                .push((self.generation, message));
+        }
+        Ok(())
+    }
+}
+
+struct WindowFixture {
+    fail_first: ReleaseGate,
+    hold_replacement: ReleaseGate,
+    deliveries: Arc<Mutex<Vec<(usize, usize)>>>,
+    factories: Arc<AtomicUsize>,
+}
+
+impl WindowFixture {
+    fn new() -> Self {
+        Self {
+            fail_first: ReleaseGate::default(),
+            hold_replacement: ReleaseGate::default(),
+            deliveries: Arc::new(Mutex::new(Vec::new())),
+            factories: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn definition(&self, mailbox: Mailbox, backoff: Duration) -> RawDef<WindowActor> {
+        RawDef::factory({
+            let factories = Arc::clone(&self.factories);
+            let fail_first = self.fail_first.clone();
+            let hold_replacement = self.hold_replacement.clone();
+            let deliveries = Arc::clone(&self.deliveries);
+            move || WindowActor {
+                generation: factories.fetch_add(1, Ordering::SeqCst) + 1,
+                fail_first: fail_first.clone(),
+                hold_replacement: hold_replacement.clone(),
+                deliveries: Arc::clone(&deliveries),
+            }
+        })
+        .mailbox(mailbox)
+        .restart(RestartPolicy::new(
+            RestartCondition::OnFailure,
+            Backoff::fixed(backoff, Jitter::None).expect("non-zero backoff"),
+        ))
+    }
+
+    fn deliveries(&self) -> Vec<(usize, usize)> {
+        self.deliveries
+            .lock()
+            .expect("deliveries mutex poisoned")
+            .clone()
+    }
+}
+
+/// Fails the first incarnation and waits, without moving virtual time, until
+/// the membership is unbound: the rebind window proper, not the frozen intake
+/// that precedes it.
+async fn open_rebind_window(actor: &shelterwood::ActorRef<usize>, fail_first: &ReleaseGate) {
+    fail_first.release();
+    assert_eventually_frozen!(|| matches!(
+        actor.try_send(0),
+        Err(error) if error.kind == SendErrorKind::NotRunning
+            && error.incarnation_observed.is_none()
+    ))
+    .await;
+}
+
+/// Polls parked sends front to back, collecting each accepting incarnation,
+/// and reports whether every one has resolved.
+fn resolve_in_order<F>(
+    parked: &mut Vec<std::pin::Pin<Box<F>>>,
+    accepted: &mut Vec<Incarnation>,
+) -> bool
+where
+    F: std::future::Future<Output = Result<Incarnation, shelterwood::SendError<usize>>>,
+{
+    while let Some(send) = parked.first_mut() {
+        match poll_once(send.as_mut()) {
+            std::task::Poll::Ready(result) => {
+                accepted.push(result.expect("parked send enters the replacement"));
+                drop(parked.remove(0));
+            }
+            std::task::Poll::Pending => break,
+        }
+    }
+    parked.is_empty()
+}
+
+/// Senders parked while the membership is unbound are accepted at bind in
+/// the order they parked (review T-11). Capacity equals the number of parked
+/// senders, so bind promotes every one of them before the replacement's first
+/// receive, and the replacement's delivery order is exactly the promotion
+/// order.
+#[tokio::test(start_paused = true)]
+async fn bind_promotes_senders_parked_in_the_rebind_window_in_arrival_order() {
+    let fixture = WindowFixture::new();
+    let backoff = Duration::from_secs(5);
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw(
+            "fifo",
+            fixture.definition(Mailbox::queue(4).expect("non-zero capacity"), backoff),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("first actor starts");
+    open_rebind_window(&actor, &fixture.fail_first).await;
+
+    let mut parked: Vec<_> = (10..14).map(|value| Box::pin(actor.send(value))).collect();
+    for send in &mut parked {
+        assert!(poll_once(send.as_mut()).is_pending(), "unbound sends park");
+    }
+
+    advance_time(backoff).await;
+    let mut accepted = Vec::new();
+    assert_eventually_frozen!(|| resolve_in_order(&mut parked, &mut accepted)).await;
+    assert_eq!(fixture.factories.load(Ordering::SeqCst), 2);
+    let replacement = accepted[0];
+    assert!(
+        accepted
+            .iter()
+            .all(|&incarnation| incarnation == replacement),
+        "every parked sender is accepted by the one replacement: {accepted:?}"
+    );
+    assert!(fixture.deliveries().is_empty(), "nothing is received yet");
+
+    fixture.hold_replacement.release();
+    assert_eventually_frozen!(
+        || fixture.deliveries().len() == 4,
+        "deliveries so far: {:?}",
+        fixture.deliveries()
+    )
+    .await;
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("replacement stops");
+    assert_eq!(
+        fixture.deliveries(),
+        [(2, 10), (2, 11), (2, 12), (2, 13)],
+        "bind promotion accepts parked senders in arrival order"
+    );
+}
+
+/// A `latest()` mailbox never parks a sender for capacity, only for binding.
+/// Senders parked across a restart are all accepted by the replacement at
+/// bind, each conflating the one before, so every send succeeds and the
+/// newest parked value is the only one delivered (review T-11).
+#[tokio::test(start_paused = true)]
+async fn latest_mailbox_accepts_senders_parked_across_a_restart_and_keeps_the_newest() {
+    let fixture = WindowFixture::new();
+    let backoff = Duration::from_secs(5);
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw("latest", fixture.definition(Mailbox::latest(), backoff))
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("first actor starts");
+    let first = actor
+        .try_send(1)
+        .expect("the first incarnation accepts into its slot");
+    open_rebind_window(&actor, &fixture.fail_first).await;
+
+    let mut parked: Vec<_> = (21..24).map(|value| Box::pin(actor.send(value))).collect();
+    for send in &mut parked {
+        assert!(poll_once(send.as_mut()).is_pending(), "unbound sends park");
+    }
+
+    advance_time(backoff).await;
+    let mut accepted = Vec::new();
+    assert_eventually_frozen!(|| resolve_in_order(&mut parked, &mut accepted)).await;
+    let replacement = accepted[0];
+    assert!(replacement.supersedes(first));
+    assert!(
+        accepted
+            .iter()
+            .all(|&incarnation| incarnation == replacement),
+        "a conflated sender was still accepted, by the replacement: {accepted:?}"
+    );
+
+    fixture.hold_replacement.release();
+    assert_eventually_frozen!(
+        || !fixture.deliveries().is_empty(),
+        "no delivery reached the replacement"
+    )
+    .await;
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("replacement stops");
+    // The complete history proves the first incarnation's slot did not cross
+    // the restart and that conflation destroyed the older parked values
+    // rather than delaying them.
+    assert_eq!(
+        fixture.deliveries(),
+        [(2, 23)],
+        "only the newest parked value survives bind-time conflation"
+    );
+}
+
+/// SPEC §5.2 and Appendix B's expiry boundary: an acceptance that wins the
+/// race at the deadline instant resolves `send_timeout` successfully; the
+/// tie is decided by the withdrawal race, never by clock comparison (review
+/// T-11).
+///
+/// The restart backoff equals the send budget and both are armed at one
+/// frozen virtual instant, so the replacement binds exactly when the send's
+/// deadline elapses. The send is not polled until after that bind, when its
+/// timer has already fired: bind promotion accepted it first, so withdrawal
+/// finds it accepted and the send succeeds. The twin in which the rebind
+/// comes later is `timed_send_withdraws_while_replacement_is_in_backoff`.
+#[tokio::test(start_paused = true)]
+async fn bind_promotion_at_the_exact_deadline_resolves_send_timeout_successfully() {
+    let fixture = WindowFixture::new();
+    let width = Duration::from_secs(10);
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw(
+            "tie",
+            fixture.definition(Mailbox::queue(1).expect("non-zero capacity"), width),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("first actor starts");
+    let first = actor.try_send(1).expect("first incarnation accepts");
+    open_rebind_window(&actor, &fixture.fail_first).await;
+
+    let started = tokio::time::Instant::now();
+    let mut timed = Box::pin(actor.send_timeout(42, width));
+    assert!(poll_once(timed.as_mut()).is_pending(), "unbound send parks");
+
+    advance_time(width).await;
+    // Bind evidence that leaves the timed send untouched: once bound, the
+    // capacity-1 queue is full, holding the promoted message, and a probe is
+    // refused and handed back without side effects.
+    let mut bound = None;
+    assert_eventually_frozen!(|| match actor.try_send(0) {
+        Err(error) if error.kind == SendErrorKind::Full => {
+            bound = error.incarnation_observed;
+            true
+        }
+        _ => false,
+    })
+    .await;
+    assert_eq!(
+        tokio::time::Instant::now(),
+        started + width,
+        "the send is resolved at its exact deadline instant"
+    );
+
+    let std::task::Poll::Ready(result) = poll_once(timed.as_mut()) else {
+        panic!("a send whose deadline elapsed resolves on its next poll");
+    };
+    let accepting = result.expect("acceptance at the deadline instant wins the tie");
+    assert!(accepting.supersedes(first));
+    assert_eq!(bound, Some(accepting));
+
+    fixture.hold_replacement.release();
+    assert_eventually_frozen!(
+        || fixture.deliveries() == [(2, 42)],
+        "deliveries so far: {:?}",
+        fixture.deliveries()
+    )
+    .await;
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("replacement stops");
 }

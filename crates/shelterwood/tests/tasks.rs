@@ -44,6 +44,15 @@ fn public_exit_constructors_preserve_evidence_and_classify_failures() {
 #[test]
 fn spawn_without_runtime_is_a_build_error() {
     assert!(matches!(Tree::new().spawn(), Err(BuildError::NoRuntime)));
+    // The public text stays runtime-neutral (SPEC §15.1): it names no executor.
+    assert_eq!(
+        BuildError::NoRuntime.to_string(),
+        "no ambient supported async runtime is available"
+    );
+    assert_eq!(
+        BuildError::NoRuntime.to_string(),
+        ReserveError::NoRuntime.to_string()
+    );
 }
 
 #[test]

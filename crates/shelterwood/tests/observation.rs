@@ -1045,6 +1045,16 @@ async fn never_ran_members_stop_rather_than_report_startup_abort() {
         .wait_started()
         .await
         .expect_err("pre-ready terminal exit aborts startup");
+    // SPEC §12: a reported child-caused startup failure is never ahead of
+    // its child, so the snapshot taken right after `Err` already shows it.
+    assert!(matches!(
+        scope
+            .snapshot()
+            .child("failing-readiness")
+            .expect("aborted child resident")
+            .state,
+        ChildState::StartupAborted { .. }
+    ));
     scope
         .wait_for_child(
             "never-ran",
@@ -1053,16 +1063,6 @@ async fn never_ran_members_stop_rather_than_report_startup_abort() {
         )
         .await
         .expect("joined suffix disposal publishes terminality");
-    // Each child's construction is disposed by its own blocking-pool job, so
-    // the suffix's terminal publication does not order the failed child's.
-    scope
-        .wait_for_child(
-            "failing-readiness",
-            |child| matches!(child.state, ChildState::StartupAborted { .. }),
-            POLL_TIMEOUT,
-        )
-        .await
-        .expect("the failed child publishes its startup abort");
     let snapshot = scope.snapshot();
     assert!(
         matches!(

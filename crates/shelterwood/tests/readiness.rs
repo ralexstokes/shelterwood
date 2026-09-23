@@ -1740,7 +1740,6 @@ async fn startup_failure_is_decided_at_dispatch_not_after_construction_disposal(
         .expect("the wait does not panic")
         .expect("the failed child's construction is being disposed");
     system.scope().request_shutdown();
-    release.send(()).expect("the disposal is still blocked");
 
     let startup = system.wait_started().await.expect_err("startup fails");
     assert!(
@@ -1751,6 +1750,26 @@ async fn startup_failure_is_decided_at_dispatch_not_after_construction_disposal(
         ),
         "{startup:?}"
     );
+    // §12: the named child is already terminal, with exactly the payload's
+    // exit, while its factory's destruction is still blocked.
+    let StartupError::StartupFailed(ref failure) = startup else {
+        unreachable!("matched above")
+    };
+    let StartupFailureCause::Child {
+        exit: ref reported, ..
+    } = failure.cause
+    else {
+        unreachable!("matched above")
+    };
+    assert!(
+        matches!(
+            system.scope().snapshot().child("failure").map(|child| &child.state),
+            Some(ChildState::StartupAborted { exit }) if exit == reported
+        ),
+        "{:?}",
+        system.scope().snapshot().child("failure")
+    );
+    release.send(()).expect("the disposal is still blocked");
     system
         .shutdown(Duration::from_secs(1))
         .await

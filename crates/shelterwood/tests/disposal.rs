@@ -23,7 +23,8 @@ use shelterwood::{
     Backoff, CallErrorKind, Cancellation, ChildId, ChildState, DynamicTree, ExitError, ExitKind,
     ExitResult, Jitter, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
     ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition, RestartPolicy,
-    ScopeState, StaticReserveError, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+    ScopeState, StartupError, StartupFailureCause, StaticReserveError, SubtreeOnceDef, TaskDef,
+    TaskOnceDef, Tree,
 };
 
 struct DropProbe {
@@ -456,6 +457,120 @@ async fn factory_capture_destructor_panic_is_contained_during_shutdown() {
         "a factory destructor panic must not reclassify the exit: {exit:?}"
     );
     assert_eq!(exit.cancellation(), Cancellation::Observed);
+}
+
+/// SPEC §8/§12: a startup failure's payload and its child's published exit
+/// agree even when the child's retained factory panics while it is destroyed.
+/// That destruction is the release edge, outside every verdict, so the exit
+/// is final — and published — at dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn factory_destructor_panic_on_startup_failure_keeps_payload_and_exit_equal() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "failing",
+            TaskDef::new({
+                let capture = CountedPanic::new(&drops, "startup failure factory destructor");
+                move |_| {
+                    let _ = &capture;
+                    async { Err(ExitError::message("fails before ready")) }
+                }
+            })
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .restart(never()),
+        )
+        .expect("valid failing task");
+    let system = tree.spawn().expect("runtime is available");
+
+    let startup = system
+        .wait_started()
+        .await
+        .expect_err("a pre-ready terminal exit fails startup");
+    let snapshot = system.scope().snapshot();
+    let StartupError::StartupFailed(ref failure) = startup else {
+        panic!("expected a child startup failure, got {startup:?}")
+    };
+    let StartupFailureCause::Child {
+        ref id, ref exit, ..
+    } = failure.cause
+    else {
+        panic!("expected a child cause, got {failure:?}")
+    };
+    assert_eq!(id.as_str(), "failing");
+    assert!(
+        matches!(exit.kind(), ExitKind::Failed(error) if error.to_string() == "fails before ready"),
+        "{exit:?}"
+    );
+    let state = &snapshot
+        .child("failing")
+        .expect("the failed child is resident")
+        .state;
+    assert!(
+        matches!(state, ChildState::StartupAborted { exit: published } if published == exit),
+        "the child's published exit must be the payload's exit: {state:?}"
+    );
+
+    assert_eventually!(
+        || drops.load(Ordering::SeqCst) == 1,
+        "the factory is destroyed and its panic contained"
+    )
+    .await;
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("the scope shuts down cleanly after a contained factory panic");
+    assert_eq!(
+        &task.wait().await,
+        exit,
+        "the exit-awaiting surface carries the payload's exit"
+    );
+}
+
+/// SPEC §9: exit-awaiting surfaces resolve at terminal publication, while
+/// removal waits for the release edge, the destruction of the factory's
+/// captures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_resolves_before_factory_release_while_removal_waits_for_it() {
+    let gate = DestructorGate::default();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+    let task = scope
+        .add_task(
+            "failing",
+            TaskDef::new({
+                let capture = BlockingDropProbe::new(&gate, dropped);
+                move |_| {
+                    let _ = &capture;
+                    async { Err(ExitError::message("final failure")) }
+                }
+            })
+            .restart(never()),
+        )
+        .await
+        .expect("task admission");
+
+    wait_for_destructor(&gate).await;
+    assert_disposed_off_current(&mut drops, "factory disposal reports its thread").await;
+    let terminal = tokio::time::timeout(POLL_TIMEOUT, task.wait())
+        .await
+        .expect("wait() resolves while the factory's destructor is blocked");
+    assert!(matches!(
+        terminal.kind(),
+        ExitKind::Failed(error) if error.to_string() == "final failure"
+    ));
+    let mut removal = Box::pin(scope.remove_task(&task));
+    poll_pending(&mut removal).await;
+
+    gate.release();
+    assert_eq!(removal.await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("dynamic root shuts down");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

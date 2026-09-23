@@ -316,17 +316,15 @@ async fn sidecar_startup_failure_leaves_prefix_supervised_until_host_rolls_it_ba
     );
     let snapshot = scope.snapshot();
     assert_eq!(snapshot.state, shelterwood::ScopeState::StartupFailed);
-    // Startup failure is published at exit dispatch; the child's terminal
-    // projection follows its isolated construction disposal.
-    assert_eventually!(|| matches!(
-        scope
-            .snapshot()
+    // SPEC §12: a reported child-caused startup failure is never ahead of
+    // its child, so the snapshot taken right after `Err` already shows it.
+    assert!(matches!(
+        snapshot
             .child("failing-readiness")
             .expect("failed child retained")
             .state,
         ChildState::StartupAborted { .. }
-    ))
-    .await;
+    ));
     // The park is the point of the state: the started prefix stays running
     // and supervised until the host decides (Appendix C.2), rather than
     // being eagerly torn down with the failure.

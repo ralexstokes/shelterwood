@@ -967,14 +967,10 @@ impl ScopeRuntime {
         let Some(key) = supervisor_admit(&mut self.supervisor, membership, initial) else {
             return Err(Box::new(child));
         };
-        // This method can run under both the observation gate and dynamic-
-        // state mutex. Probe before insertion so even a future key-domain
-        // regression returns the incoming user construction intact instead
-        // of displacing and unwinding a resident child through those locks.
-        if self.children.get(key).is_some() {
-            return Err(Box::new(child));
-        }
-        let _ = self.children.insert(key, child);
+        // `supervisor_admit` mints every key from this scope's monotonic
+        // counter, which never repeats a value, so the insert cannot displace.
+        let displaced = self.children.insert(key, child);
+        debug_assert!(displaced.is_none(), "child keys are never reused");
         Ok(key)
     }
 
@@ -1518,11 +1514,8 @@ async fn run_scope_incarnation(
             rejected_child = Some(child);
             break;
         };
-        if children.get(key).is_some() {
-            rejected_child = Some(child);
-            break;
-        }
-        let _ = children.insert(key, child);
+        let displaced = children.insert(key, child);
+        debug_assert!(displaced.is_none(), "child keys are never reused");
     }
     if let Some(child) = rejected_child {
         // A fresh domain cannot exhaust for an in-memory plan, but the total

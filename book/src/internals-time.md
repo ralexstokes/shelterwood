@@ -89,4 +89,5 @@ point; an operation cancelled by runtime teardown before it ever ran
 panics with a distinct teardown diagnostic when awaited. The
 blocking-pool submission path underneath is the same one the disposal
 lanes use, and its rejection-ownership subtleties are why the workspace
-pins the exact Tokio release.
+pins the exact Tokio release; the comment beside that pin in the workspace
+`Cargo.toml` lists every site to re-audit on an upgrade.

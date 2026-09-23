@@ -416,6 +416,7 @@ pub struct OneShotReceiver<T> {
     /// nor this seam. Every terminal edge here records that instead, so the
     /// re-poll diagnostic is framework-owned. A bare [`Self::close`] is not
     /// terminal — Tokio keeps the receiver pollable — so it does not set this.
+    /// Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
     completed: bool,
 }
 
@@ -717,6 +718,7 @@ impl<T> DisposingReceiver<T> {
         // Probe with a framework waker, then leave only the stable proxy
         // registered across a pending return so Tokio never destroys the raw
         // caller waker at that delivery seam.
+        // Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
         self.caller_poll.poll(
             self.inner
                 .as_mut()

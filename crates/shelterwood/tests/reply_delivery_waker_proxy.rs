@@ -110,6 +110,7 @@ impl Actor for ChannelSource {
 /// registered caller waker while its ready result owned this value; the two
 /// unwinds aborted the process. Nextest's process-per-test isolation makes
 /// that SIGABRT a failure of this exact regression.
+/// Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
 ///
 /// The reply is sent directly rather than through an actor: this seam is the
 /// receiver's, and driving a live actor would add scheduling the test cannot

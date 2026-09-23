@@ -241,8 +241,11 @@ impl<R> System<R> {
     /// Returns the [`StartupError`] recorded by the root startup barrier: a
     /// terminal child failure during startup, a restart-intensity trip, or a
     /// shutdown requested before startup completed.
-    pub async fn wait_started(&self) -> Result<(), StartupError> {
-        self.run.root.wait_started().await
+    pub fn wait_started(&self) -> impl Future<Output = Result<(), StartupError>> + Send {
+        // Own a root handle rather than borrowing `self` across the await,
+        // so the future is `Send` whether or not `System` is `Sync`.
+        let root = Arc::clone(&self.run.root);
+        async move { root.wait_started().await }
     }
 
     /// Rolls a startup failure back through full shutdown.

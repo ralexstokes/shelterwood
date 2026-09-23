@@ -163,6 +163,10 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
         assert_send(system.shutdown(DeadlineBudget::ZERO));
     };
     let _assert_wait_future = |system: System<ScopeRef>| assert_send(system.wait());
+    let _assert_started_futures = |system: &System<ScopeRef>, dynamic: &System<DynamicScopeRef>| {
+        assert_send(system.wait_started());
+        assert_send(dynamic.wait_started());
+    };
 }
 
 fn assert_clone<T: Clone>() {}

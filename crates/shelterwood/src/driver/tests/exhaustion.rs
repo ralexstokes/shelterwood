@@ -762,8 +762,8 @@ async fn settlement_terminates_when_the_first_spawn_exhausts_incarnations() {
     // construction, the funnel exhausts, and the child terminalizes in place.
     scope.settle_supervisor();
     assert!(scope.supervisor.is_disposing(key));
-    // §7: the pre-readiness terminal fails startup at dispatch; only the
-    // member's terminal publication waits for the construction disposal.
+    // §7: the pre-readiness terminal publishes and fails startup at dispatch;
+    // only the release edge waits for construction disposal.
     assert!(
         scope.supervisor.lifecycle().startup_failed(),
         "the pre-readiness position routes the scope's startup failure at dispatch"

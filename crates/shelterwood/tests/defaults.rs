@@ -13,7 +13,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet, poll_once,
+    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, advance_time, assert_eventually, assert_quiet,
+    poll_once,
 };
 use shelterwood::{
     Actor, ActorDef, Backoff, Context, DynamicTree, ExitError, ExitKind, ExitResult, GracePhase,
@@ -85,7 +86,7 @@ async fn default_mailbox_is_a_queue_of_sixty_four_messages() {
 
     release.release();
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("drained actor shuts down");
 }
@@ -286,7 +287,7 @@ async fn default_restart_backoff_and_retention_follow_definition_ownership() {
     .await;
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root stops");
 }
@@ -348,7 +349,7 @@ async fn default_mailbox_shutdown_drains_the_frozen_prefix() {
     actor.try_send(()).expect("second message accepts");
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("implicit drain completes");
     assert_eq!(

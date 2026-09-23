@@ -276,10 +276,9 @@ mod tests {
         pin::Pin,
         sync::{Arc, Mutex},
         task::{Context, Poll, Wake, Waker},
-        time::Duration,
     };
 
-    use crate::{ExitKind, TaskDef};
+    use crate::{ExitKind, TaskDef, test_support::SHUTDOWN_BUDGET};
 
     use super::{Admission, Removal};
     use crate::{
@@ -411,7 +410,7 @@ mod tests {
                 .expect("reentrant second reservation was released"),
         );
         system
-            .shutdown(Duration::from_secs(1))
+            .shutdown(SHUTDOWN_BUDGET)
             .await
             .expect("cancelled reservations leave no stragglers");
     }

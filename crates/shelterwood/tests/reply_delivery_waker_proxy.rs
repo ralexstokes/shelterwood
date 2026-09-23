@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use common::{POLL_TIMEOUT, ReleaseGate, hostile_waker};
+use common::{POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, hostile_waker};
 use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Reply, Tree};
 
 enum Message {
@@ -76,10 +76,7 @@ async fn successful_call_contains_reply_caller_waker_retirement() {
     assert_eq!(replied.value, 7);
 
     drop(call);
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("actor stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
 }
 
 struct HostileReply;

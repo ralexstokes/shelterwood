@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet,
+    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, advance_time, assert_eventually, assert_quiet,
     policy::never,
     waiting::{
         cancellation_signalled_waiting_task, construction_signalled_waiting_task,
@@ -300,7 +300,7 @@ async fn after_init_stop_waits_for_success_then_advances_the_ordered_suffix() {
     assert_eq!(exit.cancellation(), Cancellation::Observed);
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("ordered suffix cooperates");
 }
@@ -1200,10 +1200,7 @@ async fn runtime_dynamic_additions_never_join_aggregate_readiness() {
         scope.remove_task(&runtime_task).await,
         shelterwood::RemoveOutcome::Removed
     );
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("root stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
 #[tokio::test]
@@ -1285,7 +1282,7 @@ async fn nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause() {
         shelterwood::StopReason::StartupFailed(_)
     ));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root rolls back");
 }
@@ -1348,7 +1345,7 @@ async fn nested_ordered_startup_failure_rolls_back_only_the_started_prefix() {
         shelterwood::StopReason::StartupFailed(_)
     ));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root rolls back");
 }
@@ -1415,10 +1412,7 @@ async fn earliest_mark_ready_wins_and_later_readiness_edges_are_no_ops() {
         .wait_started()
         .await
         .expect("automatic and duplicate readiness signals are harmless no-ops");
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("tree stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("tree stops");
 }
 
 #[tokio::test]
@@ -1440,7 +1434,7 @@ async fn start_or_shutdown_preserves_startup_error_and_rolls_back_the_prefix() {
     .expect("valid failure");
     let system = tree.spawn().expect("runtime is available");
     let error = system
-        .start_or_shutdown(Duration::from_secs(1))
+        .start_or_shutdown(SHUTDOWN_BUDGET)
         .await
         .expect_err("startup failure is returned after rollback");
     assert!(matches!(error.startup, StartupError::StartupFailed(_)));
@@ -1630,7 +1624,7 @@ async fn nested_startup_rollback_includes_runtime_added_members() {
     ));
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root rolls back");
 }
@@ -1685,7 +1679,7 @@ async fn immediate_raw_construction_panic_classifies_post_ready() {
     )
     .await;
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("clean shutdown");
 }
@@ -1752,7 +1746,7 @@ async fn startup_failure_is_decided_at_dispatch_not_after_construction_disposal(
         "{startup:?}"
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("the requested shutdown completes");
 }
@@ -1846,7 +1840,7 @@ async fn shutdown_during_starting_stops_gated_children_without_startup_abort() {
 
     root_hold.release();
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("the requested shutdown completes");
 }
@@ -1890,7 +1884,7 @@ async fn parked_prefix_restart_stopped_by_shutdown_is_not_a_startup_abort() {
 
     hold.release();
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("the requested shutdown completes");
 }
@@ -1927,7 +1921,7 @@ async fn parked_prefix_restart_completing_pre_ready_is_not_a_startup_abort() {
 
     hold.release();
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("the parked root stops");
 }

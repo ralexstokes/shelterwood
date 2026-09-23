@@ -25,7 +25,7 @@ use std::{
     time::Duration,
 };
 
-use common::{ordinal_drop_waker, probe_waker_with_wake};
+use common::{SHUTDOWN_BUDGET, ordinal_drop_waker, probe_waker_with_wake};
 use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Reply, Tree};
 
 const OUTER_PANIC: &str = "injected outer panic";
@@ -116,10 +116,7 @@ async fn call_reply_phase_drop_contains_caller_wakers_during_unwind() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     assert_pending_then_unwind(Box::pin(actor.call(Message::Hold, Duration::MAX)));
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("actor stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
 }
 
 #[tokio::test]

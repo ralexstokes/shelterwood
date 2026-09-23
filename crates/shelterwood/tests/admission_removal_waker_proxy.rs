@@ -11,10 +11,9 @@ mod common;
 use std::{
     future::Future,
     task::{Context, Poll},
-    time::Duration,
 };
 
-use common::{assert_eventually, hostile_waker, waiting::task as waiting_task};
+use common::{SHUTDOWN_BUDGET, assert_eventually, hostile_waker, waiting::task as waiting_task};
 use shelterwood::{ChildState, DynamicTree, RemoveOutcome};
 
 /// Admission does not enqueue its driver request until first poll. A
@@ -52,7 +51,7 @@ async fn successful_admission_never_parks_its_caller_waker_and_returns_the_exact
 
     assert_eq!(scope.remove_task(&admitted).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root stops");
 }
@@ -105,7 +104,7 @@ async fn exact_removal_never_parks_its_caller_waker_and_preserves_its_outcomes()
     );
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root stops");
 }

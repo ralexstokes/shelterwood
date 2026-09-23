@@ -6,7 +6,7 @@ use std::{
     task::{Context as TaskContext, Poll},
 };
 
-use common::{DestructorGate, POLL_TIMEOUT, hostile_waker, poll_until_ready};
+use common::{DestructorGate, POLL_TIMEOUT, SHUTDOWN_BUDGET, hostile_waker, poll_until_ready};
 use shelterwood::{Actor, ActorOnceDef, Blocking, Context, ExitError, ExitResult, Tree};
 
 struct DeliveredValue {
@@ -106,7 +106,7 @@ async fn drive_run_blocking_delivery(panic_on_drop: bool) {
     drop(work);
 
     system
-        .shutdown(POLL_TIMEOUT)
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("the actor stops");
 }

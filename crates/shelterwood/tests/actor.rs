@@ -9,7 +9,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, waiting::task as waiting_task,
+    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_quiet,
+    waiting::task as waiting_task,
 };
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DynamicTree, ExitError, ExitKind,
@@ -639,7 +640,7 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
         "the dynamic actor completes its full stop path before the test proceeds"
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("tree shuts down");
     assert_eq!(
@@ -807,7 +808,7 @@ async fn capabilities_after_inner_error<R: RawActor<Msg = ()>>(
         .expect("error-return observation mutex poisoned")
         .expect("the decorator observed its returned context");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("the tree shuts down after the failed child");
     capabilities
@@ -966,7 +967,7 @@ async fn handler_error_joins_offloads_before_returning_to_a_raw_decorator() {
         ["offload-destroyed", "decorator-resumed"]
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("tree shuts down");
 }
@@ -998,7 +999,7 @@ async fn init_error_joins_live_offloads_before_the_exit_is_observed() {
         "startup cannot expose the init error before its offload is destroyed"
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed-startup tree shuts down");
 }

@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, next_event,
+    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_quiet, next_event,
     policy::never,
     poll_once,
     waiting::{cancellation_signalled_waiting_task, task as waiting_task},
@@ -99,7 +99,7 @@ async fn framework_task_verdicts_remain_typed() {
         ExitKind::ReadinessTimedOut { .. }
     ));
     timeout_system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed startup can be rolled back");
 
@@ -114,7 +114,7 @@ async fn framework_task_verdicts_remain_typed() {
     let abort_system = abort_tree.spawn().expect("runtime is available");
     abort_system.wait_started().await.expect("tree starts");
     abort_system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("child grace bounds shutdown");
     assert!(matches!(
@@ -223,7 +223,7 @@ async fn actor_destructor_panic_supersedes_the_completed_run_outcome() {
         ExitKind::Panicked { message } if message.as_deref() == Some("actor destructor panic")
     ));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root shuts down");
 }
@@ -280,7 +280,7 @@ async fn replacement_starts_only_after_the_old_future_is_destroyed() {
         ["start-1", "drop-1", "start-2"]
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("tree shuts down");
 }
@@ -524,7 +524,7 @@ async fn dynamic_teardown_cancels_children_concurrently() {
     }
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
-    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
+    let shutdown = tokio::spawn(system.shutdown(SHUTDOWN_BUDGET));
     assert_eventually!(|| cancelled.iter().all(|flag| flag.load(Ordering::SeqCst))).await;
     gate.release();
     gate.release();
@@ -597,7 +597,7 @@ async fn concurrent_initial_failures_publish_one_startup_failed_scope_edge() {
     );
     assert!(system.wait_started().await.is_err());
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed dynamic root shuts down");
 }
@@ -664,7 +664,7 @@ async fn plain_restart_publishes_exited_old_before_started_new() {
     assert!(second.supersedes(first));
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("replacement stops");
     loop {
@@ -738,7 +738,7 @@ async fn abort_policy_task_exits_aborted_without_grace() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("abort policy bounds teardown");
     let exit = task.wait().await;

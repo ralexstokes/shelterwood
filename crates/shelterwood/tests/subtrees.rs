@@ -10,8 +10,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet, next_event,
-    poll_once, poll_until, startup_failed_child, waiting::task as waiting_task,
+    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, advance_time, assert_eventually, assert_quiet,
+    next_event, poll_once, poll_until, startup_failed_child, waiting::task as waiting_task,
 };
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, CallErrorKind, Cancellation, ChildState, Context,
@@ -112,7 +112,7 @@ async fn static_subtree_slot_preserves_its_handle_through_definition_and_spawn()
     assert!(matches!(snapshot.state, shelterwood::ScopeState::Running));
     assert!(snapshot.child("worker").is_some());
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("reserved subtree shuts down");
 }
@@ -213,10 +213,7 @@ async fn a_restartable_subtree_can_heal_an_unfilled_lowering_failure() {
         rejected.wait().await.kind(),
         ExitKind::NeverStarted
     ));
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("root stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
 #[tokio::test]
@@ -280,7 +277,7 @@ async fn one_shot_subtree_lowering_failure_retains_structured_provenance() {
             if undefined.len() == 1 && undefined[0].as_str() == "missing"
     ));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root rolls back");
 }
@@ -330,7 +327,7 @@ async fn subtree_intensity_trip_retains_structured_provenance() {
         "as_error exposes the same erased failure that Display renders"
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root rolls back");
 }
@@ -546,7 +543,7 @@ async fn recursive_shutdown_reaches_nested_descendants() {
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("recursive shutdown joins");
     assert!(cancelled.load(Ordering::SeqCst));
@@ -726,7 +723,7 @@ async fn hard_aborted_subtree_descendants_still_publish_exits() {
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     system
-        .shutdown(Duration::from_secs(5))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("the subtree's abort policy bounds teardown");
     let exit = tokio::time::timeout(Duration::from_secs(1), leaf.wait())
@@ -1022,7 +1019,7 @@ async fn shutdown_latched_before_a_subtree_lowering_failure_reads_cancelled() {
         "a pre-loop stop request is still a stop request: {exit:?}"
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("the stopped root rolls back");
 }
@@ -1214,10 +1211,7 @@ async fn subtree_defaults_inherit_or_reset_end_to_end() {
 
     inherited_release.release();
     reset_release.release();
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("root stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
 #[tokio::test]
@@ -1296,10 +1290,7 @@ async fn three_level_mailbox_capacity_walk_honors_inherit_and_reset() {
 
     inherited_release.release();
     reset_release.release();
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("root stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
 #[tokio::test]
@@ -1392,10 +1383,7 @@ async fn subtree_restart_defaults_inherit_or_reset_end_to_end() {
     assert!(poll_once(reset_wait.as_mut()).is_pending());
     drop(reset_wait);
 
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("root stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
 #[tokio::test(start_paused = true)]

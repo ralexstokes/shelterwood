@@ -16,8 +16,8 @@ use std::{
 };
 
 use crate::common::{
-    DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, advance_time,
-    assert_eventually, assert_quiet, next_exit_of, policy::never, poll_once,
+    DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, SHUTDOWN_BUDGET,
+    advance_time, assert_eventually, assert_quiet, next_exit_of, policy::never, poll_once,
 };
 use shelterwood::{
     Backoff, CallErrorKind, Cancellation, ChildId, ChildState, DynamicTree, ExitError, ExitKind,
@@ -339,7 +339,7 @@ async fn panicking_unread_messages_are_all_disposed_without_reclassifying_the_ac
         .expect("second message is accepted");
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("payload panics do not unwind the scope driver");
     assert_eventually!(
@@ -450,7 +450,7 @@ async fn factory_capture_destructor_panic_is_classified_during_shutdown() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("task starts");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("factory destruction stays off the scope driver");
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -646,7 +646,7 @@ fn latest_prebind_conflation_is_destroyed_outside_the_current_thread_driver() {
         assert!(first.await.is_ok());
         assert!(second.await.is_ok());
         system
-            .shutdown(Duration::from_secs(1))
+            .shutdown(SHUTDOWN_BUDGET)
             .await
             .expect("latest actor shuts down");
         displaced_thread
@@ -682,7 +682,7 @@ async fn non_runtime_reservation_cancellation_contains_destructor_panic() {
     assert_disposed_off(&mut drops, cancellation_thread, "definition was disposed").await;
     assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root shuts down");
 }
@@ -795,7 +795,7 @@ async fn non_runtime_disposals_run_off_callers_and_contain_panics() {
     .await;
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root shuts down");
 }
@@ -826,7 +826,7 @@ async fn unadmitted_removal_completes_after_blocking_definition_disposal() {
     assert_eq!(removal.await, RemoveOutcome::Removed);
     drop(admission);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root shuts down");
 }
@@ -883,7 +883,7 @@ async fn restart_window_removal_joins_factory_disposal_before_terminality() {
     ));
     assert_eq!(removal.await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root shuts down");
 }
@@ -913,7 +913,7 @@ async fn unadmitted_removal_completes_when_the_panic_payload_destructor_panics()
     assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
     drop(admission);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root shuts down");
 }
@@ -964,7 +964,7 @@ async fn ordered_shutdown_waits_for_later_unstarted_definition_disposal() {
 
     let system = tree.spawn().expect("runtime is available");
     let shutdown_token = starts.recv().await.expect("earlier task starts");
-    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(1)));
+    let shutdown = tokio::spawn(system.shutdown(SHUTDOWN_BUDGET));
     wait_for_destructor(&gate).await;
     assert!(
         !shutdown_token.is_cancelled(),
@@ -1452,7 +1452,7 @@ async fn add_id_conversion_panics_keep_static_and_dynamic_definitions_isolated()
     )
     .await;
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root shuts down");
 }
@@ -1525,7 +1525,7 @@ async fn dynamic_duplicate_rejection_disposes_definition_before_admission() {
     let error = admission.await.expect_err("duplicate id is rejected");
     assert!(matches!(error, ReserveError::DuplicateId(id) if id.as_str() == "dup"));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root shuts down");
 }
@@ -1622,7 +1622,7 @@ async fn cancelled_call_disposes_stored_reply_off_the_caller() {
     assert_disposed_off_current(&mut drops, "stored reply reports its disposal thread").await;
     gate.release();
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("replier shuts down");
 }

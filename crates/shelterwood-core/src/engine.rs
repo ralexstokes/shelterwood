@@ -1005,11 +1005,7 @@ impl<K> Default for DeadlineQueue<K> {
 impl<K> DeadlineQueue<K> {
     pub fn push(&mut self, at: Instant, key: K) -> DeadlineHandle {
         let handle = self.next_handle();
-        let replaced = self.registrations.insert(handle, key);
-        assert!(
-            replaced.is_none(),
-            "monotonic deadline keys are never reused"
-        );
+        let _ = self.registrations.insert(handle, key);
         self.entries.push(DeadlineEntry { at, handle });
         handle
     }

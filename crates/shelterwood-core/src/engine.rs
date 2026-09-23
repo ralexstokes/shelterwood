@@ -710,12 +710,9 @@ impl ScopeEpochs {
 
     pub fn finish(&mut self, epoch: Epoch) -> bool {
         match *self {
-            Self::Live {
-                current,
-                last_stopped,
-            } if current == epoch => {
+            Self::Live { current, .. } if current == epoch => {
                 *self = Self::Idle {
-                    last_stopped: last_stopped.max(Some(epoch)),
+                    last_stopped: Some(epoch),
                 };
                 // Settlement is monotone: once an owner finishes its epoch,
                 // every later `finished(epoch)` — including one asked across a

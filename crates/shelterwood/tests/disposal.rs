@@ -1112,6 +1112,18 @@ async fn ordered_shutdown_waits_for_later_unstarted_definition_disposal() {
     );
 }
 
+/// Releases every gate when dropped, so a failed assertion unwinds promptly
+/// instead of leaving a gated destructor to hit its stuck-test backstop.
+struct ReleaseOnDrop(Vec<DestructorGate>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        for gate in &self.0 {
+            gate.release();
+        }
+    }
+}
+
 /// Which later sibling's construction disposal is released first.
 #[derive(Clone, Copy)]
 enum FirstRelease {
@@ -1131,6 +1143,7 @@ enum FirstRelease {
 async fn ordered_teardown_with_out_of_order_disposal(release: FirstRelease) {
     let middle_gate = DestructorGate::default();
     let last_gate = DestructorGate::default();
+    let _release_on_failure = ReleaseOnDrop(vec![middle_gate.clone(), last_gate.clone()]);
     let order = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
     let mut tree = Tree::new();

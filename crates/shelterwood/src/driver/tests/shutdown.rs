@@ -1,5 +1,5 @@
 use super::support::*;
-use crate::{cells::RetainedExit, test_support::SHUTDOWN_BUDGET};
+use crate::{cells::RetainedExit, driver::Instant, test_support::SHUTDOWN_BUDGET};
 
 struct BlockingFactoryDrop(Arc<FactoryGate>);
 
@@ -482,4 +482,133 @@ fn epoch_guard_unwind_retires_the_epoch_despite_poisoned_control() {
             reason: StopReason::ShutdownRequested
         }
     ));
+}
+
+/// Waits for the nested child's exit, skipping its readiness edge, and returns
+/// how its task's join resolved.
+async fn nested_join_outcome(
+    events: &mut crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+) -> crate::runtime::JoinOutcome<()> {
+    loop {
+        match recv_child_event(events, DRIVER_PROGRESS_WAIT, "the nested driver's exit").await {
+            ChildEvent::Exited { join, .. } => return join,
+            ChildEvent::Ready { .. } => {}
+            _ => panic!("the nested child publishes only readiness before its exit"),
+        }
+    }
+}
+
+/// Drives a forced nested-scope child through its stop ladder up to the
+/// framework-abort phase and returns the backstop's due instant. The ladder is
+/// advanced with explicit instants, so no wall-clock beat can let the nested
+/// driver run unless the caller yields to it.
+fn force_nested_to_framework_abort(scope: &mut ScopeRuntime, key: ChildKey) -> Instant {
+    fn ladder_deadline(scope: &ScopeRuntime, key: ChildKey, phase: &str) -> Instant {
+        scope.children[key]
+            .active
+            .as_ref()
+            .expect("the nested incarnation is active")
+            .ladder
+            .as_ref()
+            .expect("the forced incarnation owns a stop ladder")
+            .deadline()
+            .unwrap_or_else(|| panic!("{phase} arms a deadline"))
+    }
+
+    scope.force_child(key);
+    let escalated = ladder_deadline(scope, key, "escalation's tidy beat");
+    let active = scope.children[key].active.as_ref().expect("still active");
+    assert!(
+        active.hard_abort_phase.is_none(),
+        "force stops at escalation's tidy beat before any framework abort"
+    );
+    scope.advance_ladder(key, escalated);
+    let active = scope.children[key].active.as_ref().expect("still active");
+    assert!(
+        active
+            .framework_abort
+            .as_ref()
+            .expect("a nested scope child owns a framework-abort latch")
+            .is_fired(),
+        "the escalation beat's expiry sends the framework abort"
+    );
+    ladder_deadline(scope, key, "the framework-abort backstop")
+}
+
+// SPEC §11 / §10 `shutdown`: a framework driver that acknowledges its
+// ancestor's abort recursively hard-drains and joins its own children, so the
+// parent's backstop must not task-abort it.
+#[crate::runtime::test]
+async fn acknowledged_framework_abort_is_joined_not_task_aborted_at_the_backstop() {
+    let mut tree = Tree::new();
+    tree.add_subtree("nested", SubtreeDef::factory(pending_tree))
+        .expect("valid subtree");
+    let fixture = OrderedScopeFixture::new(tree);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, mut events) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
+    scope.spawn_child(key);
+
+    let backstop = force_nested_to_framework_abort(&mut scope, key);
+    let ack = scope.children[key]
+        .active
+        .as_ref()
+        .expect("still active")
+        .framework_abort_ack
+        .clone()
+        .expect("a nested scope child owns a framework-abort acknowledgement");
+    // Let the real nested driver run: it observes the ancestor abort and
+    // publishes its acknowledgement before the backstop is evaluated.
+    let acked = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, async {
+        while !ack.is_fired() {
+            crate::runtime::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        matches!(acked, crate::runtime::Timeout::Completed(())),
+        "the scheduled nested driver acknowledges the framework abort"
+    );
+
+    scope.advance_ladder(key, backstop);
+    let join = nested_join_outcome(&mut events).await;
+    assert!(
+        matches!(join, crate::runtime::JoinOutcome::Ok { .. }),
+        "an acknowledged framework driver completes its own recursive drain; \
+         the backstop must not cancel its task"
+    );
+}
+
+// The fallback half: a framework driver that never publishes the
+// acknowledgement within the framework tidy beat is task-aborted there.
+#[crate::runtime::test]
+async fn unacknowledged_framework_abort_is_task_aborted_at_the_backstop() {
+    let mut tree = Tree::new();
+    tree.add_subtree("nested", SubtreeDef::factory(pending_tree))
+        .expect("valid subtree");
+    let fixture = OrderedScopeFixture::new(tree);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, mut events) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
+    scope.spawn_child(key);
+
+    // No yield between spawn and the backstop: the nested task is never
+    // polled, so it cannot acknowledge.
+    let backstop = force_nested_to_framework_abort(&mut scope, key);
+    let ack = scope.children[key]
+        .active
+        .as_ref()
+        .expect("still active")
+        .framework_abort_ack
+        .clone()
+        .expect("a nested scope child owns a framework-abort acknowledgement");
+    assert!(
+        !ack.is_fired(),
+        "an unpolled nested driver cannot acknowledge"
+    );
+
+    scope.advance_ladder(key, backstop);
+    let join = nested_join_outcome(&mut events).await;
+    assert!(
+        matches!(join, crate::runtime::JoinOutcome::Cancelled),
+        "a framework driver that misses its acknowledgement is task-aborted at the backstop"
+    );
 }

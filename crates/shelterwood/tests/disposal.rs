@@ -23,8 +23,8 @@ use shelterwood::{
     Backoff, CallErrorKind, Cancellation, ChildId, ChildState, DynamicTree, ExitError, ExitKind,
     ExitResult, Jitter, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
     ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition, RestartPolicy,
-    ScopeState, StartupError, StartupFailureCause, StaticReserveError, SubtreeOnceDef, TaskDef,
-    TaskOnceDef, Tree,
+    Retention, ScopeState, StartupError, StartupFailureCause, StaticReserveError, SubtreeOnceDef,
+    TaskDef, TaskOnceDef, Tree,
 };
 
 struct DropProbe {
@@ -147,13 +147,23 @@ impl Wake for BlockingWake {
 struct OrderedBlockingDropProbe {
     order: Arc<std::sync::Mutex<Vec<&'static str>>>,
     blocker: Option<DestructorBlocker>,
+    labels: [&'static str; 2],
 }
 
 impl OrderedBlockingDropProbe {
     fn new(gate: &DestructorGate, order: Arc<std::sync::Mutex<Vec<&'static str>>>) -> Self {
+        Self::labelled(gate, order, ["later-dispose-start", "later-dispose-end"])
+    }
+
+    fn labelled(
+        gate: &DestructorGate,
+        order: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        labels: [&'static str; 2],
+    ) -> Self {
         Self {
             order,
             blocker: Some(gate.blocker()),
+            labels,
         }
     }
 }
@@ -163,12 +173,12 @@ impl Drop for OrderedBlockingDropProbe {
         self.order
             .lock()
             .expect("order mutex is available")
-            .push("later-dispose-start");
+            .push(self.labels[0]);
         drop(self.blocker.take());
         self.order
             .lock()
             .expect("order mutex is available")
-            .push("later-dispose-end");
+            .push(self.labels[1]);
     }
 }
 
@@ -1100,6 +1110,166 @@ async fn ordered_shutdown_waits_for_later_unstarted_definition_disposal() {
         *order.lock().expect("order mutex is available"),
         ["later-dispose-start", "later-dispose-end", "earlier-stop"]
     );
+}
+
+/// Which later sibling's construction disposal is released first.
+#[derive(Clone, Copy)]
+enum FirstRelease {
+    /// The middle sibling, whose disposal began before shutdown and which the
+    /// teardown cursor has not reached yet.
+    Middle,
+    /// The last sibling, which the cursor stopped and is waiting on.
+    Last,
+}
+
+/// SPEC §11: an ordered scope stops children one at a time in reverse
+/// declaration order, and each stop waits for that child's release edge
+/// (its construction's destruction) before the earlier sibling is stopped.
+/// Two later siblings' constructions are disposing at once here, and their
+/// completions arrive in an order chosen by the test. Whichever completes
+/// first, the cursor must not stop `first` until both have joined.
+async fn ordered_teardown_with_out_of_order_disposal(release: FirstRelease) {
+    let middle_gate = DestructorGate::default();
+    let last_gate = DestructorGate::default();
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    tree.add_task(
+        "first",
+        TaskDef::new({
+            let order = Arc::clone(&order);
+            move |context| {
+                let shutdown = context.shutdown_token();
+                started
+                    .send(shutdown.clone())
+                    .expect("test observes first startup");
+                let order = Arc::clone(&order);
+                async move {
+                    shutdown.cancelled().await;
+                    order
+                        .lock()
+                        .expect("order mutex is available")
+                        .push("first-stop");
+                    Ok(())
+                }
+            }
+        }),
+    )
+    .expect("valid first task");
+    // Completes at once and never restarts: its factory's disposal begins
+    // before shutdown, while the cursor has not reached it.
+    tree.add_task(
+        "middle",
+        TaskDef::new({
+            let capture = OrderedBlockingDropProbe::labelled(
+                &middle_gate,
+                Arc::clone(&order),
+                ["middle-dispose-start", "middle-dispose-end"],
+            );
+            move |_| {
+                let _ = &capture;
+                async { Ok(()) }
+            }
+        })
+        .restart(never())
+        .retention(Retention::Remove),
+    )
+    .expect("valid middle task");
+    // Live until shutdown: the cursor stops it first, and its factory's
+    // disposal begins at that stop.
+    tree.add_task(
+        "last",
+        TaskDef::new({
+            let capture = OrderedBlockingDropProbe::labelled(
+                &last_gate,
+                Arc::clone(&order),
+                ["last-dispose-start", "last-dispose-end"],
+            );
+            move |context| {
+                let _ = &capture;
+                async move {
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
+        })
+        .retention(Retention::Remove),
+    )
+    .expect("valid last task");
+
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    let first = starts.recv().await.expect("first task starts");
+    system.wait_started().await.expect("ordered root starts");
+    wait_for_destructor(&middle_gate).await;
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(1)));
+    wait_for_destructor(&last_gate).await;
+    assert!(
+        !first.is_cancelled(),
+        "first stays live while later construction disposals are pending"
+    );
+    assert_eq!(
+        *order.lock().expect("order mutex is available"),
+        ["middle-dispose-start", "last-dispose-start"]
+    );
+
+    // Release one disposal and wait until the driver has joined it: under
+    // `Retention::Remove` the joined membership is pruned from the snapshot,
+    // which the driver publishes in the same batch that settles the cursor.
+    let (released, held, pruned) = match release {
+        FirstRelease::Middle => (&middle_gate, &last_gate, "middle"),
+        FirstRelease::Last => (&last_gate, &middle_gate, "last"),
+    };
+    let mut snapshots = scope.subscribe_snapshots();
+    released.release();
+    tokio::time::timeout(POLL_TIMEOUT, async {
+        while scope.child(pruned).is_some() {
+            snapshots
+                .changed()
+                .await
+                .expect("the live root keeps publishing snapshots");
+        }
+    })
+    .await
+    .expect("the released sibling joins and is pruned");
+    assert!(
+        !first.is_cancelled(),
+        "one joined later sibling cannot advance the cursor past the other"
+    );
+
+    held.release();
+    first.cancelled().await;
+    shutdown
+        .await
+        .expect("shutdown task joins")
+        .expect("ordered root shuts down");
+    let expected = match release {
+        FirstRelease::Middle => [
+            "middle-dispose-start",
+            "last-dispose-start",
+            "middle-dispose-end",
+            "last-dispose-end",
+            "first-stop",
+        ],
+        FirstRelease::Last => [
+            "middle-dispose-start",
+            "last-dispose-start",
+            "last-dispose-end",
+            "middle-dispose-end",
+            "first-stop",
+        ],
+    };
+    assert_eq!(*order.lock().expect("order mutex is available"), expected);
+}
+
+#[tokio::test]
+async fn ordered_teardown_waits_on_the_stopped_sibling_when_an_earlier_disposal_finishes_first() {
+    ordered_teardown_with_out_of_order_disposal(FirstRelease::Middle).await;
+}
+
+#[tokio::test]
+async fn ordered_teardown_waits_on_an_already_disposing_sibling_after_the_stopped_one_joins() {
+    ordered_teardown_with_out_of_order_disposal(FirstRelease::Last).await;
 }
 
 #[tokio::test]

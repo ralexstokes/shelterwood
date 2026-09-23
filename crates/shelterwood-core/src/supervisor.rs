@@ -48,33 +48,49 @@ enum IncarnationState {
 /// Membership state and transition reason in one enum.
 ///
 /// Removal is deliberately not a boolean parallel to incarnation state. The
-/// synchronous control-plane latch is sampled into [`Event::RemovalLatched`];
-/// after that transition, this enum is the reducer's sole authority.
+/// synchronous control-plane latch is sampled into [`Event::RemovalSampled`]
+/// and committed by [`Event::RemovalLatched`]; after those transitions, this
+/// enum is the reducer's sole authority.
+///
+/// Sampling and commitment are separate states because they own different
+/// things. A sample only forbids construction; the latch that fired it also
+/// queued exactly one removal command, and applying that command is what
+/// issues the removal's effects. Keeping the effects on the commit edge makes
+/// each one edge-triggered — one [`Effect::StopChild`] or
+/// [`Effect::FinalizeRemoval`] from the command, and at most one later
+/// [`Effect::FinalizeRemoval`] when a stopped child joins.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum ChildState {
     /// Ordinary resident membership.
     Resident(IncarnationState),
-    /// Planned removal won while the child was in the enclosed state.
+    /// A fired removal latch was sampled while the child was in the enclosed
+    /// state; its queued removal command has not been applied yet.
+    RemovalSampled(IncarnationState),
+    /// The removal command was applied and its effect issued while the child
+    /// was in the enclosed state.
     Removing(IncarnationState),
 }
 
 impl ChildState {
     fn incarnation(self) -> IncarnationState {
         match self {
-            Self::Resident(state) | Self::Removing(state) => state,
+            Self::Resident(state) | Self::RemovalSampled(state) | Self::Removing(state) => state,
         }
     }
 
     fn with_incarnation(self, state: IncarnationState) -> Self {
         match self {
             Self::Resident(_) => Self::Resident(state),
+            Self::RemovalSampled(_) => Self::RemovalSampled(state),
             Self::Removing(_) => Self::Removing(state),
         }
     }
 
-    fn removing(self) -> Self {
+    /// Records a sampled removal latch. A committed removal stays committed.
+    fn removal_sampled(self) -> Self {
         match self {
-            Self::Resident(state) | Self::Removing(state) => Self::Removing(state),
+            Self::Resident(state) => Self::RemovalSampled(state),
+            Self::RemovalSampled(_) | Self::Removing(_) => self,
         }
     }
 
@@ -98,7 +114,7 @@ impl ChildState {
     pub fn membership_status(self) -> MembershipStatus {
         match self {
             Self::Resident(_) => MembershipStatus::Active,
-            Self::Removing(_) => MembershipStatus::Removing,
+            Self::RemovalSampled(_) | Self::Removing(_) => MembershipStatus::Removing,
         }
     }
 }
@@ -165,6 +181,8 @@ pub enum Event {
     RemovalSampled {
         child: ChildKey,
     },
+    /// Applies the removal command the fired latch queued. Only the first
+    /// application for a key commits the removal and issues its effect.
     RemovalLatched {
         child: ChildKey,
     },
@@ -183,12 +201,31 @@ pub enum Event {
 /// A command for the runtime shell or observation projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect {
-    StartChild { child: ChildKey },
-    StopChild { child: ChildKey },
-    ForceChild { child: ChildKey },
-    FinalizeRemoval { child: ChildKey },
-    StartupCompleted { state: ScopeState },
-    Finished { reason: StopReason },
+    StartChild {
+        child: ChildKey,
+    },
+    /// Stops the child's live incarnation. A removal issues this at most once
+    /// per key, from its [`Event::RemovalLatched`] commit; drain and force
+    /// stops are separate sources with their own sequencing.
+    StopChild {
+        child: ChildKey,
+    },
+    ForceChild {
+        child: ChildKey,
+    },
+    /// Finalizes a committed removal whose child has joined. Issued at most
+    /// once per key: whichever of the commit and the terminal join comes
+    /// second emits it, and the `Removing(Joined)` state it leaves behind is
+    /// absorbing until [`Event::Reclaim`] retires the never-reused key.
+    FinalizeRemoval {
+        child: ChildKey,
+    },
+    StartupCompleted {
+        state: ScopeState,
+    },
+    Finished {
+        reason: StopReason,
+    },
 }
 
 /// Authoritative structural state for one scope incarnation.
@@ -342,10 +379,10 @@ impl SupervisorState {
         false
     }
 
-    fn mark_removing(&mut self, child: ChildKey) -> Option<IncarnationState> {
-        let record = self.children.get_mut(&child)?;
-        record.state = record.state.removing();
-        Some(record.state.incarnation())
+    fn sample_removal(&mut self, child: ChildKey) {
+        if let Some(record) = self.children.get_mut(&child) {
+            record.state = record.state.removal_sampled();
+        }
     }
 
     fn admit(&mut self, membership: Membership, initial: bool) -> Option<ChildKey> {
@@ -542,7 +579,7 @@ impl SupervisorState {
                 removal_latched,
             } => {
                 if removal_latched {
-                    self.mark_removing(child);
+                    self.sample_removal(child);
                 }
                 let Some(record) = self.children.get_mut(&child) else {
                     return;
@@ -609,18 +646,27 @@ impl SupervisorState {
                     child,
                     &[IncarnationState::Disposing],
                     IncarnationState::Joined,
-                ) && self.membership_status(child) == MembershipStatus::Removing
+                ) && matches!(self.child_state(child), Some(ChildState::Removing(_)))
                 {
+                    // A committed removal whose stop has now joined. A merely
+                    // sampled one finalizes when its queued command commits.
                     effects.push(Effect::FinalizeRemoval { child });
                 }
             }
             Event::RemovalSampled { child } => {
-                self.mark_removing(child);
+                self.sample_removal(child);
             }
             Event::RemovalLatched { child } => {
-                let Some(state) = self.mark_removing(child) else {
+                let Some(record) = self.children.get_mut(&child) else {
                     return;
                 };
+                let (ChildState::Resident(state) | ChildState::RemovalSampled(state)) =
+                    record.state
+                else {
+                    // Already committed: its effect was issued then.
+                    return;
+                };
+                record.state = ChildState::Removing(state);
                 if state == IncarnationState::Joined {
                     effects.push(Effect::FinalizeRemoval { child });
                 } else {
@@ -799,7 +845,7 @@ mod tests {
     #[test]
     fn transition_table_keeps_removal_in_the_authoritative_state() {
         struct Case {
-            before: IncarnationState,
+            before: ChildState,
             event: EventKind,
             after: ChildState,
             effect: EffectKind,
@@ -815,24 +861,65 @@ mod tests {
             Finalize,
             None,
         }
+        use ChildState::{RemovalSampled, Removing, Resident};
+        use IncarnationState::{Active, Disposing, Joined};
 
         let cases = [
             Case {
-                before: IncarnationState::Active,
+                before: Resident(Active),
                 event: EventKind::Remove,
-                after: ChildState::Removing(IncarnationState::Active),
+                after: Removing(Active),
                 effect: EffectKind::Stop,
             },
             Case {
-                before: IncarnationState::Joined,
+                before: Resident(Joined),
                 event: EventKind::Remove,
-                after: ChildState::Removing(IncarnationState::Joined),
+                after: Removing(Joined),
                 effect: EffectKind::Finalize,
             },
             Case {
-                before: IncarnationState::Disposing,
+                before: Resident(Disposing),
                 event: EventKind::Terminal,
-                after: ChildState::Resident(IncarnationState::Joined),
+                after: Resident(Joined),
+                effect: EffectKind::None,
+            },
+            // A sample forbids construction but issues nothing; its queued
+            // command commits it and owns the effect.
+            Case {
+                before: RemovalSampled(Active),
+                event: EventKind::Remove,
+                after: Removing(Active),
+                effect: EffectKind::Stop,
+            },
+            Case {
+                before: RemovalSampled(Disposing),
+                event: EventKind::Terminal,
+                after: RemovalSampled(Joined),
+                effect: EffectKind::None,
+            },
+            Case {
+                before: RemovalSampled(Joined),
+                event: EventKind::Remove,
+                after: Removing(Joined),
+                effect: EffectKind::Finalize,
+            },
+            // A committed removal issues each effect once.
+            Case {
+                before: Removing(Disposing),
+                event: EventKind::Terminal,
+                after: Removing(Joined),
+                effect: EffectKind::Finalize,
+            },
+            Case {
+                before: Removing(Active),
+                event: EventKind::Remove,
+                after: Removing(Active),
+                effect: EffectKind::None,
+            },
+            Case {
+                before: Removing(Joined),
+                event: EventKind::Remove,
+                after: Removing(Joined),
                 effect: EffectKind::None,
             },
         ];
@@ -841,8 +928,7 @@ mod tests {
             let membership = memberships(1)[0];
             let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::starting());
             let child = admit(&mut state, membership, true);
-            state.children.get_mut(&child).expect("child").state =
-                ChildState::Resident(case.before);
+            state.children.get_mut(&child).expect("child").state = case.before;
             let mut effects = Vec::new();
             step(
                 &mut state,
@@ -1401,7 +1487,7 @@ mod tests {
     /// until a pass emits nothing, so a start effect the shell declines is
     /// re-derived from unchanged state forever rather than merely wasted. Pin
     /// the emission set to [`Event::Spawned`]'s acceptance set across every
-    /// child state, in both flavors and both membership statuses.
+    /// child state, in both flavors and every membership status.
     #[test]
     fn start_effects_are_confined_to_the_spawn_transition() {
         let phases = [
@@ -1414,16 +1500,16 @@ mod tests {
             IncarnationState::Joined,
         ];
         for flavor in [ScopeFlavor::Ordered, ScopeFlavor::Dynamic] {
-            for removing in [false, true] {
+            for status in [
+                ChildState::Resident,
+                ChildState::RemovalSampled,
+                ChildState::Removing,
+            ] {
                 for phase in phases {
                     let membership = memberships(1)[0];
                     let mut state = SupervisorState::new(flavor, ScopeLifecycle::starting());
                     let child = admit(&mut state, membership, true);
-                    state.children.get_mut(&child).expect("child").state = if removing {
-                        ChildState::Removing(phase)
-                    } else {
-                        ChildState::Resident(phase)
-                    };
+                    state.children.get_mut(&child).expect("child").state = status(phase);
 
                     let mut effects = Vec::new();
                     step(&mut state, Event::Settle, &mut effects);
@@ -1438,8 +1524,9 @@ mod tests {
                     assert_eq!(
                         started,
                         spawned.spawned_once(child),
-                        "{flavor:?} removing={removing} {phase:?}: a start effect must be one \
-                         accepted `Spawned` away from executing"
+                        "{flavor:?} {:?}: a start effect must be one \
+                         accepted `Spawned` away from executing",
+                        status(phase)
                     );
 
                     if !started {
@@ -1447,8 +1534,9 @@ mod tests {
                         step(&mut state, Event::Settle, &mut again);
                         assert!(
                             again.is_empty(),
-                            "{flavor:?} removing={removing} {phase:?}: settlement with no start \
-                             effect to honour must already be at its fixed point, got {again:?}"
+                            "{flavor:?} {:?}: settlement with no start effect to honour must \
+                             already be at its fixed point, got {again:?}",
+                            status(phase)
                         );
                     }
                     state.check_invariants();

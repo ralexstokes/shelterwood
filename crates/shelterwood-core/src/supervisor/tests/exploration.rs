@@ -30,6 +30,12 @@ use super::{admit, memberships};
 /// The widest roster a fingerprint can encode; see [`fingerprint`].
 const MAX_WIDTH: usize = 4;
 
+/// Bits one child slot occupies in a fingerprint.
+const SLOT_BITS: usize = 9;
+
+// The scope-level fields packed above the slots end 18 bits past them.
+const _: () = assert!(SLOT_BITS * MAX_WIDTH + 18 <= 64);
+
 /// Packs every field of [`SupervisorState`] into one hashable word.
 ///
 /// The projection is what makes the walk terminate: two states with the same
@@ -98,14 +104,18 @@ fn fingerprint(state: &SupervisorState, keys: &[ChildKey]) -> u64 {
             IncarnationState::Disposing => 5,
             IncarnationState::Joined => 6,
         };
-        let removing = state.membership_status() == MembershipStatus::Removing;
+        let removal = match state {
+            ChildState::Resident(_) => 0,
+            ChildState::RemovalSampled(_) => 1,
+            ChildState::Removing(_) => 2,
+        };
         let packed = 1
             | incarnation << 1
-            | u64::from(removing) << 4
-            | u64::from(initial) << 5
-            | u64::from(ready) << 6
-            | u64::from(spawned_once) << 7;
-        word |= packed << (8 * slot(key));
+            | removal << 4
+            | u64::from(initial) << 6
+            | u64::from(ready) << 7
+            | u64::from(spawned_once) << 8;
+        word |= packed << (SLOT_BITS * slot(key) as usize);
     }
 
     let cursor = |key: &Option<ChildKey>| key.map_or(7, slot);
@@ -114,14 +124,14 @@ fn fingerprint(state: &SupervisorState, keys: &[ChildKey]) -> u64 {
     // variant to choose a projection, but not to choose one that fits: a value
     // of 8 would alias into the flavor bit and prune the space silently.
     assert!(lifecycle_state < 8 && lifecycle_reason < 8, "3-bit fields");
-    word |= u64::from(lifecycle_state) << (8 * MAX_WIDTH);
-    word |= u64::from(lifecycle_reason) << (8 * MAX_WIDTH + 3);
-    word |= u64::from(*flavor == ScopeFlavor::Ordered) << (8 * MAX_WIDTH + 6);
-    word |= u64::from(*hard_forced) << (8 * MAX_WIDTH + 7);
-    word |= u64::from(*finish_emitted) << (8 * MAX_WIDTH + 8);
-    word |= cursor(next_ordered_start) << (8 * MAX_WIDTH + 9);
-    word |= cursor(ordered_stop_cursor) << (8 * MAX_WIDTH + 12);
-    word |= cursor(ordered_stop_waiting) << (8 * MAX_WIDTH + 15);
+    word |= u64::from(lifecycle_state) << (SLOT_BITS * MAX_WIDTH);
+    word |= u64::from(lifecycle_reason) << (SLOT_BITS * MAX_WIDTH + 3);
+    word |= u64::from(*flavor == ScopeFlavor::Ordered) << (SLOT_BITS * MAX_WIDTH + 6);
+    word |= u64::from(*hard_forced) << (SLOT_BITS * MAX_WIDTH + 7);
+    word |= u64::from(*finish_emitted) << (SLOT_BITS * MAX_WIDTH + 8);
+    word |= cursor(next_ordered_start) << (SLOT_BITS * MAX_WIDTH + 9);
+    word |= cursor(ordered_stop_cursor) << (SLOT_BITS * MAX_WIDTH + 12);
+    word |= cursor(ordered_stop_waiting) << (SLOT_BITS * MAX_WIDTH + 15);
     word
 }
 
@@ -278,8 +288,9 @@ fn explore(
 /// **Two children, not three, and that is not a budget compromise.** Every
 /// property here is per-child, a fold over children, or cursor-versus-one-
 /// child; the reducer has no rule that couples three memberships, so a third
-/// adds combinations rather than cases. Measured, a third child costs 40x
-/// (1.4M states and 53M transitions against 49k and 1.3M) and no mutation
+/// adds combinations rather than cases. Measured, a third child cost 40x
+/// (1.4M states and 53M transitions against 49k and 1.3M, before splitting
+/// sampled from committed removal about doubled width two) and no mutation
 /// covering R1–R6, E4 or S3–S5 survives width two but falls to width three.
 /// The one genuinely three-body distinction — `keys_after(child).next()`
 /// against `.last()`, which needs a middle element to differ at all — is a
@@ -699,6 +710,66 @@ fn check_s3_s4_stop_sequencing_and_drain_lattice(transition: &Transition<'_>) {
     }
 }
 
+/// Removal effects are edge-triggered: each key is finalized at most once, and
+/// a removal stops it at most once.
+///
+/// Cardinality is a path property and the walk visits states, not paths, so it
+/// is stated over the state that records the issue. Every removal effect
+/// leaves the key committed (`Removing`), a committed key never uncommits, and
+/// `Removing(Joined)` — the state every finalize leaves behind — is absorbing
+/// until `Reclaim` retires a key the walk never reuses. An emission from a
+/// state that already records its effect is therefore exactly a second one.
+fn check_t9_removal_effects_are_issued_once(transition: &Transition<'_>) {
+    for &child in transition.keys {
+        let (Some(before), after) = (
+            transition.before.child_state(child),
+            transition.after.child_state(child),
+        ) else {
+            continue;
+        };
+        if let ChildState::Removing(state) = before {
+            assert!(
+                after.is_none_or(|after| after == ChildState::Removing(after.incarnation())),
+                "a committed removal never uncommits, got {after:?}"
+            );
+            if state == IncarnationState::Joined {
+                assert!(
+                    after.is_none_or(|after| after == before),
+                    "a finalized removal is absorbing until reclaim, got {after:?}"
+                );
+            }
+        }
+    }
+    for effect in transition.effects {
+        match effect {
+            Effect::FinalizeRemoval { child } => {
+                assert_ne!(
+                    transition.before.child_state(*child),
+                    Some(ChildState::Removing(IncarnationState::Joined)),
+                    "a removal is finalized once per key"
+                );
+                assert_eq!(
+                    transition.after.child_state(*child),
+                    Some(ChildState::Removing(IncarnationState::Joined)),
+                    "a finalize records itself as a joined, committed removal"
+                );
+            }
+            Effect::StopChild { child }
+                if matches!(transition.event, Event::RemovalLatched { .. }) =>
+            {
+                assert!(
+                    !matches!(
+                        transition.before.child_state(*child),
+                        Some(ChildState::Removing(_))
+                    ),
+                    "a removal command stops its child once per key"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 /// S5 — completion is derived and level-triggered: `all_children_joined`
 /// agrees with the per-child fold at every reachable state, and `Finished` is
 /// emitted once, only against that derived value.
@@ -777,4 +848,5 @@ fn check_every_invariant(transition: &Transition<'_>) {
     check_r4_one_accepted_start_edge(transition);
     check_s3_s4_stop_sequencing_and_drain_lattice(transition);
     check_s5_derived_level_triggered_completion(transition);
+    check_t9_removal_effects_are_issued_once(transition);
 }

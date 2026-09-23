@@ -186,6 +186,16 @@ struct ScopeControl {
     events: VecDeque<ScopeControlEvent>,
 }
 
+/// How a control-mutex acquisition treats poison. Ordinary callers reject
+/// it. Destructor paths ignore it, because a panic there aborts a thread that
+/// is already unwinding. Control holds plain request and epoch state, so a
+/// poisoner's partial update is no worse than any other racing write.
+#[derive(Clone, Copy)]
+enum ControlPoison {
+    Reject,
+    Ignore,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ScopeRequest {
     epoch: Epoch,
@@ -468,6 +478,7 @@ impl ScopeCell {
                     target: request.epoch,
                 },
                 txn,
+                ControlPoison::Reject,
             );
         }
     }
@@ -1133,8 +1144,34 @@ impl ScopeCell {
         );
     }
 
+    fn lock_control(&self, poison: ControlPoison) -> MutexGuard<'_, ScopeControl> {
+        match poison {
+            ControlPoison::Reject => self.control.lock().expect("scope control mutex poisoned"),
+            ControlPoison::Ignore => self
+                .control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
+    }
+
     pub(crate) fn finish_incarnation(&self, epoch: Epoch, reason: StopReason) {
-        self.finish_incarnation_with_terminal(epoch, RetainedStopReason::new(reason), None);
+        self.finish_incarnation_with_terminal(
+            epoch,
+            RetainedStopReason::new(reason),
+            None,
+            ControlPoison::Reject,
+        );
+    }
+
+    /// [`Self::finish_incarnation`] for destructors: tolerates a poisoned
+    /// control mutex, like [`Self::request_shutdown_ignoring_poison`].
+    pub(crate) fn finish_incarnation_ignoring_poison(&self, epoch: Epoch, reason: StopReason) {
+        self.finish_incarnation_with_terminal(
+            epoch,
+            RetainedStopReason::new(reason),
+            None,
+            ControlPoison::Ignore,
+        );
     }
 
     /// Takes the terminal exit as a carrier so a root completion never
@@ -1149,7 +1186,12 @@ impl ScopeCell {
         exit: impl Into<RetainedExit>,
     ) {
         let exit = exit.into();
-        self.finish_incarnation_with_terminal(epoch, RetainedStopReason::new(reason), Some(exit));
+        self.finish_incarnation_with_terminal(
+            epoch,
+            RetainedStopReason::new(reason),
+            Some(exit),
+            ControlPoison::Reject,
+        );
     }
 
     fn finish_incarnation_with_terminal(
@@ -1157,9 +1199,10 @@ impl ScopeCell {
         epoch: Epoch,
         reason: RetainedStopReason,
         mut terminal_exit: Option<RetainedExit>,
+        poison: ControlPoison,
     ) {
         self.with_observation_gate(move |wakes| {
-            let mut control = self.control.lock().expect("scope control mutex poisoned");
+            let mut control = self.lock_control(poison);
             if !control.epochs.finish(epoch) {
                 // A stale driver must not overwrite the observation
                 // projection of a newer live incarnation. Membership
@@ -1229,7 +1272,7 @@ impl ScopeCell {
             control.epochs.live_epoch()
         };
         if let Some(epoch) = epoch {
-            self.finish_incarnation_with_terminal(epoch, reason, Some(exit));
+            self.finish_incarnation_with_terminal(epoch, reason, Some(exit), ControlPoison::Reject);
         } else {
             self.with_observation_gate(move |wakes| {
                 self.publish_stopped_locked(
@@ -1247,23 +1290,20 @@ impl ScopeCell {
 
     pub(crate) fn request_shutdown(&self) -> Option<Epoch> {
         self.with_observation_gate(|txn| {
-            let control = self.control.lock().expect("scope control mutex poisoned");
-            self.request_shutdown_locked(control, txn)
+            let control = self.lock_control(ControlPoison::Reject);
+            self.request_shutdown_locked(control, txn, ControlPoison::Reject)
         })
     }
 
     /// [`Self::request_shutdown`] for destructors: tolerates a poisoned
     /// control mutex so a drop-path request cannot panic — and abort — on a
-    /// thread that is already unwinding. Control holds plain request state,
-    /// so overwriting a poisoner's partial update is no worse than any other
-    /// racing request.
+    /// thread that is already unwinding. The tolerance extends to the
+    /// parent's control mutex, which a pending-incarnation request also
+    /// writes.
     pub(crate) fn request_shutdown_ignoring_poison(&self) -> Option<Epoch> {
         self.with_observation_gate(|txn| {
-            let control = self
-                .control
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.request_shutdown_locked(control, txn)
+            let control = self.lock_control(ControlPoison::Ignore);
+            self.request_shutdown_locked(control, txn, ControlPoison::Ignore)
         })
     }
 
@@ -1271,6 +1311,7 @@ impl ScopeCell {
         &self,
         mut control: MutexGuard<'_, ScopeControl>,
         txn: &mut ObservationTxn<'_>,
+        poison: ControlPoison,
     ) -> Option<Epoch> {
         let RequestTarget {
             epoch: target,
@@ -1296,19 +1337,32 @@ impl ScopeCell {
                         target,
                     },
                     txn,
+                    poison,
                 );
             }
         }
         Some(target)
     }
 
-    fn publish_control_event_locked(&self, event: ScopeControlEvent, txn: &mut ObservationTxn<'_>) {
-        self.control
-            .lock()
-            .expect("scope control mutex poisoned")
-            .events
-            .push_back(event);
+    fn publish_control_event_locked(
+        &self,
+        event: ScopeControlEvent,
+        txn: &mut ObservationTxn<'_>,
+        poison: ControlPoison,
+    ) {
+        self.lock_control(poison).events.push_back(event);
         txn.pulse(&self.member.record);
+    }
+
+    /// Poisons the control mutex, as a panic inside a control critical
+    /// section would.
+    #[cfg(test)]
+    pub(crate) fn poison_control(&self) {
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _control = self.control.lock().expect("control starts healthy");
+            panic!("inject control poison");
+        }));
+        assert!(poisoned.is_err() && self.control.is_poisoned());
     }
 
     pub(crate) fn take_control_events(&self) -> Vec<ScopeControlEvent> {
@@ -3198,6 +3252,56 @@ mod tests {
         );
 
         assert!(scope.request_shutdown_ignoring_poison().is_some());
+    }
+
+    #[test]
+    fn destructor_shutdown_tolerates_a_poisoned_parent_control_mutex() {
+        let root = isolated_scope("root", ScopeFlavor::Dynamic);
+        let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
+        assert!(root.admit_child(ResidentProjection::new(
+            Arc::clone(&nested.member),
+            Some(Arc::clone(&nested)),
+        )));
+        root.poison_control();
+
+        // No incarnation has begun, so the request targets a pending one and
+        // publishes a restart-shutdown event into the parent's control.
+        let target = nested
+            .request_shutdown_ignoring_poison()
+            .expect("an idle scope targets its pending incarnation");
+
+        root.control.clear_poison();
+        assert_eq!(
+            root.take_control_events(),
+            [ScopeControlEvent::RestartShutdown {
+                membership: nested.member.membership(),
+                target,
+            }],
+            "the tolerant request still reaches the poisoned parent"
+        );
+    }
+
+    #[test]
+    fn destructor_finish_tolerates_a_poisoned_control_mutex() {
+        let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let epoch = scope
+            .begin_incarnation(ScopeState::Starting)
+            .expect("the fixture begins one incarnation");
+        scope.poison_control();
+
+        scope.finish_incarnation_ignoring_poison(epoch, StopReason::ShutdownRequested);
+
+        assert!(matches!(
+            scope.snapshot().state,
+            ScopeState::Stopped {
+                reason: StopReason::ShutdownRequested
+            }
+        ));
+        scope.control.clear_poison();
+        assert!(
+            scope.begin_incarnation(ScopeState::Starting).is_some(),
+            "the tolerant finish retired the epoch"
+        );
     }
 
     #[test]

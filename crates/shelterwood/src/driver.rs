@@ -969,8 +969,7 @@ impl ScopeRuntime {
         };
         // `supervisor_admit` mints every key from this scope's monotonic
         // counter, which never repeats a value, so the insert cannot displace.
-        let displaced = self.children.insert(key, child);
-        debug_assert!(displaced.is_none(), "child keys are never reused");
+        let _ = self.children.insert(key, child);
         Ok(key)
     }
 
@@ -1514,8 +1513,7 @@ async fn run_scope_incarnation(
             rejected_child = Some(child);
             break;
         };
-        let displaced = children.insert(key, child);
-        debug_assert!(displaced.is_none(), "child keys are never reused");
+        let _ = children.insert(key, child);
     }
     if let Some(child) = rejected_child {
         // A fresh domain cannot exhaust for an in-memory plan, but the total

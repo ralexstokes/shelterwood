@@ -1389,8 +1389,14 @@ One classification, produced at one point, used by every consumer.
   observation is orthogonal and never competes. Concretely: a panic is
   never masked, wherever it lands (`run`, `on_stop` — superseding the
   run's outcome, §4.1 — or an incarnation-owned destructor, via the
-  fallback report token; §5.5's detached message-disposal faults are
-  outside the incarnation verdict); and a readiness-deadline expiry names
+  fallback report token). Two destructor classes are outside every
+  incarnation verdict and are disposal faults: §5.5's detached message
+  disposal, and the membership's **retained construction** — a
+  restartable definition's source and its captures, or a never-started
+  definition — which no incarnation owns. It is destroyed on the
+  detached disposal lane after the membership's final exit has
+  published, and a panic there is contained without reclassifying that
+  exit (§9's release edge); and a readiness-deadline expiry names
   the *cause* even when the teardown it triggers ends in a grace-expiry
   abort (the mechanism).
 - **`Aborted` genuinely competes with a recorded outcome, and the rule is
@@ -1527,11 +1533,17 @@ is code, per the extractor boundary above.)
 distinct membership edges, and the retention option chooses only their
 distance. A membership becomes *terminal* when its final exit publishes
 (§8) — snapshot state `Stopped { exit }` / `StartupAborted { exit }`
-(B.6). It is *pruned* when it stops being a resident of its scope: the
-`Removed` event fires (B.4), the id is freed, and anything not yet
-resolved terminal now does. Under *remove*-on-terminal the edges coincide:
-pruning follows terminalization immediately (§12's finishing test runs
-strictly between them). Under *retain*, the terminal membership stays
+(B.6). Terminal publication never waits on the destruction of the
+membership's retained construction (§8). That destruction is the
+membership's **release** edge: pruning, the ordered-teardown cursor
+(§11) and the scope's drained test (§11) all wait for it, while
+exit-awaiting surfaces resolve at terminal publication and promise
+nothing about the construction's captures. It is *pruned* when it
+stops being a resident of its scope: the `Removed` event fires (B.4),
+the id is freed, and anything not yet resolved terminal now does.
+Under *remove*-on-terminal, pruning follows terminalization as soon as
+the release edge has passed (§12's finishing test runs strictly
+between them). Under *retain*, the terminal membership stays
 resident as a **tombstone**, with exactly these properties:
 
 - It still occupies its id: a same-id `reserve_*`/`add_*` fails
@@ -2077,8 +2089,9 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   is deliberately exit-only here), so §16.10's ordering assertions are
   built from child-side observations, not the event stream.
 - Ordered scopes tear down in reverse declaration order, one at a time,
-  full grace each; the cursor child is aborted *and joined* before the
-  ladder advances to the next sibling. Dynamic scopes cancel the group at
+  full grace each; the cursor child is aborted *and joined* — joined
+  including its release edge (§9) — before the ladder advances to the
+  next sibling. Dynamic scopes cancel the group at
   once and drain concurrently (grace clocks run in parallel, not summed).
   Aborting an ancestor arms a recursive hard-abort cascade.
 - **Driver death discharges; it never absolves.** A scope driver
@@ -2088,21 +2101,11 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   memberships terminalize (sends fail `Terminated`, exit-awaiting
   surfaces resolve), in-flight admissions and removals resolve their
   enumerated rejections, and every `Added` is paired with its `Removed`
-  before the scope's own final event. An inactive child in the
-  classified-but-unpublished terminal-disposal state is not coarsened:
-  teardown publishes its stored exit before discharging terminality,
-  without waiting for the retained user-state disposal, so that
-  classified verdict wins. A retained-construction destructor panic that
-  has already been reported is folded into that exit before publication,
-  just as on orderly dispatch — whether it is still queued on the
-  disposal lane or was already collected into the driver's current event
-  batch, which a teardown transition outranks. Teardown folds only what
-  has been reported and never waits: a disposal still in flight remains
-  detached, and its unknowable result cannot delay the kill path. First
-  publication wins, so a later completion cannot overwrite the bounded
-  fallback. This is one precision boundary — post-join precision may be
-  sacrificed, a parked promise may not survive — decided here once
-  rather than per call site.
+  before the scope's own final event. A child whose exit
+  has already published (§9: terminal, release edge still pending) is not
+  coarsened: teardown keeps its published verdict and only stops waiting
+  for the release edge. The in-flight construction disposal is detached,
+  and teardown never waits on it.
 - "Drained" has exactly one definition, derived from child state (no
   hand-maintained live counter).
 - Child exits are consumed through one funnel regardless of which await
@@ -2274,7 +2277,13 @@ the engine's other decision-layer invariants in §15.3.)
   runtime itself down — destroying the runtime around a live system is
   outside the contract.
 - `wait_started()` resolves when the whole declared tree is up, or
-  reports terminal startup failure. **At the root, startup failure does
+  reports terminal startup failure. A reported child-caused
+  `StartupFailed` is never ahead of its child: the named membership is
+  already terminal in snapshots and on its exit-awaiting surfaces, and
+  its published exit is the exit the payload carries (§9 — terminal
+  publication does not wait on the release edge). The same holds for
+  the payload a nested scope carries in `Stopped { reason:
+  StartupFailed }`. **At the root, startup failure does
   not auto-roll-back the live started prefix** — that is the owner's
   decision — so a `start_or_shutdown()`-shaped composition is provided
   making the safe default (roll back the started prefix on startup
@@ -4128,7 +4137,9 @@ matches to be reconsidered.
   `StartupFailed(StartupFailure)` (B.5 — child or lowering cause),
   `IntensityTripped(IntensityTrip)` (a trip during startup, §10.2), or
   `ShutdownRequested` (teardown requested concurrently before the tree
-  came up).
+  came up). A `StartupFailed(StartupFailure)` whose cause is
+  `Child { exit, .. }` carries exactly that child's published terminal
+  exit (§12).
 - `start_or_shutdown(self, timeout) -> Result<System, StartOrShutdownError>`
   — the error pairs the original `StartupError` with the rollback
   outcome: an `Option<ShutdownTimeout>` straggler report, `None` when

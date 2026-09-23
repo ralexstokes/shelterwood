@@ -16,10 +16,11 @@ small pure machines in `shelterwood-core`, composed by the driver:
   derivation. Per child it holds only a `ChildState` — `Resident` or
   `Removing`, each wrapping an incarnation state
   (`Unstarted → Active → Stopping → Complete → RestartPending |
-  Disposing → Joined`) — plus its startup membership and a spawned-once
-  bit. It embeds a **`ScopeLifecycle`** (`engine.rs`) for the scope's own
-  Starting → Running → Draining → Stopped arc and the stop-reason
-  lattice.
+  Disposing → Joined`, where `Disposing` means the terminal exit has
+  published and the release of the retained construction is pending) —
+  plus its startup membership and a spawned-once bit. It embeds a
+  **`ScopeLifecycle`** (`engine.rs`) for the scope's own Starting →
+  Running → Draining → Stopped arc and the stop-reason lattice.
 - Its siblings in `engine.rs` are consumed by the driver directly:
   **`StopLadder`** (per-child stop escalation over time),
   **`ReadinessGate`**, **`IntensityState`** with `schedule_restart`,

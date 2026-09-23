@@ -67,9 +67,8 @@ rests on:
   type-erased application error before any verdict is selected, so the child
   task's report cell and the driver's exit event carry it retained and the
   losing half of every fold retires through critical disposal. Framework code
-  reaches those folds through `classify_exit_retaining`,
-  `reconcile_recorded_outcomes_retaining` and
-  `classify_disposal_panic_retaining`; the raw `shelterwood-core` folds hand
+  reaches those folds through `classify_exit_retaining` and
+  `reconcile_recorded_outcomes_retaining`; the raw `shelterwood-core` folds hand
   both halves back and are for core's own tests.
   `RetainedExit::into_user_owned` is deliberately narrower than surrender, and
   `pub(in crate::cells)` is what keeps it narrow: no driver-layer caller can

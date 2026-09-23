@@ -42,6 +42,18 @@ impl ScopeRuntime {
                 // terminal routes through `finalize_removal`, and its exit
                 // classification must not mistake a post-ready stop for a
                 // pre-ready failure.
+                //
+                // Only the live incarnation may reach the reducer: a stale
+                // effect must neither credit startup nor promote its
+                // successor.
+                let live = self
+                    .children
+                    .get(key)
+                    .and_then(|child| child.active.as_ref())
+                    .is_some_and(|active| active.incarnation == incarnation);
+                if !live {
+                    return false;
+                }
                 let removal_latched = self.removal_latched(key);
                 self.reduce(SupervisorEvent::Ready {
                     child: key,
@@ -54,9 +66,6 @@ impl ScopeRuntime {
                 let Some(active) = child.active.as_mut() else {
                     return false;
                 };
-                if active.incarnation != incarnation {
-                    return false;
-                }
                 if let Some(deadline) = active.readiness_deadline.take() {
                     self.deadlines.cancel(deadline);
                 }

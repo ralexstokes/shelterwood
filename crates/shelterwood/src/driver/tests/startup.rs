@@ -841,6 +841,50 @@ async fn drain_stop_suppresses_an_already_fired_readiness_latch() {
     );
 }
 
+/// A readiness effect carrying a superseded incarnation is inert: it credits
+/// no startup and promotes no member, even though the key is still resident.
+#[crate::runtime::test]
+async fn stale_incarnation_readiness_effect_does_not_credit_startup() {
+    let mut tree = Tree::new();
+    tree.add_task(
+        "gate",
+        TaskDef::new(|_| future::pending::<crate::ExitResult>())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness is valid")
+            .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid task");
+    let fixture = OrderedScopeFixture::new(tree);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
+
+    scope.spawn_child(key);
+    let live = scope.children[key]
+        .active
+        .as_ref()
+        .expect("spawned child is active")
+        .incarnation;
+    let mut incarnations =
+        IncarnationCounter::fixture(scope.children[key].slot.member.membership());
+    let stale = std::iter::from_fn(|| incarnations.mint())
+        .find(|incarnation| *incarnation != live)
+        .expect("a second incarnation is mintable");
+
+    let promoted =
+        scope.apply_readiness_effect(key, stale, crate::engine::ReadinessEffect::BecameReady);
+
+    assert!(!promoted, "a stale incarnation promotes nothing");
+    assert!(
+        !scope.supervisor.initial_ready(key),
+        "a stale readiness effect must not credit startup"
+    );
+    assert!(!scope.supervisor.lifecycle().startup_complete());
+    assert!(matches!(
+        scope.children[key].slot.member.record().stage,
+        MemberStage::Starting
+    ));
+}
+
 /// `next_ordered_start` is held across `spawn_child` and is never cleared by
 /// `reclaim_child`, so `progress_startup` must treat a reclaimed key the way
 /// `stop_next_ordered` treats its own cursor: already gone, advance past it.

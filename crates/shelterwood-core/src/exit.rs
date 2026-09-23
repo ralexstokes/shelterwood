@@ -886,6 +886,17 @@ mod tests {
     }
 
     #[test]
+    fn lowering_startup_failure_counts_its_undefined_slots_and_has_no_source() {
+        let failure = StartupFailure {
+            cause: StartupFailureCause::Lowering {
+                undefined: vec![ChildId::from("left"), ChildId::from("right")],
+            },
+        };
+        assert_eq!(failure.to_string(), "subtree has 2 undefined slots");
+        assert!(failure.source().is_none());
+    }
+
+    #[test]
     fn startup_failure_chain_renders_each_cause_once() {
         let mut identity = ScopeIdentity::new();
         let mut child_failure = |id: &str, error: ExitError| StartupFailure {
@@ -1217,6 +1228,11 @@ mod tests {
     fn stop_reasons_own_nested_and_root_exit_projection() {
         assert!(stop_reason_into_nested_result(StopReason::Finished).is_ok());
         assert!(stop_reason_into_nested_result(StopReason::ShutdownRequested).is_ok());
+        assert_eq!(
+            stop_reason_root_exit(&StopReason::Finished),
+            Exit::completed(Cancellation::NotObserved),
+            "a root that finished on its own never observed cancellation"
+        );
         assert_eq!(
             stop_reason_root_exit(&StopReason::ShutdownRequested),
             Exit::completed(Cancellation::Observed)

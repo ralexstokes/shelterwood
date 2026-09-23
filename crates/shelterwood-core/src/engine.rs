@@ -1902,6 +1902,42 @@ mod tests {
     }
 
     #[test]
+    fn only_the_live_epoch_is_current() {
+        let mut epochs = ScopeEpochs::default();
+        assert!(
+            !epochs.is_current(Epoch::FIRST),
+            "an idle scope has no current epoch"
+        );
+        let first = epochs.begin().expect("first epoch is available");
+        let unminted = first.successor().expect("a successor epoch is available");
+        assert!(epochs.is_current(first));
+        assert!(
+            !epochs.is_current(unminted),
+            "a future epoch is not current"
+        );
+        assert!(epochs.finish(first));
+        assert!(
+            !epochs.is_current(first),
+            "a finished epoch is no longer current"
+        );
+
+        let second = epochs.begin().expect("second epoch is available");
+        assert_eq!(second, unminted);
+        assert!(epochs.is_current(second));
+        assert!(
+            !epochs.is_current(first),
+            "a stale epoch is not current under a later live incarnation"
+        );
+
+        let mut exhausted = ScopeEpochs::Exhausted {
+            last_stopped: Some(first),
+        };
+        assert_eq!(exhausted.begin(), None);
+        assert!(!exhausted.is_current(first));
+        assert!(!exhausted.is_current(second));
+    }
+
+    #[test]
     fn scope_epoch_exhaustion_is_poisoned_without_minting_or_reuse() {
         let mut epochs = ScopeEpochs::default();
         assert_eq!(

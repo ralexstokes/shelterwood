@@ -1652,6 +1652,49 @@ mod tests {
     }
 
     #[test]
+    fn watch_receivers_baseline_the_version_they_were_created_at() {
+        fn changed(receiver: &mut super::WatchReceiver<u8>) -> bool {
+            let mut changed = Box::pin(receiver.changed());
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        }
+
+        let (sender, mut original) = super::watch(0_u8);
+        sender.modify_silently(|value| *value = 1);
+        assert!(!changed(&mut original), "a silent write is not a change");
+        sender.pulse();
+
+        // A subscription taken after the pulse starts at that version, so the
+        // pulse it never missed is not reported to it.
+        let mut late = sender.watcher();
+        assert!(
+            !changed(&mut late),
+            "a new watcher baselines the current version"
+        );
+
+        // The channel's first receiver baselines the initial version, and a
+        // clone inherits its source's baseline rather than the channel's: one
+        // taken from the still-behind original owes the same change.
+        let mut behind_clone = original.clone();
+        assert!(changed(&mut original));
+        assert!(!changed(&mut original), "a change is observed once");
+        assert!(changed(&mut behind_clone));
+        let mut caught_up_clone = original.clone();
+        assert!(!changed(&mut caught_up_clone));
+
+        sender.pulse();
+        assert_eq!(late.borrow_and_update_cloned(), 1);
+        assert!(
+            !changed(&mut late),
+            "reading with update consumes the change"
+        );
+        assert_eq!(caught_up_clone.borrow_cloned(), 1);
+        assert!(changed(&mut caught_up_clone), "a plain read does not");
+    }
+
+    #[test]
     fn closed_watch_change_parks_on_its_first_poll() {
         let (sender, mut receiver) = super::watch(());
         drop(sender);

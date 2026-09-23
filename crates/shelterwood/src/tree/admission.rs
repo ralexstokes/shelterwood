@@ -37,6 +37,14 @@ fn fail_closed<T>(response: Option<T>, fallback: T, debug_panics: bool, what: &s
 /// Tokio runtime. A first poll outside one returns [`ReserveError::NoRuntime`]
 /// and releases the reservation.
 ///
+/// Admission starts at the first poll, so dropping the future before then
+/// never admits the child, fused or split. The reservation is released, the
+/// reserved member ends as [`ExitKind::NeverStarted`](crate::ExitKind::NeverStarted), and
+/// its id becomes reusable — the same outcome as a first poll outside a
+/// runtime. For a split definition that is the one drop edge that does not
+/// detach: the handles taken from the slot beforehand stay valid but name a
+/// child that never ran.
+///
 /// The driver's admission obligation publishes an outcome on every path,
 /// including its own drop fallback, so this future always resolves to the
 /// admitted handles or a [`ReserveError`]. Should that obligation ever be

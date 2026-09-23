@@ -95,6 +95,16 @@ macro_rules! context_common_forwarders {
         /// completion. Awaiting it resumes a panic raised inside the closure
         /// at the await point.
         ///
+        /// The closure's token is a child of the
+        /// [`shutdown_token`](Self::shutdown_token), and is also cancelled when
+        /// the returned future is dropped. From [`StopContext`] it is
+        /// therefore *always already cancelled*: `on_stop` runs only after
+        /// shutdown has fired, and the child inherits that state. Blocking
+        /// teardown that must finish should not bail out on that token; watch
+        /// a captured [`abort_token`](Self::abort_token) instead, which fires
+        /// only when the stop escalates to abort (grace expiry, or at once
+        /// under an abort shutdown policy).
+        ///
         /// Cancellation is cooperative; a hard-aborted operation's OS thread
         /// detaches and may outlive this actor incarnation.
         /// A blocking-pool rejection during runtime teardown uses a detached

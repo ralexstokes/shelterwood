@@ -825,6 +825,30 @@ async fn select_and_timeout_preserve_fused_and_split_admission_ownership() {
 }
 
 #[tokio::test]
+async fn split_definition_dropped_before_first_poll_never_starts() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+
+    let slot = scope
+        .reserve_task("split-unpolled")
+        .expect("split reservation");
+    let task = slot.task_ref();
+    drop(slot.define(waiting_task()));
+    let exit = tokio::time::timeout(POLL_TIMEOUT, task.wait())
+        .await
+        .expect("the released reservation publishes its terminal exit");
+    assert!(matches!(exit.kind(), ExitKind::NeverStarted));
+    let reused = scope
+        .add_task("split-unpolled", waiting_task())
+        .await
+        .expect("the released id is reusable");
+    assert_eq!(scope.remove_task(&reused).await, RemoveOutcome::Removed);
+
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
+}
+
+#[tokio::test]
 async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");

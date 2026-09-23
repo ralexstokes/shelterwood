@@ -1424,10 +1424,15 @@ async fn wait_for_scope_wake(
             return Some(reason);
         }
         runtime::ScopeWake::Deadline => {
-            // A producer becoming ready at the same instant owns the tie over
-            // its deadline. Give tasks woken by that clock edge one turn to
-            // publish their retained readiness latch before collecting due
-            // registrations.
+            // What SPEC §7/§13 guarantee is that a readiness latch already
+            // fired when its deadline is handled wins the tie:
+            // `handle_deadline` feeds the retained latch into the engine.
+            // This yield only widens that window, best effort. On a
+            // current-thread runtime, tasks woken by the same clock edge are
+            // queued ahead of this deferred driver and each get one poll, so
+            // a producer that marks ready on that poll wins the tie. On a
+            // multi-thread runtime such a producer may be on another worker
+            // and not yet have run, and then the deadline can win.
             runtime::yield_now().await;
         }
         runtime::ScopeWake::Message(Some(event))

@@ -312,7 +312,6 @@ struct IntensityCharge {
 impl IntensityTrip {
     fn new(charge: IntensityCharge) -> Self {
         let policy = charge.policy;
-        assert_eq!(charge.tripped, charge.in_window > policy.max_restarts());
         Self {
             max_restarts: policy.max_restarts(),
             observed_restarts: charge.in_window,

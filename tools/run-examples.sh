@@ -6,10 +6,13 @@
 set -eu
 
 found=0
-for path in crates/shelterwood/examples/*.rs; do
-    [ -e "$path" ] || break
+for path in crates/shelterwood/examples/*.rs crates/shelterwood/examples/*/main.rs; do
+    [ -f "$path" ] || continue
     found=1
-    example="$(basename "$path" .rs)"
+    case "$path" in
+        crates/shelterwood/examples/*/main.rs) example="$(basename "$(dirname "$path")")" ;;
+        *) example="$(basename "$path" .rs)" ;;
+    esac
     cargo run --locked -p shelterwood --example "$example"
 done
 

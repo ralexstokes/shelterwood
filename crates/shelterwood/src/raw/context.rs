@@ -666,8 +666,15 @@ impl<M: Send + 'static> RawContext<M> {
         }
     }
 
+    /// Whether a stop has begun: a local stop (published or deferred until
+    /// after init), cooperative shutdown, or escalation. B.2's stopping rule
+    /// applies to every context uniformly, so this matches
+    /// `TaskContext::is_stopping` in counting the abort token too.
     pub(crate) fn is_stopping(&self) -> bool {
-        self.deferred_init_stop || self.local_stop.is_fired() || self.shutdown.is_cancelled()
+        self.deferred_init_stop
+            || self.local_stop.is_fired()
+            || self.shutdown.is_cancelled()
+            || self.abort.is_cancelled()
     }
 
     /// Queues an actor-local continuation ahead of external input.
@@ -1360,7 +1367,8 @@ mod tests {
 
     use super::{
         EventQueue, OffloadPoll, OffloadResource, PanicSlot, QueuedEvent, RawContext, RawDisposal,
-        RawResources, RawRunContext, SharedOffloadFuture, SharedOffloadState, TimerMessage,
+        RawResources, RawRunContext, Rejected, SharedOffloadFuture, SharedOffloadState,
+        TimerMessage,
     };
     use crate::{
         ChildId, MailboxShutdown, Readiness,
@@ -1380,6 +1388,14 @@ mod tests {
     /// bound, so `next_ready` can take the busy path without a driver. The
     /// returned latch is the context's own shutdown token.
     fn bound_raw_context_for<M: Send + 'static>() -> (RawContext<M>, ActorRef<M>, Latch) {
+        let (context, actor, shutdown, _abort) = bound_raw_context_with_abort();
+        (context, actor, shutdown)
+    }
+
+    /// [`bound_raw_context_for`], also returning the context's escalation
+    /// latch.
+    fn bound_raw_context_with_abort<M: Send + 'static>()
+    -> (RawContext<M>, ActorRef<M>, Latch, Latch) {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("raw-actor");
         let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
@@ -1408,6 +1424,7 @@ mod tests {
 
         let myself = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
         let shutdown = Latch::default();
+        let abort = Latch::default();
         let context = RawContext::new(
             RawRunContext {
                 id,
@@ -1415,7 +1432,7 @@ mod tests {
                 member,
                 scope: ScopeRef { cell: scope },
                 shutdown: shutdown.clone(),
-                abort: Latch::default(),
+                abort: abort.clone(),
                 ready: CompletionGatedLatch::default(),
                 local_stop: Latch::default(),
                 mailbox_shutdown: MailboxShutdown::Drain,
@@ -1424,7 +1441,7 @@ mod tests {
             mailbox,
             Readiness::Immediate,
         );
-        (context, myself, shutdown)
+        (context, myself, shutdown, abort)
     }
 
     fn bound_raw_context() -> (RawContext<u8>, ActorRef<u8>) {
@@ -2101,6 +2118,25 @@ mod tests {
             "the ready-selection turn reclaimed both finished ledger entries"
         );
         assert!(!context.resources.offloads[0].finished.is_fired());
+    }
+
+    #[test]
+    fn abort_first_stops_a_raw_context() {
+        let (mut context, _actor, shutdown, abort) = bound_raw_context_with_abort::<u8>();
+
+        assert!(abort.fire());
+        assert!(context.is_stopping());
+        context.mark_ready();
+        assert!(
+            !context.ready.is_fired(),
+            "escalation suppresses readiness publication, as on TaskContext"
+        );
+        assert_eq!(
+            context.continue_with(1).map_err(Rejected::into_inner),
+            Err(1),
+            "escalation rejects new incarnation work"
+        );
+        assert!(!shutdown.is_fired());
     }
 
     #[crate::runtime::test]

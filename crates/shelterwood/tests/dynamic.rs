@@ -9,7 +9,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, advance_time, assert_eventually, assert_quiet,
+    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, advance_time, assert_eventually,
+    assert_eventually_frozen, assert_quiet,
     policy::never,
     poll_once,
     waiting::{
@@ -1226,7 +1227,7 @@ async fn dynamic_scope_rejects_reservations_between_incarnations() {
     let scope = root.add_subtree("dynamic", subtree).expect("valid subtree");
     let system = root.spawn().expect("runtime is available");
 
-    assert_eventually!(|| first_started.load(Ordering::SeqCst)).await;
+    assert_eventually_frozen!(|| first_started.load(Ordering::SeqCst)).await;
     system
         .scope()
         .wait_for_child(
@@ -1393,7 +1394,7 @@ fn pending_restart_subtree(
 }
 
 async fn await_first_restart_window(root: &ScopeRef, starts: &Arc<AtomicUsize>) {
-    assert_eventually!(|| starts.load(Ordering::SeqCst) == 1).await;
+    assert_eventually_frozen!(|| starts.load(Ordering::SeqCst) == 1).await;
     root.wait_for_child(
         "nested",
         |child| matches!(child.state, ChildState::Restarting),
@@ -1493,7 +1494,7 @@ async fn assert_pending_restart_shutdown_is_expedited<R: Clone>(
     // never reaches a *later* incarnation only re-measures the quiet interior
     // of the window it already observed.
     advance_time(width + Duration::from_secs(1)).await;
-    assert_eventually!(
+    assert_eventually_frozen!(
         || starts.load(Ordering::SeqCst) >= 3,
         "a consumed pending request must not suppress the ordinary backoff restart"
     )

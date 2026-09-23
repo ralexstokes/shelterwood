@@ -10,8 +10,8 @@ use std::{
 };
 
 use crate::common::{
-    GatedRecorder, MessageRecorder, ReleaseGate, advance_time, assert_eventually, assert_quiet,
-    poll_once, waiting::task as waiting_task,
+    GatedRecorder, MessageRecorder, ReleaseGate, advance_time, assert_eventually_frozen,
+    assert_quiet, poll_once, waiting::task as waiting_task,
 };
 use shelterwood::{
     Backoff, CallErrorKind, ChildState, ExitError, ExitResult, Jitter, Mailbox, RawOnceDef,
@@ -210,12 +210,12 @@ async fn acceptance_winning_the_deadline_withdrawal_race_succeeds() {
 
     advance_time(deadline).await;
     gate.release();
-    assert_eventually!(|| values.lock().expect("values mutex poisoned").contains(&1)).await;
+    assert_eventually_frozen!(|| values.lock().expect("values mutex poisoned").contains(&1)).await;
     assert!(
         matches!(poll_once(timed.as_mut()), Poll::Ready(Ok(value)) if value == accepting),
         "acceptance is checked before successful withdrawal at the boundary"
     );
-    assert_eventually!(|| values.lock().expect("values mutex poisoned").as_slice() == [1, 2]).await;
+    assert_eventually_frozen!(|| values.lock().expect("values mutex poisoned").as_slice() == [1, 2]).await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -244,7 +244,7 @@ async fn call_promotion_winning_the_deadline_race_reports_response_timeout() {
 
     advance_time(deadline).await;
     gate.release();
-    assert_eventually!(|| calls.load(Ordering::SeqCst) == 1).await;
+    assert_eventually_frozen!(|| calls.load(Ordering::SeqCst) == 1).await;
     let Poll::Ready(Err(error)) = poll_once(call.as_mut()) else {
         panic!("promotion must win before deadline withdrawal");
     };
@@ -300,7 +300,8 @@ async fn zero_deadlines_short_circuit_without_acceptance_or_message_construction
     assert!(!constructed.load(Ordering::SeqCst));
 
     gate.release();
-    assert_eventually!(|| values.lock().expect("values mutex poisoned").as_slice() == [1]).await;
+    assert_eventually_frozen!(|| values.lock().expect("values mutex poisoned").as_slice() == [1])
+        .await;
     assert_quiet(Duration::from_millis(20), || {
         values.lock().expect("values mutex poisoned").contains(&2)
             || calls.load(Ordering::SeqCst) != 0
@@ -559,7 +560,7 @@ async fn overflowing_restart_delay_has_no_substitute_and_never_restarts() {
 
     // SPEC B.6: an exact deadline too distant for the runtime clock to
     // represent and arm has no substitute, and therefore never fires.
-    assert_eventually!(|| {
+    assert_eventually_frozen!(|| {
         system.scope().child("restart").is_some_and(|child| {
             matches!(child.state, ChildState::Restarting) && child.restart_at.is_none()
         })

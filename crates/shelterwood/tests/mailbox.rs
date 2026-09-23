@@ -11,7 +11,7 @@ use std::{
 
 use crate::common::{
     GatedRecorder, MessageRecorder, ReleaseGate, SHUTDOWN_BUDGET, advance_time, assert_eventually,
-    assert_quiet, poll_once,
+    assert_eventually_frozen, assert_quiet, poll_once,
 };
 use shelterwood::{
     CallErrorKind, Mailbox, PolicyError, RawDef, Reply, ReplyError, SendErrorKind, Tree,
@@ -156,7 +156,7 @@ async fn queue_backpressure_and_send_error_identity_are_exact() {
             .expect("send accepts"),
         accepting
     );
-    assert_eventually!(|| values.lock().expect("values mutex poisoned").as_slice() == [1, 2]).await;
+    assert_eventually_frozen!(|| values.lock().expect("values mutex poisoned").as_slice() == [1, 2]).await;
 
     system
         .shutdown(Duration::from_secs(1))
@@ -240,12 +240,13 @@ async fn timed_send_withdraws_and_recovers_the_message() {
     assert!(poll_once(cancelled.as_mut()).is_pending());
     drop(cancelled);
     gate.release();
-    assert_eventually!(|| values.lock().expect("values mutex poisoned").as_slice() == [1]).await;
+    assert_eventually_frozen!(|| values.lock().expect("values mutex poisoned").as_slice() == [1])
+        .await;
     actor
         .send(error.message)
         .await
         .expect("recovered message is safe to resend");
-    assert_eventually!(|| values.lock().expect("values mutex poisoned").as_slice() == [1, 2]).await;
+    assert_eventually_frozen!(|| values.lock().expect("values mutex poisoned").as_slice() == [1, 2]).await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -286,7 +287,7 @@ async fn call_distinguishes_success_drop_and_response_timeout() {
             tokio::spawn(
                 async move { call_actor.call(|reply| Message::Ask(7, reply), width).await },
             );
-        assert_eventually!(|| asks.load(Ordering::SeqCst) == 1).await;
+        assert_eventually_frozen!(|| asks.load(Ordering::SeqCst) == 1).await;
         if mode == ReplyMode::Hold {
             advance_time(width).await;
         }

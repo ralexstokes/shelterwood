@@ -11,8 +11,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, PanicOnDrop, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_quiet,
-    last_panic_message, next_exit_of,
+    POLL_TIMEOUT, PanicOnDrop, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually,
+    assert_eventually_frozen, assert_quiet, last_panic_message, next_exit_of,
 };
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
@@ -575,7 +575,7 @@ async fn offload_completion_wins_at_the_exact_deadline() {
         .send(DeadlineMessage::Start)
         .await
         .expect("actor live");
-    assert_eventually!(
+    assert_eventually_frozen!(
         || armed.load(Ordering::SeqCst) && offload_started.load(Ordering::SeqCst),
         "the offload is polled and its deadline is registered before time moves"
     )
@@ -646,7 +646,7 @@ async fn dropping_scoped_guard_suppresses_the_continuation() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     actor.send(GuardMessage::Start).await.expect("actor live");
-    assert_eventually!(
+    assert_eventually_frozen!(
         || guard_dropped.load(Ordering::SeqCst),
         "the actor drops the guard before the negative window begins"
     )

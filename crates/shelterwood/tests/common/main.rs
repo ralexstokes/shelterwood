@@ -108,6 +108,44 @@ async fn eventual_assertion_context_is_evaluated_only_on_failure() {
     assert!(!evaluated.get());
 }
 
+/// The case the frozen variant exists for: a paused-clock wait on a native
+/// thread that Tokio does not track. `assert_eventually!` would auto-advance
+/// 1 ms per probe here and spend its whole virtual budget within a few real
+/// milliseconds; the frozen variant waits on wall time and leaves the clock
+/// where it was.
+#[tokio::test(start_paused = true)]
+async fn frozen_eventual_assertion_waits_on_a_native_thread_without_moving_time() {
+    let done = Arc::new(AtomicBool::new(false));
+    let worker = std::thread::spawn({
+        let done = Arc::clone(&done);
+        move || {
+            std::thread::sleep(Duration::from_millis(100));
+            done.store(true, Ordering::SeqCst);
+        }
+    });
+    let started_at = tokio::time::Instant::now();
+
+    crate::common::assert_eventually_frozen!(|| done.load(Ordering::SeqCst)).await;
+
+    assert_eq!(tokio::time::Instant::now(), started_at);
+    worker.join().expect("worker thread completes");
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "virtual time moved while")]
+async fn frozen_eventual_assertion_rejects_a_moved_clock() {
+    let advanced = Arc::new(AtomicBool::new(false));
+    tokio::spawn({
+        let advanced = Arc::clone(&advanced);
+        async move {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            advanced.store(true, Ordering::SeqCst);
+        }
+    });
+
+    crate::common::assert_eventually_frozen!(|| advanced.load(Ordering::SeqCst)).await;
+}
+
 /// The raw-waker probe is shared with internal tests, and every fixture built
 /// on it -- `hostile_waker` above all -- is consumed by abort-class regressions
 /// that assert only that

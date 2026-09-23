@@ -9,7 +9,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, advance_time, assert_eventually, assert_quiet,
+    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, advance_time, assert_eventually,
+    assert_eventually_frozen, assert_quiet,
     policy::never,
     waiting::{
         cancellation_signalled_waiting_task, construction_signalled_waiting_task,
@@ -186,7 +187,7 @@ async fn readiness_fired_before_failure_makes_the_failure_post_ready() {
     .expect("valid task");
 
     let system = tree.spawn().expect("runtime is available");
-    assert_eventually!(|| {
+    assert_eventually_frozen!(|| {
         system
             .scope()
             .child("ready-then-fail")
@@ -589,7 +590,7 @@ async fn immediate_restart_deadline_rechecks_aggregate_startup() {
     .expect("valid manual sibling");
 
     let system = tree.spawn().expect("runtime is available");
-    assert_eventually!(|| {
+    assert_eventually_frozen!(|| {
         system
             .scope()
             .child("restarting-immediate")
@@ -601,7 +602,7 @@ async fn immediate_restart_deadline_rechecks_aggregate_startup() {
     assert_eq!(system.scope().snapshot().state, ScopeState::Starting);
 
     advance_time(backoff).await;
-    assert_eventually!(|| incarnations.load(Ordering::SeqCst) == 2).await;
+    assert_eventually_frozen!(|| incarnations.load(Ordering::SeqCst) == 2).await;
     system
         .wait_started()
         .await
@@ -643,8 +644,10 @@ async fn ordered_startup_waits_for_manual_readiness() {
     .expect("valid task");
 
     let system = tree.spawn().expect("runtime is available");
-    assert_eventually!(|| { order.lock().expect("order mutex poisoned").as_slice() == ["gated"] })
-        .await;
+    assert_eventually_frozen!(|| {
+        order.lock().expect("order mutex poisoned").as_slice() == ["gated"]
+    })
+    .await;
     assert_quiet(Duration::from_millis(20), || {
         order.lock().expect("order mutex poisoned").len() > 1
     })
@@ -780,7 +783,7 @@ async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
         )
         .expect("valid task");
     let ready_system = ready_tree.spawn().expect("runtime is available");
-    assert_eventually!(|| ready_started.load(Ordering::SeqCst)).await;
+    assert_eventually_frozen!(|| ready_started.load(Ordering::SeqCst)).await;
     advance_time(width).await;
     ready_marked.wait().await;
     ready_system
@@ -863,9 +866,9 @@ async fn restart_before_aggregate_readiness_rearms_the_gate() {
     )
     .expect("valid task");
     let system = tree.spawn().expect("runtime is available");
-    assert_eventually!(|| later_started.load(Ordering::SeqCst)).await;
+    assert_eventually_frozen!(|| later_started.load(Ordering::SeqCst)).await;
     fail_first.release();
-    assert_eventually!(|| incarnation.load(Ordering::SeqCst) == 2).await;
+    assert_eventually_frozen!(|| incarnation.load(Ordering::SeqCst) == 2).await;
     release_second.release();
     assert!(
         tokio::time::timeout(Duration::from_millis(20), system.wait_started())
@@ -1000,7 +1003,7 @@ async fn dynamic_startup_completes_after_removing_sole_unready_initial_member() 
         .expect("valid initial member");
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
-    assert_eventually!(|| scope.as_scope().child("gate").is_some()).await;
+    assert_eventually_frozen!(|| scope.as_scope().child("gate").is_some()).await;
 
     assert_eq!(
         scope.remove("gate").await,
@@ -1025,7 +1028,7 @@ async fn dynamic_startup_completes_after_removing_last_unready_initial_member() 
         .expect("valid unready member");
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
-    assert_eventually!(|| {
+    assert_eventually_frozen!(|| {
         scope
             .as_scope()
             .child("ready")
@@ -1059,7 +1062,7 @@ async fn dynamic_startup_completes_after_removing_every_initial_member() {
         .expect("valid unready member");
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
-    assert_eventually!(|| {
+    assert_eventually_frozen!(|| {
         scope.as_scope().child("first").is_some() && scope.as_scope().child("second").is_some()
     })
     .await;
@@ -1095,7 +1098,7 @@ async fn removal_completed_nested_startup_releases_the_ordered_sibling() {
 
     let system = root.spawn().expect("runtime is available");
     let scope = system.scope();
-    assert_eventually!(|| nested_scope.as_scope().child("gate").is_some()).await;
+    assert_eventually_frozen!(|| nested_scope.as_scope().child("gate").is_some()).await;
     assert_quiet(Duration::from_secs(5), || {
         scope
             .child("after")
@@ -1135,7 +1138,7 @@ async fn removing_a_ready_initial_member_leaves_startup_pending() {
         .expect("valid unready member");
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
-    assert_eventually!(|| {
+    assert_eventually_frozen!(|| {
         scope
             .as_scope()
             .child("ready")

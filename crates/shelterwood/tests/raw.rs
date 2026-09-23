@@ -9,8 +9,8 @@ use std::{
 };
 
 use crate::common::{
-    ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_quiet, last_panic_message,
-    waiting::task as waiting_task,
+    ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_eventually_frozen, assert_quiet,
+    last_panic_message, waiting::task as waiting_task,
 };
 use shelterwood::{
     DynamicTree, ExitError, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor,
@@ -279,7 +279,7 @@ async fn raw_manual_readiness_gates_ordered_startup_but_not_mailbox_acceptance()
         )
         .expect("valid sibling");
     let system = tree.spawn().expect("runtime is available");
-    assert_eventually!(|| entered.load(Ordering::SeqCst)).await;
+    assert_eventually_frozen!(|| entered.load(Ordering::SeqCst)).await;
     assert_quiet(Duration::from_millis(20), || {
         sibling_started.load(Ordering::SeqCst)
     })
@@ -291,7 +291,7 @@ async fn raw_manual_readiness_gates_ordered_startup_but_not_mailbox_acceptance()
     release_ready.release();
     system.wait_started().await.expect("manual gate releases");
     assert!(sibling_started.load(Ordering::SeqCst));
-    assert_eventually!(|| {
+    assert_eventually_frozen!(|| {
         values
             .lock()
             .expect("manual values mutex poisoned")

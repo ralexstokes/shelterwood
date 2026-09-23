@@ -10,7 +10,7 @@ use std::{
 
 use crate::common::{
     DestructorBlocker, DestructorGate, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually,
-    policy::never, poll_once,
+    assert_eventually_frozen, policy::never, poll_once,
 };
 use shelterwood::{
     Backoff, CallErrorKind, ExitError, ExitResult, Jitter, Mailbox, RawActor, RawContext, RawDef,
@@ -167,7 +167,7 @@ async fn rebind_refreshes_all_overflow_waiter_incarnation_evidence() {
 
     fail_first.release();
     let mut replacement = None;
-    assert_eventually!(|| {
+    assert_eventually_frozen!(|| {
         if let std::task::Poll::Ready(result) = poll_once(promoted.as_mut()) {
             replacement = Some(result.expect("first waiter enters replacement capacity"));
             true
@@ -366,7 +366,7 @@ async fn timed_send_withdraws_while_replacement_is_in_backoff() {
     assert!(poll_once(timed.as_mut()).is_pending());
     fail_first.release();
     let mut observed_rebind = None;
-    assert_eventually!(|| {
+    assert_eventually_frozen!(|| {
         match actor.try_send(0) {
             Err(error) if error.kind == SendErrorKind::NotRunning => {
                 observed_rebind = Some(error.incarnation_observed);

@@ -89,6 +89,17 @@ fn spawn_reporting(
         .expect("stress thread spawns")
 }
 
+/// A completed first pass is required before the coordinator can stop any
+/// open-ended worker. The coordinator itself never acquires a monitored gate.
+fn observe_until_stopped(stop: &AtomicBool, first_passes: &AtomicUsize, mut work: impl FnMut()) {
+    work();
+    first_passes.fetch_add(1, Ordering::Release);
+    while !stop.load(Ordering::Acquire) {
+        work();
+        thread::yield_now();
+    }
+}
+
 fn round() -> usize {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let mids: Vec<_> = (0..MIDS)
@@ -115,8 +126,9 @@ fn round() -> usize {
         .collect();
 
     let (done, finished) = mpsc::channel();
-    let start = Arc::new(Barrier::new(MIDS * 4 + 1));
-    let adopted = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(Barrier::new(MIDS * 4 + 2));
+    let first_passes = Arc::new(AtomicUsize::new(0));
+    let root_walks = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     let mut workers = 0;
@@ -124,19 +136,13 @@ fn round() -> usize {
     for (index, (mid, deep)) in mids.iter().zip(&deep).enumerate() {
         // Adopter: root admits the mid, re-homing its subtree onto the root
         // gate while holding both gates.
-        let (root_a, mid_a, start_a, adopted_a) = (
-            Arc::clone(&root),
-            Arc::clone(mid),
-            Arc::clone(&start),
-            Arc::clone(&adopted),
-        );
+        let (root_a, mid_a, start_a) = (Arc::clone(&root), Arc::clone(mid), Arc::clone(&start));
         threads.push(spawn_reporting(
             format!("adopt-{index}"),
             &done,
             move || {
                 start_a.wait();
                 assert!(root_a.admit_child(projection(&mid_a)));
-                adopted_a.fetch_add(1, Ordering::SeqCst);
             },
         ));
         // Sub-admitter: admits fresh leaves and then the deep scope into the
@@ -162,55 +168,82 @@ fn round() -> usize {
         // Writer: record writes through the deep scope's and a leaf's own
         // current gate, which moves twice (deep → mid → root) underneath.
         let (deep_w, stop_w, start_w) = (Arc::clone(deep), Arc::clone(&stop), Arc::clone(&start));
+        let passes_w = Arc::clone(&first_passes);
         threads.push(spawn_reporting(
             format!("write-{index}"),
             &done,
             move || {
                 start_w.wait();
                 let leaf = deep_w.resident_projections()[0].member.clone();
-                while !stop_w.load(Ordering::Acquire) {
+                observe_until_stopped(&stop_w, &passes_w, || {
                     // `update` debug-asserts that its transaction holds the
                     // member's current gate.
                     deep_w.member.update(|_| {});
                     leaf.update(|_| {});
-                    thread::yield_now();
-                }
+                });
             },
         ));
         // Observer: walks the mid's residency from inside the mid's gate.
         let (mid_o, stop_o, start_o) = (Arc::clone(mid), Arc::clone(&stop), Arc::clone(&start));
+        let passes_o = Arc::clone(&first_passes);
         threads.push(spawn_reporting(
             format!("observe-{index}"),
             &done,
             move || {
                 start_o.wait();
-                while !stop_o.load(Ordering::Acquire) {
+                observe_until_stopped(&stop_o, &passes_o, || {
                     mid_o.with_observation_gate(|_| {
                         let held = mid_o.current_observation_gate();
                         assert_residents_on(&mid_o, &held);
                     });
-                    thread::yield_now();
-                }
+                });
             },
         ));
         workers += 4;
     }
 
+    // All gate acquisitions, including the final count, run on reporting
+    // workers so a deadlocked root gate cannot block deadline enforcement.
+    let (root_o, stop_o, start_o, passes_o, walks_o) = (
+        Arc::clone(&root),
+        Arc::clone(&stop),
+        Arc::clone(&start),
+        Arc::clone(&first_passes),
+        Arc::clone(&root_walks),
+    );
+    threads.push(spawn_reporting(
+        "observe-root".to_owned(),
+        &done,
+        move || {
+            start_o.wait();
+            observe_until_stopped(&stop_o, &passes_o, || {
+                root_o.with_observation_gate(|_| {
+                    let held = root_o.current_observation_gate();
+                    assert_residents_on(&root_o, &held);
+                });
+                walks_o.fetch_add(1, Ordering::Relaxed);
+            });
+            let expected_per_mid = LEAVES_BEFORE + LEAVES_DURING + 2; // + deep + deep-leaf
+            let visited = root_o.with_observation_gate(|_| {
+                let held = root_o.current_observation_gate();
+                assert_residents_on(&root_o, &held)
+            });
+            assert_eq!(visited, MIDS * (1 + expected_per_mid));
+        },
+    ));
+    workers += 1;
+
     start.wait();
     let deadline = Instant::now() + STALL;
-    let mut root_walks = 0;
     let mut finished_count = 0;
     let mut stopping = false;
     while finished_count < workers {
-        // Root observer on the test thread: under the root gate the whole
-        // resident tree, at every depth, shares that gate.
-        root.with_observation_gate(|_| {
-            let held = root.current_observation_gate();
-            assert_residents_on(&root, &held);
-        });
-        root_walks += 1;
-        // Stop the open-ended loops once every bounded worker has finished.
-        if !stopping && adopted.load(Ordering::SeqCst) == MIDS && finished_count >= MIDS * 2 {
+        // Every bounded worker and every observer's first pass must finish
+        // before the open-ended loops are allowed to stop.
+        if !stopping
+            && finished_count >= MIDS * 2
+            && first_passes.load(Ordering::Acquire) == MIDS * 2 + 1
+        {
             stop.store(true, Ordering::Release);
             stopping = true;
         }
@@ -241,13 +274,7 @@ fn round() -> usize {
             .expect("a reporting worker contains its own panic");
     }
 
-    let expected_per_mid = LEAVES_BEFORE + LEAVES_DURING + 2; // + deep + deep-leaf
-    let visited = root.with_observation_gate(|_| {
-        let held = root.current_observation_gate();
-        assert_residents_on(&root, &held)
-    });
-    assert_eq!(visited, MIDS * (1 + expected_per_mid));
-    root_walks
+    root_walks.load(Ordering::Relaxed)
 }
 
 #[test]

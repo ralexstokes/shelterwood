@@ -1912,4 +1912,6 @@ impl<M: Send + 'static> MailboxReceiver<M> {
 }
 
 #[cfg(test)]
+mod stress_tests;
+#[cfg(test)]
 pub(super) mod tests;

@@ -265,6 +265,7 @@ impl Wake for WakerProxyState {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // raw-waker test doubles
 mod tests {
     use std::{
         mem::ManuallyDrop,

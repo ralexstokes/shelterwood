@@ -121,7 +121,6 @@
             commonArgs
             // {
               cargoArtifacts = cargoArtifactsNightly;
-              nativeBuildInputs = [ pkgs.ripgrep ];
               buildPhaseCargoCommand = ''
                 cargo fmt --manifest-path tools/external-consumer/Cargo.toml -- --check
                 cargo fmt --manifest-path tools/benchmarks/Cargo.toml -- --check

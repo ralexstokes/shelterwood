@@ -1,4 +1,9 @@
 #![allow(missing_docs, unreachable_pub)]
+// All `unsafe` in this crate is test-only raw-waker construction. `forbid`
+// cannot be relaxed by a nested `allow`, so test builds `deny` instead and the
+// test modules that build raw wakers opt in with `#[allow(unsafe_code)]`.
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, deny(unsafe_code))]
 
 //! Tokio-backed runtime facilities used by Shelterwood's public façade.
 //!

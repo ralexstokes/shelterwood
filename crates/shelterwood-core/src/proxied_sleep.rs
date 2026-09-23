@@ -141,6 +141,7 @@ impl Drop for ProxiedSleep {
 /// that needs a real disposal lane lives in the façade's mailbox timer
 /// module, so this crate keeps no dev-dependencies.
 #[cfg(test)]
+#[allow(unsafe_code)] // raw-waker test doubles
 mod tests {
     use std::{
         future::Future,

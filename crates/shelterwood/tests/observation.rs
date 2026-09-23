@@ -10,7 +10,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, next_event, next_item, poll_once,
+    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_quiet, next_event,
+    next_item, poll_once,
     waiting::{gate_released_manual_ready_task, task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
@@ -139,7 +140,7 @@ async fn lifecycle_sequence_advances_across_an_unobserved_stretch() {
     );
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("root shuts down");
 }
@@ -198,7 +199,7 @@ async fn lifecycle_lag_is_exact_coalesced_per_episode_and_subscribers_are_isolat
     drop(slow);
     drop(fast);
     system
-        .shutdown(Duration::from_secs(2))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("all waiting tasks shut down");
 }
@@ -289,7 +290,7 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
         RemoveOutcome::Removed
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("root shuts down");
 }
@@ -387,7 +388,7 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
     })
     .await;
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("root shuts down");
     let mut saw_teardown_prune = false;
@@ -525,7 +526,7 @@ async fn descendant_events_forward_with_origin_identity_path_and_causal_order() 
     assert_eq!(removal.await, RemoveOutcome::Removed);
     while nested_events.recv().await.is_some() {}
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("root shuts down");
 }
@@ -753,7 +754,7 @@ async fn rebuilt_declared_handles_and_incarnations_keep_identity() {
     assert_eq!(starts[1].1.membership(), second.membership());
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("tree shuts down");
 }
@@ -820,7 +821,7 @@ async fn wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_t
     assert_eq!(terminal_snapshot.membership, terminal.membership());
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("root shuts down");
     let after_shutdown = scope
@@ -869,7 +870,7 @@ async fn undefined_dynamic_reservations_are_absent_and_emit_no_membership_edges(
     assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("root shuts down");
 }
@@ -907,10 +908,7 @@ async fn withdrawn_queued_admission_never_publishes_an_added_child() {
         }
     }
 
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("root stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
 #[tokio::test]
@@ -977,7 +975,7 @@ async fn hard_aborted_scope_pairs_added_with_exited_and_removed() {
     system.wait_started().await.expect("tree starts");
     let mut events = sub.subscribe_lifecycle();
     system
-        .shutdown(Duration::from_secs(5))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("the subtree's abort policy bounds teardown");
 
@@ -1121,7 +1119,7 @@ async fn descendant_resolves_leaf_and_scope_path_endings() {
     assert!(snapshot.descendant(["nested", "missing"]).is_none());
     assert!(snapshot.descendant(["direct", "too-deep"]).is_none());
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("tree shuts down");
 }
@@ -1453,10 +1451,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
 
     release_stop.release();
     assert_eq!(removal.await, RemoveOutcome::Removed);
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("root stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
     assert!(nested_scope.snapshot().state.is_stopped());
 }
 
@@ -1507,10 +1502,7 @@ async fn state_predicates_hold_only_for_terminal_projections() {
     assert!(!running.state.is_terminal());
 
     assert_eq!(scope.remove_task(&runner).await, RemoveOutcome::Removed);
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("root stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
     let stopped = scope.as_scope().snapshot().state.clone();
     assert!(matches!(stopped, ScopeState::Stopped { .. }));
     assert!(stopped.is_stopped());
@@ -1526,10 +1518,7 @@ async fn snapshot_subscription_yields_snapshot_closed_after_terminal_shutdown() 
     let scope = system.scope();
     let mut snapshots = scope.subscribe_snapshots();
 
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("root stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 
     let terminal = snapshots
         .changed()

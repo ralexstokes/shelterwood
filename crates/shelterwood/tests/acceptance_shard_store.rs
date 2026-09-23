@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::ReleaseGate;
+use crate::common::{ReleaseGate, SHUTDOWN_BUDGET};
 use shelterwood::{
     Actor, ActorDef, ActorRef, CallErrorKind, Context, DynamicScopeRef, DynamicTree, ExitError,
     ExitResult, Incarnation, Membership, RemoveOutcome, Reply, ScopeRef, SubtreeOnceDef, Tree,
@@ -647,7 +647,7 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
     assert_eq!(failed_candidate.durable.get("alpha"), None);
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("store shuts down");
 }
@@ -770,7 +770,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
     );
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("store shuts down");
 }

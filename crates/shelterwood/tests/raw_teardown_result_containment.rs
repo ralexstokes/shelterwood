@@ -2,7 +2,7 @@ mod common;
 
 use std::{error::Error, fmt, sync::mpsc, thread::ThreadId, time::Duration};
 
-use crate::common::next_exit_of;
+use crate::common::{SHUTDOWN_BUDGET, next_exit_of};
 use shelterwood::{
     Actor, ActorOnceDef, Context, ExitError, ExitKind, ExitResult, Guard, Handler, RawActor,
     RawContext, RawOnceDef, Shutdown, StopReason, Tree,
@@ -278,7 +278,7 @@ async fn assert_callback_error_is_retained_during_cancelled_cleanup<const INIT: 
     // Work is still inside its poll. Finished proves that error cleanup has
     // requested cancellation; its join cannot finish until we release work.
     system
-        .shutdown(Duration::from_secs(2))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("hard abort completes despite the pending resource join");
     release

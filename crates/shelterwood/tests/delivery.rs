@@ -9,7 +9,9 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{GatedRecorder, MessageRecorder, ReleaseGate, assert_eventually, poll_once};
+use crate::common::{
+    GatedRecorder, MessageRecorder, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, poll_once,
+};
 use shelterwood::{
     CallErrorKind, ExitError, ExitResult, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Reply,
     SendErrorKind, Shutdown, SubtreeOnceDef, Tree,
@@ -81,10 +83,7 @@ async fn accepted_but_undelivered_prefix_never_crosses_an_incarnation() {
         log.lock().expect("prefix log mutex poisoned").as_slice() == [(1, 1), (2, 4)]
     })
     .await;
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("actor stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
     // The final history is authoritative: after synchronized shutdown no
     // later delivery can occur, so the accepted-but-undelivered prefix
     // (2 and 3) is proven absent rather than merely unseen for a quiet
@@ -252,10 +251,7 @@ async fn queue_preserves_per_sender_fifo_under_interleaved_senders() {
         .collect();
     assert_eq!(a, [1, 2]);
     assert_eq!(b, [1, 2]);
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("actor stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
 }
 
 struct CallRecorder {
@@ -313,10 +309,7 @@ async fn latest_conflation_drops_replaced_call_and_keeps_newest_value() {
     assert_eq!(error.kind, CallErrorKind::ReplyDropped);
     assert_eq!(error.incarnation_observed, Some(accepting));
     gate.release();
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("actor stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
     // The replaced call envelope was destroyed at conflation time — the
     // complete post-shutdown history proves the handler never saw it.
     assert_eq!(
@@ -359,10 +352,7 @@ async fn send_cancellation_withdraws_before_acceptance_but_not_after() {
         log.lock().expect("send log mutex poisoned").as_slice() == [(2, 1), (2, 3)]
     })
     .await;
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("actor stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
     // The complete post-shutdown history proves the pre-acceptance
     // cancellation withdrew message 2 outright.
     assert_eq!(
@@ -404,10 +394,7 @@ async fn call_cancellation_withdraws_before_acceptance_but_processes_after() {
         if accepted_before_drop {
             assert_eventually!(|| calls.load(Ordering::SeqCst) == expected).await;
         }
-        system
-            .shutdown(Duration::from_secs(1))
-            .await
-            .expect("actor stops");
+        system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
         // The complete post-shutdown history is exact in both directions:
         // an accepted call is processed once, a withdrawn call never.
         assert_eq!(

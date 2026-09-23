@@ -6,11 +6,11 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 
 use crate::common::{
-    ConsumeCount, ConsumeGuard, ReleaseGate, assert_eventually, policy::never, poll_once,
+    ConsumeCount, ConsumeGuard, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, policy::never,
+    poll_once,
 };
 use shelterwood::{
     Actor, ActorOnceDef, Context, DynamicTree, ExitError, ExitResult, RawActor, RawContext,
@@ -120,7 +120,7 @@ async fn dynamic_one_shot_raw_resource_drops_once_on_readiness_definition_panic(
             .expect("the panicking dynamic definition releases its id"),
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root stops");
 }
@@ -139,7 +139,7 @@ async fn one_shot_raw_resource_drops_once_on_startup_failure() {
     let system = tree.spawn().expect("runtime is available");
     assert!(system.wait_started().await.is_err());
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root rolls back");
     count.assert_once();
@@ -168,7 +168,7 @@ async fn one_shot_raw_resource_drops_once_on_shutdown_before_start() {
     .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("shutdown completes");
     count.assert_once();
@@ -253,7 +253,7 @@ async fn assert_actor_init_path_drops_once(mode: ActorResourceMode) {
         .await
         .expect_err("init path fails startup");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root shuts down");
     count.assert_once();
@@ -298,7 +298,7 @@ async fn one_shot_actor_args_drop_once_when_shutdown_prevents_start() {
     let system = tree.spawn().expect("runtime is available");
     gate_started.wait().await;
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("tree shuts down");
     count.assert_once();
@@ -365,7 +365,7 @@ async fn one_shot_task_resource_drops_once_on_startup_failure() {
     let system = tree.spawn().expect("runtime is available");
     assert!(system.wait_started().await.is_err());
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root rolls back");
     count.assert_once();
@@ -399,7 +399,7 @@ async fn one_shot_task_resource_drops_once_on_shutdown_before_start() {
         .expect("valid task");
     let system = tree.spawn().expect("runtime is available");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("shutdown completes");
     count.assert_once();
@@ -562,7 +562,7 @@ async fn cancelling_inflight_one_shot_adds_drops_every_kind_resource_once() {
     }
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("cancelled admissions leave no stragglers");
     task_count.assert_once();
@@ -597,7 +597,7 @@ async fn one_shot_subtree_resource_drops_once_on_panic() {
     let system = root.spawn().expect("runtime is available");
     assert!(system.wait_started().await.is_err());
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root rolls back");
     count.assert_once();
@@ -624,7 +624,7 @@ async fn one_shot_subtree_resource_drops_once_on_lowering_failure() {
     let system = root.spawn().expect("runtime is available");
     assert!(system.wait_started().await.is_err());
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root rolls back");
     count.assert_once();
@@ -650,7 +650,7 @@ async fn one_shot_subtree_resource_drops_once_on_shutdown_before_start() {
         .expect("valid subtree");
     let system = root.spawn().expect("runtime is available");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("shutdown completes");
     count.assert_once();

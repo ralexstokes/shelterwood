@@ -2,7 +2,17 @@ mod waker;
 
 pub(crate) use waker::{probe_waker, probe_waker_with_wake};
 
+use std::time::Duration;
+
 use shelterwood_core::{ChildId, Incarnation, IncarnationCounter, Membership, ScopeIdentity};
+
+/// Shared cooperative-teardown budget for real-clock shutdowns that expect
+/// no stragglers. A green shutdown returns as soon as teardown finishes, so a
+/// generous budget costs nothing; sizing it near the expected latency makes
+/// scheduler starvation on a loaded machine indistinguishable from a
+/// straggler. Paused-clock tests and tests whose budget is under test keep
+/// their own literal.
+pub(crate) const SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
 
 pub(crate) fn mint_actor_membership() -> (Membership, IncarnationCounter) {
     ScopeIdentity::new()

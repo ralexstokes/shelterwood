@@ -9,7 +9,8 @@ use std::{
 };
 
 use crate::common::{
-    ReleaseGate, assert_eventually, assert_quiet, last_panic_message, waiting::task as waiting_task,
+    ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_quiet, last_panic_message,
+    waiting::task as waiting_task,
 };
 use shelterwood::{
     DynamicTree, ExitError, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor,
@@ -210,7 +211,7 @@ async fn raw_readiness_override_does_not_evaluate_actor_readiness() {
     system.wait_started().await.expect("actor becomes ready");
     assert_eq!(OVERRIDE_READINESS_CALLS.load(Ordering::SeqCst), 0);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("actor stops cooperatively");
 }
@@ -356,7 +357,7 @@ async fn raw_recv_is_shutdown_biased_and_try_recv_controls_drain_vs_discard() {
         system.wait_started().await.expect("actor starts");
         let accepting = actor.try_send(1).expect("one accepts");
         actor.try_send(2).expect("two accepts");
-        let shutdown = tokio::spawn(async move { system.shutdown(Duration::from_secs(1)).await });
+        let shutdown = tokio::spawn(async move { system.shutdown(SHUTDOWN_BUDGET).await });
         assert_eventually!(|| {
             matches!(
                 actor.try_send(3),
@@ -525,10 +526,7 @@ async fn dynamic_scope_admits_uses_and_exactly_removes_a_raw_actor() {
     assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
     let terminal = actor.send(10).await.expect_err("removed actor is terminal");
     assert_eq!(terminal.kind, SendErrorKind::Terminated);
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("root stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
 #[tokio::test]
@@ -565,10 +563,7 @@ async fn deferred_queue_capacity_ignores_a_latest_scope_default() {
             == [1, 2]
     })
     .await;
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("actor stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
 }
 
 struct DoublePanicActor;
@@ -680,7 +675,7 @@ async fn hard_abort_offload_panic_with_panicking_raw_destructor_is_contained() {
     )
     .await;
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("the two panics remain contained");
 
@@ -742,7 +737,7 @@ async fn raw_context_scope_shutdown_request_stops_only_the_supervising_scope() {
         Some(shelterwood::ChildState::Running)
     ));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("root shuts down after the nested scope stopped");
 }

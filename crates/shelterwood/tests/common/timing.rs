@@ -9,6 +9,17 @@ use std::{
 /// Shared wall-clock budget for eventually-consistent test observations.
 pub(crate) const POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Shared cooperative-teardown budget for real-clock shutdowns that expect
+/// no stragglers.
+///
+/// A green shutdown returns as soon as teardown finishes, so a generous
+/// budget costs nothing; sizing it near the expected latency makes scheduler
+/// starvation on a loaded machine indistinguishable from a straggler. Tests
+/// whose budget is part of the property under test — an asserted
+/// `ShutdownTimeout`, a paused clock, or a race against an outer wall-clock
+/// bound — keep their own literal.
+pub(crate) const SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
+
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Polls a pinned future once with a no-op waker.

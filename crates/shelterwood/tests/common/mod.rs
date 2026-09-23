@@ -18,8 +18,8 @@ pub(crate) use ownership::{ConsumeCount, ConsumeGuard, LiveFlag, PanicOnDrop};
 pub(crate) use recorder::{GatedRecorder, MessageRecorder};
 pub(crate) use startup::startup_failed_child;
 pub(crate) use timing::{
-    POLL_TIMEOUT, advance_time, assert_eventually_predicate, assert_quiet, poll_once, poll_until,
-    poll_until_ready,
+    POLL_TIMEOUT, SHUTDOWN_BUDGET, advance_time, assert_eventually_predicate, assert_quiet,
+    poll_once, poll_until, poll_until_ready,
 };
 pub(crate) use waker::{
     LiveWakerCounter, OrdinalWakerState, counting_waker, hostile_waker, ordinal_drop_waker,

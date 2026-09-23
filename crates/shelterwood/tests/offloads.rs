@@ -11,8 +11,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually, assert_quiet, last_panic_message,
-    next_exit_of,
+    POLL_TIMEOUT, PanicOnDrop, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_quiet,
+    last_panic_message, next_exit_of,
 };
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
@@ -203,7 +203,7 @@ async fn zero_budget_offload_contains_and_classifies_its_work_destructor_panic()
     assert!(!polled.load(Ordering::SeqCst));
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root shuts down");
 }
@@ -698,10 +698,7 @@ async fn guard_reports_incarnation_cancellation() {
     let guard = guard_receiver.await.expect("actor exports guard");
     assert!(!guard.is_cancelled());
 
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("actor stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
     assert!(guard.is_cancelled());
 }
 
@@ -1049,7 +1046,7 @@ async fn cancellation_destructor_panic_wakes_an_otherwise_idle_actor() {
     );
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed actor scope shuts down");
 }
@@ -1213,7 +1210,7 @@ async fn assert_pre_ready_panic(mode: PanicMode, expected: &str, trigger: bool) 
     );
     assert_eq!(message.as_deref(), Some(expected));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root shuts down");
 }
@@ -1248,7 +1245,7 @@ async fn assert_cancellation_drop_panic(mode: CancellationDropMode, expected: &s
         );
     }
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root shuts down");
 }
@@ -1363,7 +1360,7 @@ async fn hostile_finished_waker_cannot_strand_later_offload_or_exit_publication(
         "the later offload is cancelled and disposed before exit publication"
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed actor scope shuts down");
 }
@@ -1446,7 +1443,7 @@ async fn assert_queued_panic_beats_orderly_exit(mode: QueuedPanicMode) {
     assert_eq!(message.as_deref(), Some("owned offload panic"));
     assert!(queued.load(Ordering::SeqCst));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root shuts down");
 }
@@ -1598,7 +1595,7 @@ async fn assert_pending_offload_panic_stops_before_handler_teardown(
         "the offload panic must unwind through the Handler composition point"
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root shuts down");
 }
@@ -1661,7 +1658,7 @@ async fn externally_stopped_recv_resumes_a_pending_offload_panic() {
     .await;
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed actor shuts down");
 
@@ -1728,7 +1725,7 @@ async fn stopping_try_recv_resumes_a_pending_offload_panic_before_drain() {
     );
     assert_eq!(message.as_deref(), Some("stopping try_recv offload panic"));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root shuts down");
 }
@@ -1840,7 +1837,7 @@ async fn assert_discarded_continuation_panic_stops_before_handler_teardown(
         "the disposal panic must unwind through the Handler composition point"
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("failed root shuts down");
 }
@@ -1885,7 +1882,7 @@ async fn queued_offload_panic_survives_hard_abort() {
     )
     .await;
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("hard abort bounds shutdown");
 
@@ -1948,7 +1945,7 @@ async fn hard_abort_preserves_owned_offload_panic_over_handler_destructor() {
     )
     .await;
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("the two panics remain contained");
 
@@ -2039,7 +2036,7 @@ async fn incarnation_offloads_are_destroyed_before_actor_state_on_panic() {
         ["offload", "actor"]
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("tree shuts down");
 }
@@ -2415,7 +2412,7 @@ async fn incarnation_offloads_are_destroyed_before_actor_state_on_error() {
         ["offload", "actor"]
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("tree shuts down");
 }
@@ -2505,7 +2502,7 @@ async fn epilogue_join_exit(hard_abort: bool) -> ExitKind {
         .expect("the continuation reports its destruction");
     if hard_abort {
         system
-            .shutdown(Duration::from_secs(1))
+            .shutdown(SHUTDOWN_BUDGET)
             .await
             .expect("hard abort bounds shutdown");
     }

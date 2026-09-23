@@ -9,7 +9,8 @@ use std::{
 };
 
 use crate::common::{
-    DestructorBlocker, DestructorGate, ReleaseGate, assert_eventually, policy::never, poll_once,
+    DestructorBlocker, DestructorGate, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually,
+    policy::never, poll_once,
 };
 use shelterwood::{
     Backoff, CallErrorKind, ExitError, ExitResult, Jitter, Mailbox, RawActor, RawContext, RawDef,
@@ -238,7 +239,7 @@ async fn always_restart_carries_parked_send_and_call_across_a_clean_exit() {
     assert_eq!(replied.value, 17);
     assert_eq!(factories.load(Ordering::SeqCst), 2);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("replacement stops");
 }
@@ -294,10 +295,7 @@ async fn send_rides_the_frozen_destructor_and_rebind_window() {
         2,
         "only one replacement starts"
     );
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("actor stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -439,8 +437,5 @@ async fn dropping_a_parked_send_in_the_rebind_window_withdraws_it() {
         deliveries.lock().expect("deliveries mutex poisoned")
     )
     .await;
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("actor stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
 }

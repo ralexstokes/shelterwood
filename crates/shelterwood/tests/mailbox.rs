@@ -10,8 +10,8 @@ use std::{
 };
 
 use crate::common::{
-    GatedRecorder, MessageRecorder, ReleaseGate, advance_time, assert_eventually, assert_quiet,
-    poll_once,
+    GatedRecorder, MessageRecorder, ReleaseGate, SHUTDOWN_BUDGET, advance_time, assert_eventually,
+    assert_quiet, poll_once,
 };
 use shelterwood::{
     CallErrorKind, Mailbox, PolicyError, RawDef, Reply, ReplyError, SendErrorKind, Tree,
@@ -196,10 +196,7 @@ async fn latest_mailbox_keeps_only_the_newest_accepted_value() {
     actor.try_send(Message::Value(3)).expect("replace two");
     gate.release();
     assert_eventually!(|| values.lock().expect("values mutex poisoned").as_slice() == [3]).await;
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("actor stops");
+    system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
     // The complete post-shutdown history proves conflation destroyed the
     // replaced values rather than merely delaying them.
     assert_eq!(

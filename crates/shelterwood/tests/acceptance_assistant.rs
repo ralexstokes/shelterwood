@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, next_event};
+use crate::common::{
+    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_quiet, next_event,
+};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DeadlineElapsed, DynamicScopeRef,
     DynamicTree, ExitError, ExitResult, LifecycleEvent, LifecycleEventKind, LifecycleItem, Mailbox,
@@ -713,7 +715,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         gateway_scope.membership()
     );
     system
-        .shutdown(POLL_TIMEOUT)
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("staged control-plane shutdown completes");
 }

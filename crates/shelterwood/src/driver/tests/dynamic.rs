@@ -1,5 +1,5 @@
 use super::{super::AdmissionInstall, support::*};
-use crate::plan::ChildPlan;
+use crate::{plan::ChildPlan, test_support::SHUTDOWN_BUDGET};
 
 /// Panics from the locked never-started terminalization seam.
 ///
@@ -579,7 +579,7 @@ async fn retained_unadmitted_slot_does_not_block_driver_teardown() {
         .reserve_task("retained")
         .expect("unadmitted reservation is retained");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("driver teardown completes");
 

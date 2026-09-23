@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use crate::common::{LiveFlag, assert_eventually};
+use crate::common::{LiveFlag, SHUTDOWN_BUDGET, assert_eventually};
 use shelterwood::{
     BuildError, Cancellation, DynamicTree, Exit, ExitError, ExitKind, GracePhase, PolicyError,
     Readiness, ReadinessDeadline, RemoveOutcome, ReserveError, Shutdown, StaticReserveError,
@@ -82,7 +82,7 @@ async fn dynamic_reservation_validates_ids_at_the_driver_boundary() {
 
     assert!(matches!(scope.reserve_task(""), Err(ReserveError::EmptyId)));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root stops");
 
@@ -152,7 +152,7 @@ async fn dynamic_add_resolves_at_admission_and_removal_is_exact() {
         RemoveOutcome::AlreadyAbsent
     );
     assert_eq!(scope.remove_task(&second).await, RemoveOutcome::Removed);
-    assert_eq!(system.shutdown(Duration::from_secs(1)).await, Ok(()));
+    assert_eq!(system.shutdown(SHUTDOWN_BUDGET).await, Ok(()));
 }
 
 #[tokio::test]

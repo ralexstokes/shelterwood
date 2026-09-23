@@ -1,5 +1,5 @@
 use super::support::*;
-use crate::cells::RetainedExit;
+use crate::{cells::RetainedExit, test_support::SHUTDOWN_BUDGET};
 
 struct BlockingFactoryDrop(Arc<FactoryGate>);
 
@@ -783,7 +783,7 @@ async fn system_shutdown_joins_root_driver_teardown() {
     drop(control);
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("empty dynamic root shuts down");
 

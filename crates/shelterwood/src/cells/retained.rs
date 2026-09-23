@@ -6,7 +6,7 @@ use shelterwood_core::{
     engine::ScopeState,
     exit::{
         Cancellation, ExitKind, ExitResult, GracePhase, JoinOutcome, RecordedOutcome, StartupError,
-        StartupFailure, StartupFailureCause, StopReason, classify_disposal_panic, classify_exit,
+        StartupFailure, StartupFailureCause, StopReason, classify_exit,
         reconcile_recorded_outcomes,
     },
 };
@@ -273,21 +273,6 @@ pub(crate) fn classify_exit_retaining(
     let (exit, discarded) = classify_exit(recorded, join, hard_abort_phase, cancellation);
     drop(discarded.map(RetainedExit::new));
     exit
-}
-
-/// Folds a destructor panic into a retained exit, retaining the loser.
-///
-/// The carrier stays a [`RetainedExit`] across the fold: the losing half is
-/// the application error whenever one was recorded, because
-/// `Failed` ranks below `Panicked`.
-pub(crate) fn classify_disposal_panic_retaining(
-    mut exit: RetainedExit,
-    message: Option<String>,
-) -> RetainedExit {
-    let exit = exit.0.take().expect("retained exit was already taken");
-    let (selected, discarded) = classify_disposal_panic(exit, message);
-    drop(RetainedExit::new(discarded));
-    RetainedExit::new(selected)
 }
 
 /// A stop reason retained by driver state or a runtime completion.

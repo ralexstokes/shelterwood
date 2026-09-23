@@ -39,9 +39,11 @@ enum IncarnationState {
     Complete,
     /// A restart deadline is pending.
     RestartPending,
-    /// Terminal definition disposal is pending.
+    /// The terminal exit has published; the retained construction's
+    /// destruction (the release edge) is pending.
     Disposing,
-    /// Membership terminality and joined disposal have both completed.
+    /// The release edge has passed: the retained construction is destroyed,
+    /// or teardown stopped waiting for it.
     Joined,
 }
 

@@ -165,22 +165,12 @@ pub(super) struct ChildRuntime {
     pub(super) mailbox_bind: Option<MailboxBindToken>,
     pub(super) terminality: Obligation<ChildTerminality>,
     pub(super) construction: runtime::Isolated<ChildConstruction>,
-    pub(super) pending_terminal: Option<PendingTerminal>,
     pub(super) options: crate::policy::ResolvedCommonOptions,
     pub(super) incarnations: IncarnationCounter,
     pub(super) restarts: RestartState,
     pub(super) restart_deadline: Option<DeadlineHandle>,
     pub(super) restart_shutdown_pending: Option<Epoch>,
     pub(super) active: Option<ActiveChild>,
-}
-
-pub(super) struct PendingTerminal {
-    exit: RetainedExit,
-    exited_incarnation: Option<Incarnation>,
-    startup: StartupDisposition,
-    /// Set once this terminal's startup failure has been decided at exit
-    /// dispatch, so disposal completion does not route it a second time.
-    startup_routed: bool,
 }
 
 impl ChildRuntime {
@@ -214,7 +204,6 @@ impl ChildRuntime {
             mailbox,
             mailbox_bind,
             construction,
-            pending_terminal: None,
             options,
             incarnations,
             restarts: RestartState::new(),
@@ -222,11 +211,6 @@ impl ChildRuntime {
             restart_shutdown_pending: None,
             active: None,
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn is_disposing(&self) -> bool {
-        self.pending_terminal.is_some()
     }
 
     #[cfg(test)]
@@ -645,6 +629,13 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
 }
 
 impl ScopeRuntime {
+    /// Publishes a terminal exit and joins the membership in one step.
+    ///
+    /// Production splits these edges: `begin_terminal_disposal` publishes at
+    /// dispatch and `handle_construction_disposed` joins at the release edge.
+    /// A few structural tests synthesize the already-released boundary
+    /// directly and drive both halves here.
+    #[cfg(test)]
     pub(super) fn terminalize_child(
         &mut self,
         key: ChildKey,
@@ -655,37 +646,69 @@ impl ScopeRuntime {
         // Protect the raw user error before every resource lookup and reducer
         // invariant. A malformed key may still be diagnosed, but it cannot
         // unwind the Exit payload on the driver stack.
-        let mut exit = Some(exit.into());
-        // Production terminal publication follows joined construction
-        // disposal.  A few structural test/fallback paths synthesize that
-        // already-joined boundary directly, so normalize them through the
-        // same reducer predecessor instead of allowing `Terminalized` to
-        // skip arbitrary incarnation states.
+        let exit = exit.into();
+        // Normalize through the same reducer predecessor production uses,
+        // instead of allowing `Terminalized` to skip arbitrary incarnation
+        // states.
         if !self.supervisor.is_disposing(key) && !self.supervisor.joined(key) {
             self.reduce(SupervisorEvent::DisposalStarted { child: key });
         }
-        let changed = self
+        let changed = self.publish_terminal(key, exit, exited_incarnation, startup);
+        self.join_terminal(key);
+        changed
+    }
+
+    /// Publishes a disposing membership's final exit through the cell layer.
+    ///
+    /// The exit is final at dispatch (SPEC §9): publication never waits on
+    /// the retained construction's destruction, which is only the release
+    /// edge `join_terminal` records.
+    fn publish_terminal(
+        &mut self,
+        key: ChildKey,
+        exit: RetainedExit,
+        exited_incarnation: Option<Incarnation>,
+        startup: StartupDisposition,
+    ) -> bool {
+        let mut exit = Some(exit);
+        let child = self
             .children
             .get_mut(key)
-            .expect("terminalized child remains registered")
-            .terminalize(
-                &self.root,
-                exit.take()
-                    .expect("terminal publication consumes its retained exit once"),
-                exited_incarnation,
-                startup,
-            );
+            .expect("terminalized child remains registered");
+        let member = Arc::clone(&child.slot.member);
+        let changed = child.terminalize(
+            &self.root,
+            exit.take()
+                .expect("terminal publication consumes its retained exit once"),
+            exited_incarnation,
+            startup,
+        );
+        // A drain entry may have marked this member as pending terminal
+        // cleanup. Clear the marker only after terminal publication has
+        // committed, so a concurrent shutdown sampler sees either the marker
+        // or a terminal member, never the gap between those two
+        // representations.
+        //
+        // Argued, not pinned: clearing the marker before publication reopens
+        // that gap for a few instructions, which no test in the suite can
+        // provoke deterministically.
+        member.set_terminal_disposal_pending(false);
+        changed
+    }
+
+    /// Records the release edge: the retained construction is destroyed, so
+    /// the membership joins.
+    fn join_terminal(&mut self, key: ChildKey) {
         self.reduce(SupervisorEvent::Terminalized { child: key });
         // The reducer drops an event whose predecessor never ran, which keeps
         // `step` total but leaves the shell no return channel. A child that
-        // published terminality without reaching `Joined` would never count
-        // toward completion, so the scope would simply never finish. Assert
-        // the transition landed rather than discovering it as a stall.
+        // never reached `Joined` would never count toward completion, so the
+        // scope would simply never finish. Assert the transition landed
+        // rather than discovering it as a stall.
         assert!(
             self.supervisor.joined(key),
-            "terminal publication must leave the reducer's membership joined"
+            "the release edge must leave the reducer's membership joined"
         );
-        changed
     }
 
     pub(super) fn spawn_child(&mut self, key: ChildKey) {
@@ -725,8 +748,9 @@ impl ScopeRuntime {
                 .last_exit
                 .unwrap_or_else(Exit::never_started);
             // Exhaustion is a terminal outcome, not an exceptional cleanup
-            // path. Join retained-definition disposal before terminality,
-            // retention, removal completion, or ordered-scope progression.
+            // path. Its exit publishes now; retained-definition disposal
+            // still gates retention, removal completion, and ordered-scope
+            // progression.
             self.begin_terminal_disposal(key, RetainedExit::new(exit), None, startup);
             return;
         };
@@ -909,8 +933,9 @@ impl ScopeRuntime {
             let record = child.slot.member.record();
             let exit = record.last_exit.unwrap_or_else(Exit::never_started);
             // A never-ran child and a child stopped between restart
-            // incarnations share the same post-disposal terminal route. Hard
-            // shutdown still detaches disposal through `hard_forced` below.
+            // incarnations share the same terminal route: publish, then
+            // release through disposal. Hard shutdown still detaches that
+            // disposal through `hard_forced`.
             self.begin_terminal_disposal(
                 key,
                 RetainedExit::new(exit),
@@ -1240,147 +1265,54 @@ impl ScopeRuntime {
         if !self.supervisor.contains(key)
             || self.supervisor.is_disposing(key)
             || self.supervisor.joined(key)
+            || self.children.get(key).is_none()
         {
             return;
         }
         self.reduce(SupervisorEvent::DisposalStarted { child: key });
-        // Same reasoning as `terminalize_child`: a dropped `DisposalStarted`
-        // would make the later `Terminalized` unreachable too, stranding the
-        // membership short of `Joined` with no loud failure.
+        // A dropped `DisposalStarted` would make the later `Terminalized`
+        // unreachable too, stranding the membership short of `Joined` with
+        // no loud failure. `Disposing` is also the one-disposal-in-flight
+        // guard: the refusal above admits a single terminal per membership.
         assert!(
             self.supervisor.is_disposing(key),
             "terminal disposal must leave the reducer's incarnation disposing"
         );
-        let construction = {
-            let Some(child) = self.children.get_mut(key) else {
-                return;
-            };
-            if child.pending_terminal.is_some() {
-                return;
-            }
-            child.pending_terminal = Some(PendingTerminal {
-                exit: exit
-                    .take()
-                    .expect("terminal disposal installs its retained exit once"),
-                exited_incarnation,
-                startup,
-                startup_routed: false,
-            });
-            child.slot.member.set_terminal_disposal_pending(true);
-            child.construction.take()
-        };
-        let Some(construction) = construction else {
-            self.handle_construction_disposed(key, None);
-            return;
-        };
+        let exit = exit
+            .take()
+            .expect("terminal disposal publishes its retained exit once");
 
-        if self.supervisor.hard_forced() {
-            runtime::dispose_detached(construction);
-            self.handle_construction_disposed(key, None);
-            return;
-        }
-
-        // The retained factory is user-owned. Destroy it on the blocking
-        // pool. The disposal job itself owns completion, so cancellation or
-        // failure to spawn an auxiliary async joiner cannot strand the child.
-        let sender = self.disposal_events.clone();
-        let signal = self.root.signal().clone();
-        runtime::dispose_then(construction, move |panic| {
-            if sender
-                .send(DriverEvent::Child(ChildEvent::ConstructionDisposed {
-                    child: key,
-                    panic,
-                }))
-                .is_ok()
-            {
-                signal.pulse();
-            }
-        });
-
-        // §7: the scope leaves `Starting` the moment the exit funnel
-        // dispatches a terminal pre-ready exit, and that exit names the
-        // failure. Disposal of a retained construction completes on the
-        // blocking pool at an arbitrary later time, so decide the startup
-        // failure now: otherwise a same-wake sibling's faster disposal, a
-        // shutdown request or an intensity trip landing in the gap would take
-        // the verdict instead. Only the member's terminal publication waits
-        // for disposal.
-        let startup_exit = self
-            .children
-            .get_mut(key)
-            .and_then(|child| child.pending_terminal.as_mut())
-            .filter(|pending| pending.startup == StartupDisposition::Aborted)
-            .map(|pending| {
-                pending.startup_routed = true;
-                pending.exit.clone()
-            });
-        if let Some(exit) = startup_exit
-            && self.supervisor.membership_status(key) != MembershipStatus::Removing
-            && !self.supervisor.lifecycle().is_draining()
-        {
-            self.fail_startup(key, &exit);
-        }
-    }
-
-    pub(super) fn handle_construction_disposed(
-        &mut self,
-        key: ChildKey,
-        panic: Option<runtime::DisposalPanic>,
-    ) {
-        let Some(child) = self.children.get_mut(key) else {
-            return;
-        };
-        let Some(terminal) = child.pending_terminal.take() else {
-            return;
-        };
-        let member = Arc::clone(&child.slot.member);
-        let mut exit = terminal.exit;
-        if terminal.exited_incarnation.is_some()
-            && let Some(runtime::DisposalPanic { message }) = panic
-        {
-            // Only an exited incarnation can own a destructor failure. A
-            // never-started child or a child between restart incarnations
-            // keeps its already-authoritative verdict while disposal remains
-            // ordered ahead of terminal routing.
-            exit = classify_disposal_panic_retaining(exit, message);
-        }
-        // §7's `StartupAborted` is a startup-sequence property of a
+        // The exit is final at dispatch, and so is its publication (SPEC
+        // §9). §7's `StartupAborted` is a startup-sequence property of a
         // membership that *ran* and failed before its initial readiness
         // edge. A terminal without an exited incarnation never ran, so it
         // publishes the plain `Stopped { NeverStarted }` verdict (B.6) even
         // when its pre-readiness position still routes the scope's startup
-        // failure below. Incarnation exhaustion is the reachable case:
-        // it terminalizes an unspawned membership while `pre_ready` holds.
-        let startup = if terminal.exited_incarnation.is_some() {
-            terminal.startup
-        } else {
-            StartupDisposition::NotAborted
-        };
+        // failure below. Incarnation exhaustion is the reachable case: it
+        // terminalizes an unspawned membership while `pre_ready` holds.
+        //
         // Hand the publication seam a guarded clone rather than a raw one, so
         // no window between here and the cell layer's own retention holds the
         // user error unguarded. The cell layer surrenders its copy inside the
-        // publishing transaction.
-        self.terminalize_child(key, exit.clone(), terminal.exited_incarnation, startup);
-        // Keep the marker installed until terminal publication has committed.
-        // A concurrent shutdown sampler then sees either pending cleanup or a
-        // terminal member, never the gap between those two representations.
-        //
-        // Argued, not pinned: clearing the marker before `terminalize_child`
-        // reopens that gap for a few instructions, which no test in the suite
-        // can provoke deterministically.
-        member.set_terminal_disposal_pending(false);
-        if self.supervisor.membership_status(key) == MembershipStatus::Removing {
-            self.flush_supervisor_effects();
+        // publishing transaction, where the terminal member record is its
+        // structural co-owner.
+        let publication = if exited_incarnation.is_some() {
+            startup
         } else {
-            if terminal.startup == StartupDisposition::Aborted
-                && !terminal.startup_routed
-                && !self.supervisor.lifecycle().is_draining()
-            {
-                self.fail_startup(key, &exit);
-            }
-            if self.children[key].options.retention == crate::Retention::Remove {
-                self.prune_terminal(key);
-            }
+            StartupDisposition::NotAborted
+        };
+        self.publish_terminal(key, exit.clone(), exited_incarnation, publication);
+
+        // §7: the scope leaves `Starting` the moment the exit funnel
+        // dispatches a terminal pre-ready exit, and that exit names the
+        // failure. Routing it after publication is what makes SPEC §12's
+        // guarantee hold: a reported child-caused `StartupFailed` is never
+        // ahead of its child, whose published exit is exactly the payload's.
+        if startup == StartupDisposition::Aborted
+            && self.supervisor.membership_status(key) != MembershipStatus::Removing
+            && !self.supervisor.lifecycle().is_draining()
+        {
+            self.fail_startup(key, &exit);
         }
         // Both routes above are fallible, so the guard retires once, here, by
         // falling out of scope whichever route ran. Issue #455 removed the
@@ -1388,10 +1320,67 @@ impl ScopeRuntime {
         // conventional co-owner proof, and the driver owns no observation
         // transaction to surrender into, so `RetainedExit::drop` is the venue:
         // it retires a failed user error through critical disposal at the cost
-        // of one blocking-pool job. The copy that retires as refcount traffic
-        // is the clone handed to `terminalize_child` above, surrendered inside
-        // the publishing transaction where the terminal member record is its
-        // structural co-owner.
+        // of one blocking-pool job.
+        drop(exit);
+
+        // Release edge. Startup routing can reenter teardown, so re-sample
+        // the membership: a hard-force fallback may already have joined it,
+        // and a joined remove-retained member may already be pruned.
+        let construction = match self.children.get_mut(key) {
+            Some(child) => child.construction.take(),
+            None => return,
+        };
+        if !self.supervisor.is_disposing(key) {
+            if let Some(construction) = construction {
+                runtime::dispose_detached(construction);
+            }
+            return;
+        }
+        let Some(construction) = construction else {
+            self.handle_construction_disposed(key);
+            return;
+        };
+        if self.supervisor.hard_forced() {
+            runtime::dispose_detached(construction);
+            self.handle_construction_disposed(key);
+            return;
+        }
+
+        // The retained factory is user-owned. Destroy it on the blocking
+        // pool. The disposal job itself owns completion, so cancellation or
+        // failure to spawn an auxiliary async joiner cannot strand the child.
+        // A destructor panic is a disposal fault outside the published
+        // verdict (SPEC §8); the job contains it.
+        let sender = self.disposal_events.clone();
+        let signal = self.root.signal().clone();
+        runtime::dispose_then(construction, move || {
+            if sender
+                .send(DriverEvent::Child(ChildEvent::ConstructionDisposed {
+                    child: key,
+                }))
+                .is_ok()
+            {
+                signal.pulse();
+            }
+        });
+    }
+
+    /// Crosses a terminal membership's release edge (SPEC §9).
+    ///
+    /// The exit already published at dispatch. Joining gates pruning,
+    /// `remove`'s resolution, the ordered-teardown cursor and the drained
+    /// test. A completion for a membership that already joined — a hard
+    /// force or driver teardown stopped waiting for it — is a no-op.
+    pub(super) fn handle_construction_disposed(&mut self, key: ChildKey) {
+        if !self.supervisor.is_disposing(key) || self.children.get(key).is_none() {
+            return;
+        }
+        self.join_terminal(key);
+        if self.supervisor.membership_status(key) == MembershipStatus::Removing {
+            self.flush_supervisor_effects();
+        } else if self.children[key].options.retention == crate::Retention::Remove {
+            self.prune_terminal(key);
+        }
     }
 }
 

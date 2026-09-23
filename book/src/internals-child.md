@@ -150,14 +150,19 @@ teardown in [Shutdown from the inside](internals-shutdown.md).
 
 ## Terminal
 
-A terminal exit first retains the exit (`RetainedExit`) and hands the
-child's retained construction to the disposal lane; its completion comes
-back as a disposal event so destructor panics are folded into the
-verdict before terminalization. Terminalizing writes the member's
-terminal stage and last exit, and prepares mailbox termination: every
-parked sender wakes with `Terminated`, and unread payloads leave for
-detached disposal. A pre-ready failure becomes a startup failure — an
-ordered scope terminalizes its never-started suffix and a nested scope
-begins rollback — and the retention option then decides whether the
+A terminal exit is final at dispatch. The driver retains the exit
+(`RetainedExit`) and publishes it at once: terminalizing writes the
+member's terminal stage and last exit, and prepares mailbox termination —
+every parked sender wakes with `Terminated`, and unread payloads leave
+for detached disposal. A pre-ready failure then becomes a startup
+failure — an ordered scope terminalizes its never-started suffix and a
+nested scope begins rollback — so a startup verdict never runs ahead of
+the terminal it names. Only after that is the child's retained
+construction handed to the disposal lane. Its completion comes back as a
+disposal event that drives the reducer's `Disposing → Joined` step, the
+membership's *release* edge: a destructor panic there is contained and
+never reclassifies the published exit. Joining is what gates pruning,
+the ordered-teardown cursor and the drained test, so the retention
+option decides — once the release edge has passed — whether the
 terminal membership is pruned immediately or kept resident as a
 tombstone.

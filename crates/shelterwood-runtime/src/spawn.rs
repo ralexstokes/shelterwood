@@ -509,7 +509,7 @@ pub(super) fn contain_panic_payload(payload: PanicPayload) -> Option<String> {
 /// Terminal, off-executor destruction for an opaque user panic payload.
 ///
 /// The wrapper is load-bearing, not ceremony: submitting a bare payload to
-/// [`dispose_detached`] closes a cycle. `DisposalJob::finish` classifies a
+/// [`dispose_detached`] closes a cycle. `DisposalJob::finish` contains a
 /// destructor panic by calling [`contain_panic_payload`], which submits the
 /// replacement payload for detached disposal, whose destructor panics again.
 /// A self-regenerating payload — one whose `Drop` `panic_any`s a fresh copy

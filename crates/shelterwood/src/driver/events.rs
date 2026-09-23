@@ -26,7 +26,6 @@ pub(super) enum ChildEvent {
     },
     ConstructionDisposed {
         child: ChildKey,
-        panic: Option<runtime::DisposalPanic>,
     },
 }
 
@@ -126,12 +125,11 @@ pub(super) struct EventLanes<'a> {
 /// the exit that completes shutdown. Disposal completions trail, and
 /// `arbitrate` sorts stably, so a `ConstructionDisposed` always follows every
 /// same-class `Exited` collected in the same wake — even one produced later.
-/// A disposal is therefore a batch-tail event: the exit it trails may begin a
-/// drain first, after which `handle_construction_disposed` sees `is_draining`
-/// and routes the disposed child through stop progression instead of
-/// `fail_startup`. That is a widening of an order that was already reachable,
-/// not a new one: disposal runs on the blocking pool, so its completion never
-/// had a fixed position relative to concurrent exits.
+/// A disposal is therefore a batch-tail event. It carries no verdict — the
+/// disposed child's exit published at dispatch, and its startup failure was
+/// routed there too — so its position only decides when the membership's
+/// release edge (SPEC §9) is crossed. Disposal runs on the blocking pool, so
+/// its completion never had a fixed position relative to concurrent exits.
 ///
 /// Every lane — disposal included — is capped. An uncapped lane can monopolize
 /// a wake before the loop returns to the top and observes a shutdown request
@@ -146,8 +144,8 @@ pub(super) struct EventLanes<'a> {
 ///
 /// The disposal cap only bites for a dynamic scope whose initial plan is small
 /// relative to its admitted population. At most one construction disposal is in
-/// flight per child (`pending_terminal` admits one), so an ordered scope's
-/// disposal lane can never reach the `plan.children.len() * 3` limit.
+/// flight per child (the reducer's `Disposing` state admits one), so an ordered
+/// scope's disposal lane can never reach the `plan.children.len() * 3` limit.
 pub(super) fn collect_event_lanes(
     lanes: EventLanes<'_>,
     limit: usize,

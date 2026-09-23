@@ -644,7 +644,7 @@ fn dispose_definition_then(
         completion();
         return;
     };
-    runtime::dispose_then(construction, move |_| {
+    runtime::dispose_then(construction, move || {
         // A never-admitted definition has no incarnation verdict to publish,
         // but its destructor must still be isolated and complete before any
         // response releases ownership back to the caller.

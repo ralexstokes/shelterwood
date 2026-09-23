@@ -9,118 +9,6 @@ impl Drop for BlockingFactoryDrop {
     }
 }
 
-const ARRIVED_FACTORY_DISPOSAL_PANIC: &str = "arrived factory disposal panic";
-
-struct PanickingFactoryDrop;
-
-impl Drop for PanickingFactoryDrop {
-    fn drop(&mut self) {
-        panic!("{ARRIVED_FACTORY_DISPOSAL_PANIC}");
-    }
-}
-
-async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey, Arc<MemberCell>) {
-    scope_with_arrived_factory_disposal_panic_over(ExitError::message("application failure")).await
-}
-
-/// Drives a child to a pending terminal carrying `recorded`, then parks an
-/// arrived construction-disposal panic against it.
-///
-/// The recorded failure is the *losing* half of `classify_disposal_panic`:
-/// `Failed` ranks below `Panicked`, so every published verdict below is the
-/// panic and the application error is discarded. Taking the error as a
-/// parameter is what lets one case probe the discard's destruction venue.
-async fn scope_with_arrived_factory_disposal_panic_over(
-    recorded: ExitError,
-) -> (ScopeRuntime, ChildKey, Arc<MemberCell>) {
-    let mut tree = Tree::new();
-    tree.add_task(
-        "worker",
-        TaskDef::new({
-            let capture = PanickingFactoryDrop;
-            move |_| {
-                let _ = &capture;
-                future::pending::<crate::ExitResult>()
-            }
-        })
-        .restart(RestartPolicy::new(
-            RestartCondition::Never,
-            Backoff::Immediate,
-        ))
-        .retention(Retention::Retain),
-    )
-    .expect("valid task");
-    let fixture = OrderedScopeFixture::new(tree);
-    let root = Arc::clone(&fixture.root);
-    root.member
-        .update(|record| record.stage = MemberStage::Running);
-    root.set_state_and_startup(ScopeState::Running, Ok(()));
-    let key = fixture.children.keys().next().expect("one child plan");
-    let member = Arc::clone(&fixture.children[key].slot.member);
-    let (mut scope, mut event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
-
-    scope.spawn_child(key);
-    let active = scope.children[key]
-        .active
-        .as_ref()
-        .expect("worker is active");
-    let incarnation = active.incarnation;
-    active.abort_handle.abort();
-    let _joined = recv_child_exit(
-        &mut event_receiver,
-        DRIVER_PROGRESS_WAIT,
-        "the aborted fixture task to join",
-    )
-    .await;
-    // `handle_exit` is a post-join operation in production. Wait for that
-    // boundary before injecting the synthetic application verdict so the
-    // spawned body has released its factory clone and retained-construction
-    // disposal is the sole owner whose panic this fixture observes.
-    scope.handle_exit(
-        key,
-        incarnation,
-        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-            Err(recorded),
-        ))),
-        crate::runtime::JoinOutcome::Ok { value: () },
-        Cancellation::NotObserved,
-        false,
-    );
-    assert!(scope.children[key].pending_terminal.is_some());
-
-    let (disposed_child, panic) = recv_construction_disposed(
-        &mut scope.disposal_event_receiver,
-        DRIVER_PROGRESS_WAIT,
-        "the retained factory disposal panic to arrive",
-    )
-    .await;
-    assert_eq!(disposed_child, key);
-    let panic = panic.expect("the retained factory disposal panics");
-    assert_eq!(
-        panic.message.as_deref(),
-        Some(ARRIVED_FACTORY_DISPOSAL_PANIC)
-    );
-    assert!(
-        scope.disposal_event_receiver.is_empty(),
-        "a terminal disposes its retained construction exactly once"
-    );
-    // Replay the validated completion, pulse included, so runtime teardown,
-    // batch collection and the hard-force fallback still meet it exactly as
-    // `handle_terminal_disposal` leaves it.
-    assert!(
-        scope
-            .disposal_events
-            .send(DriverEvent::Child(ChildEvent::ConstructionDisposed {
-                child: disposed_child,
-                panic: Some(panic),
-            }))
-            .is_ok(),
-        "the validated disposal completion returns to the live lane"
-    );
-    scope.root.signal().pulse();
-    (scope, key, member)
-}
-
 #[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_teardown_finishes_the_cancelled_root_driver() {
     let plan = DynamicTree::new().lower_for_test();
@@ -164,8 +52,12 @@ async fn runtime_teardown_finishes_the_cancelled_root_driver() {
     ));
 }
 
+/// A child's exit publishes at dispatch, ahead of its retained factory's
+/// destruction (SPEC §9). Driver death while that destruction is still
+/// blocked therefore finds the verdict already published: teardown keeps it
+/// and only stops waiting for the release edge (SPEC §11).
 #[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
-async fn runtime_teardown_publishes_the_exit_awaiting_factory_disposal() {
+async fn runtime_teardown_keeps_the_exit_published_ahead_of_factory_disposal() {
     const FAILURE: &str = "distinctive application failure";
 
     let gate = Arc::new(FactoryGate::default());
@@ -197,18 +89,21 @@ async fn runtime_teardown_publishes_the_exit_awaiting_factory_disposal() {
         crate::runtime::timeout(DRIVER_PROGRESS_WAIT, gate.wait_entered()).await,
         crate::runtime::Timeout::Completed(())
     ));
-    let pending = task.cell.record();
+    // The factory's destructor is now blocked on the pool, and the driver
+    // submitted it only after publishing the exit.
+    let published = task.cell.record();
+    let before_teardown = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, task.wait()).await;
 
     // Dropping this dedicated runtime destroys the scope-driver future while
     // the blocking pool remains held in the retained factory's destructor.
-    // Run teardown concurrently so the test can observe the synchronous
-    // driver epilogue before allowing that destructor to finish.
+    // Join the cancelled driver before releasing the gate below, so the
+    // driver future is gone and the release edge can no longer be crossed.
     let teardown = crate::runtime::spawn(hosted.shutdown());
-    let publication = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, async {
-        let terminal = task.wait().await;
-        let lifecycle = loop {
+    let driver = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(driver)).await;
+    let lifecycle = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, async {
+        loop {
             let Some(item) = events.recv().await else {
-                panic!("driver teardown closed lifecycle without an Exited event")
+                panic!("lifecycle closed without the worker's Exited event")
             };
             if let LifecycleItem::Event(event) = item
                 && let LifecycleEventKind::Exited { id, exit, .. } = event.kind
@@ -216,17 +111,16 @@ async fn runtime_teardown_publishes_the_exit_awaiting_factory_disposal() {
             {
                 break exit;
             }
-        };
-        (terminal, lifecycle, task.cell.record())
+        }
     })
     .await;
+    let after_teardown = task.cell.record();
 
-    // Always unblock the runtime thread before asserting the publication, so
-    // a regression fails promptly rather than waiting for the gate backstop.
+    // Always unblock the runtime thread before asserting, so a regression
+    // fails promptly rather than waiting for the gate backstop.
     gate.release();
     let teardown =
         crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(teardown)).await;
-    let driver = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(driver)).await;
 
     assert!(matches!(
         teardown,
@@ -236,15 +130,19 @@ async fn runtime_teardown_publishes_the_exit_awaiting_factory_disposal() {
         driver,
         crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Cancelled)
     ));
-    assert!(matches!(pending.stage, MemberStage::Running));
-    assert_eq!(pending.last_exit, None);
-    let crate::runtime::Timeout::Completed((terminal, lifecycle, record)) = publication else {
-        panic!("driver teardown did not publish the pending terminal exit")
+    let MemberStage::Terminal(recorded) = published.stage else {
+        panic!("the exit must publish before the factory's destruction completes")
     };
-    let MemberStage::Terminal(recorded) = record.stage else {
-        panic!("driver teardown did not terminalize the child membership")
+    let crate::runtime::Timeout::Completed(terminal) = before_teardown else {
+        panic!("wait() must resolve before the factory's destruction completes")
     };
-    for exit in [&terminal, &lifecycle, &recorded] {
+    let crate::runtime::Timeout::Completed(lifecycle) = lifecycle else {
+        panic!("the published exit's lifecycle event was not observed")
+    };
+    let MemberStage::Terminal(kept) = after_teardown.stage else {
+        panic!("driver teardown must keep the membership terminal")
+    };
+    for exit in [&terminal, &lifecycle, &recorded, &kept] {
         assert!(matches!(
             exit.kind(),
             ExitKind::Failed(error) if error.to_string() == FAILURE
@@ -253,40 +151,8 @@ async fn runtime_teardown_publishes_the_exit_awaiting_factory_disposal() {
     }
     assert_eq!(lifecycle, terminal);
     assert_eq!(recorded, terminal);
-    assert_eq!(record.last_exit, Some(terminal));
-}
-
-#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
-async fn runtime_teardown_folds_an_arrived_factory_disposal_panic() {
-    let (scope, _key, member) = scope_with_arrived_factory_disposal_panic().await;
-
-    drop(scope);
-
-    assert_arrived_disposal_panic_published(&member);
-}
-
-/// The losing application error is the user value on this path, and nothing
-/// else observes it: the published verdict is the disposal panic. Pin its
-/// destruction venue directly, because a framework `String` error — what every
-/// other case here records — makes the venue unobservable.
-#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_arrived_disposal_panic_disposes_its_losing_application_error_off_the_driver() {
-    let (recorded, observed) = thread_reporting_error();
-    let (scope, _key, member) = scope_with_arrived_factory_disposal_panic_over(recorded).await;
-    // Sample after the last await: a multi-thread test task may migrate, and
-    // the fold below runs inline on whichever worker drops the driver.
-    let driver_thread = std::thread::current().id();
-
-    drop(scope);
-
-    assert_arrived_disposal_panic_published(&member);
-    assert_ne!(
-        observed
-            .recv_timeout(DRIVER_PROGRESS_WAIT)
-            .expect("the discarded application failure is disposed"),
-        driver_thread,
-        "the losing application error must not be destroyed on the driver"
-    );
+    assert_eq!(kept, terminal, "teardown keeps the published verdict");
+    assert_eq!(published.last_exit, Some(terminal));
 }
 
 #[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
@@ -340,203 +206,6 @@ async fn missing_terminal_resource_retires_its_exit_before_panicking() {
         driver_thread,
         "the framework panic cannot unwind the user error on the driver"
     );
-}
-
-#[test]
-fn duplicate_disposal_completion_preserves_the_first_report() {
-    let (mut scope, _events) = OrderedScopeFixture::new(Tree::new()).build();
-    let child = ChildKey::fixture(999);
-    let first = crate::runtime::DisposalPanic {
-        message: Some("first disposal panic".to_owned()),
-    };
-    let second = crate::runtime::DisposalPanic {
-        message: Some("second disposal panic".to_owned()),
-    };
-
-    scope.stage_disposal_panic(child, Some(first.clone()));
-    scope.stage_disposal_panic(child, Some(second));
-
-    assert_eq!(scope.take_arrived_disposal_panic(child), Some(first));
-}
-
-fn assert_arrived_disposal_panic_published(member: &Arc<MemberCell>) {
-    assert!(matches!(
-        member.record().stage,
-        MemberStage::Terminal(ref exit)
-            if matches!(
-                exit.kind(),
-                ExitKind::Panicked { message }
-                    if message.as_deref() == Some(ARRIVED_FACTORY_DISPOSAL_PANIC)
-            )
-    ));
-}
-
-/// The lane is empty by the time a forced batch dispatches: collection
-/// already moved the completion into the batch, where `Pending::Force`
-/// (`ScopeShutdown`) outranks it (`ChildExit`). Staging is what keeps it
-/// reachable from the hard-force fallback.
-#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hard_force_folds_a_batch_collected_factory_disposal_panic() {
-    let (mut scope, key, member) = scope_with_arrived_factory_disposal_panic().await;
-
-    let mut pending = vec![Pending::Force.classified()];
-    collect_driver_events(&mut scope.disposal_event_receiver, 8, &mut pending);
-    scope.stage_batch_disposal_panics(&mut pending);
-    arbitrate(&mut pending);
-    let mut batch = pending.into_iter().map(|(_, event)| event);
-    assert!(matches!(batch.next(), Some(Pending::Force)));
-
-    scope.force_all();
-
-    assert!(!scope.supervisor.is_disposing(key));
-    assert_arrived_disposal_panic_published(&member);
-
-    // The batch's own entry still dispatches, against an already-taken
-    // `pending_terminal`, and must not disturb the published verdict.
-    let Some(Pending::Child(ChildEvent::ConstructionDisposed { child, panic })) = batch.next()
-    else {
-        panic!("the batch collected the construction-disposal completion")
-    };
-    assert_eq!(child, key);
-    let panic = panic.or_else(|| scope.take_arrived_disposal_panic(child));
-    scope.handle_construction_disposed(child, panic);
-    assert_arrived_disposal_panic_published(&member);
-}
-
-#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hard_force_folds_an_arrived_factory_disposal_panic() {
-    let (mut scope, key, member) = scope_with_arrived_factory_disposal_panic().await;
-
-    scope.force_all();
-
-    assert!(!scope.supervisor.is_disposing(key));
-    assert_arrived_disposal_panic_published(&member);
-}
-
-#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hard_force_preserves_the_first_terminal_observer_panic_across_its_fallback() {
-    const FIRST_PANIC: &str = "arrived disposal terminal observer panic";
-    const SECOND_PANIC: &str = "hard-force fallback terminal observer panic";
-
-    let gate = Arc::new(FactoryGate::default());
-    let mut tree = Tree::new();
-    tree.add_task(
-        "arrived",
-        TaskDef::new({
-            let capture = PanickingFactoryDrop;
-            move |_| {
-                let _ = &capture;
-                future::pending::<crate::ExitResult>()
-            }
-        })
-        .restart(RestartPolicy::new(
-            RestartCondition::Never,
-            Backoff::Immediate,
-        ))
-        .retention(Retention::Retain),
-    )
-    .expect("valid arrived child");
-    tree.add_task(
-        "fallback",
-        TaskDef::new({
-            let capture = BlockingFactoryDrop(Arc::clone(&gate));
-            move |_| {
-                let _ = &capture;
-                future::pending::<crate::ExitResult>()
-            }
-        })
-        .restart(RestartPolicy::new(
-            RestartCondition::Never,
-            Backoff::Immediate,
-        ))
-        .retention(Retention::Retain),
-    )
-    .expect("valid fallback child");
-
-    let fixture = OrderedScopeFixture::new(tree);
-    let root = Arc::clone(&fixture.root);
-    root.member
-        .update(|record| record.stage = MemberStage::Running);
-    root.set_state_and_startup(ScopeState::Running, Ok(()));
-    let mut arrived = None;
-    let mut fallback = None;
-    for key in fixture.children.keys() {
-        let member = Arc::clone(&fixture.children[key].slot.member);
-        let id = member.id().as_str().to_owned();
-        match id.as_str() {
-            "arrived" => arrived = Some((key, member)),
-            "fallback" => fallback = Some((key, member)),
-            _ => unreachable!("the fixture declares exactly two known children"),
-        }
-    }
-    let (arrived_key, arrived_member) = arrived.expect("arrived child is present");
-    let (fallback_key, fallback_member) = fallback.expect("fallback child is present");
-    let (mut scope, mut event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
-
-    for key in [arrived_key, fallback_key] {
-        scope.spawn_child(key);
-        scope.children[key]
-            .active
-            .as_ref()
-            .expect("child is active")
-            .abort_handle
-            .abort();
-    }
-    for _ in 0..2 {
-        recv_child_exit(
-            &mut event_receiver,
-            DRIVER_PROGRESS_WAIT,
-            "an aborted fixture child to join",
-        )
-        .await
-        .dispatch(&mut scope);
-    }
-    assert!(matches!(
-        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, gate.wait_entered()).await,
-        crate::runtime::Timeout::Completed(())
-    ));
-    let arrived_completion = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, async {
-        while scope.disposal_event_receiver.is_empty() {
-            crate::runtime::yield_now().await;
-        }
-    })
-    .await;
-    assert!(matches!(
-        arrived_completion,
-        crate::runtime::Timeout::Completed(())
-    ));
-
-    let mut arrived_terminal = Box::pin(arrived_member.wait_terminal());
-    let mut fallback_terminal = Box::pin(fallback_member.wait_terminal());
-    assert!(
-        arrived_terminal
-            .as_mut()
-            .poll(&mut Context::from_waker(&Waker::from(Arc::new(PanicWake(
-                FIRST_PANIC
-            )))))
-            .is_pending()
-    );
-    assert!(
-        fallback_terminal
-            .as_mut()
-            .poll(&mut Context::from_waker(&Waker::from(Arc::new(PanicWake(
-                SECOND_PANIC
-            )))))
-            .is_pending()
-    );
-
-    let result = catch_unwind(AssertUnwindSafe(|| scope.force_child(fallback_key)));
-    gate.release();
-
-    let payload = result.expect_err("both hostile terminal wakes are contained");
-    assert_eq!(
-        payload.downcast_ref::<&'static str>().copied(),
-        Some(FIRST_PANIC),
-        "the earlier arrived-disposal panic remains primary"
-    );
-    for member in [&arrived_member, &fallback_member] {
-        assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
-    }
 }
 
 #[crate::runtime::test]

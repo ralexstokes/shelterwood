@@ -1,7 +1,7 @@
 use super::support::*;
 
 fn disposed(child: ChildKey) -> DriverEvent {
-    DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic: None })
+    DriverEvent::Child(ChildEvent::ConstructionDisposed { child })
 }
 
 fn disposed_child(pending: &Pending) -> ChildKey {
@@ -340,13 +340,13 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     .await;
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
-    let (child, panic) = recv_construction_disposed(
+    let child = recv_construction_disposed(
         &mut scope.disposal_event_receiver,
         DRIVER_PROGRESS_WAIT,
         "removal joins retained construction disposal",
     )
     .await;
-    scope.handle_construction_disposed(child, panic);
+    scope.handle_construction_disposed(child);
     assert!(scope.children.get(key).is_none());
 }
 

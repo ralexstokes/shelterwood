@@ -86,9 +86,11 @@ after unlock — it is handed to a lane in
   creation the accepted fail-safe is a queued job held for the life of
   the process, which is the trade against destroying user state under a
   lock.
-- **`dispose_then` / `dispose_all`** — classified destruction with a
-  completion, used where a destructor panic must be folded into a
-  verdict (terminal disposal of a child's construction).
+- **`dispose_then` / `dispose_all`** — contained destruction with a
+  completion, used where a later step must wait for the destruction to
+  finish (a child's construction gating its release edge). The
+  completion reports only that destruction finished; a destructor panic
+  is contained and never reaches a verdict.
 
 The `Retained*` family in `cells/retained.rs` is the bridge: a framework-
 retained copy of an `Exit` owns a type-erased user error, and its drop

@@ -49,15 +49,10 @@ impl<T: Send + 'static> Drop for Isolated<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DisposalPanic {
-    pub message: Option<String>,
-}
-
 struct DisposalJob<T, C>
 where
     T: Send + 'static,
-    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
+    C: FnOnce() + Send + 'static,
 {
     state: Mutex<Option<(T, C)>>,
     /// Whether the submitter may never destroy this payload itself.
@@ -67,7 +62,7 @@ where
 impl<T, C> DisposalJob<T, C>
 where
     T: Send + 'static,
-    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
+    C: FnOnce() + Send + 'static,
 {
     fn lock_state(&self) -> std::sync::MutexGuard<'_, Option<(T, C)>> {
         self.state
@@ -104,23 +99,24 @@ where
         let Some((value, completion)) = self.take_pending() else {
             return;
         };
-        let panic = match catch_panic(|| drop(value)) {
-            Ok(()) => None,
-            Err(payload) => Some(DisposalPanic {
-                message: contain_panic_payload(payload),
-            }),
-        };
+        // A destructor panic is a disposal fault: contained here and never
+        // reported to the completion, which learns only that destruction
+        // finished. The payload itself is user-owned, so it retires through
+        // the same detached venue as any other contained panic payload.
+        if let Err(payload) = catch_panic(|| drop(value)) {
+            let _ = contain_panic_payload(payload);
+        }
         // Completion is framework bookkeeping. Contain it as well so a
         // hostile waker or a runtime teardown race cannot unwind a blocking
         // worker or double-panic while the job is being dropped.
-        discard_panic(catch_panic(|| completion(panic)).err());
+        discard_panic(catch_panic(completion).err());
     }
 }
 
 impl<T, C> Drop for DisposalJob<T, C>
 where
     T: Send + 'static,
-    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
+    C: FnOnce() + Send + 'static,
 {
     fn drop(&mut self) {
         if !self.critical {
@@ -145,7 +141,7 @@ where
 impl<T, C> BlockingPoolJob for DisposalJob<T, C>
 where
     T: Send + 'static,
-    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
+    C: FnOnce() + Send + 'static,
 {
     fn run(&self) {
         self.finish();
@@ -321,7 +317,7 @@ fn run_fallback_disposals(disposals: &FallbackQueue) {
 fn dispatch_disposal<T, C>(job: Arc<DisposalJob<T, C>>)
 where
     T: Send + 'static,
-    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
+    C: FnOnce() + Send + 'static,
 {
     dispatch_disposal_with(job, &FALLBACK_DISPOSALS, spawn_fallback_worker);
 }
@@ -332,7 +328,7 @@ fn dispatch_disposal_with<T, C>(
     spawn: impl FnOnce() -> std::io::Result<std::thread::JoinHandle<()>>,
 ) where
     T: Send + 'static,
-    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
+    C: FnOnce() + Send + 'static,
 {
     // A rejected submission falls through so the fallback thread, rather than
     // this runtime-teardown thread, owns user destruction.
@@ -364,7 +360,8 @@ fn dispatch_disposal_with<T, C>(
 }
 
 /// Runs potentially blocking user destruction away from the caller and then
-/// invokes framework completion with the contained panic diagnostic.
+/// invokes framework completion. A destructor panic is contained and does not
+/// reach the completion.
 ///
 /// Inside a Tokio runtime this uses the blocking pool. Outside one, jobs are
 /// funneled through a single shared disposal thread, so destroying many
@@ -373,7 +370,7 @@ fn dispatch_disposal_with<T, C>(
 pub fn dispose_then<T, C>(value: T, completion: C)
 where
     T: Send + 'static,
-    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
+    C: FnOnce() + Send + 'static,
 {
     dispatch_disposal(DisposalJob::new(value, completion));
 }
@@ -382,7 +379,7 @@ where
 /// caller. The guard also contains a panic if task/thread creation itself
 /// fails and drops the closure on the submitting thread.
 pub fn dispose_detached<T: Send + 'static>(value: T) {
-    dispose_then(value, |_| {});
+    dispose_then(value, || {});
 }
 
 /// Detaches user destruction from a framework critical section.
@@ -404,7 +401,7 @@ fn dispose_critical_with<T: Send + 'static>(
     disposals: &FallbackQueue,
     spawn: impl FnOnce() -> std::io::Result<std::thread::JoinHandle<()>>,
 ) {
-    let job = DisposalJob::critical(value, |_| {});
+    let job = DisposalJob::critical(value, || {});
     if submit_blocking_job(&job) {
         // Spawning is the only work this can add, and it runs no user code
         // and takes only the fallback queue's leaf lock, so the retry is as
@@ -435,7 +432,7 @@ pub fn dispose_all<T: Send + 'static>(values: Vec<T>) -> Latch {
     for value in values {
         let remaining = Arc::clone(&remaining);
         let value_completion = completion.clone();
-        dispose_then(value, move |_| {
+        dispose_then(value, move || {
             if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
                 value_completion.fire();
             }
@@ -457,9 +454,8 @@ mod tests {
     };
 
     use super::{
-        DisposalJob, DisposalPanic, FallbackQueue, Isolated, dispatch_disposal_with,
-        dispose_critical_with, dispose_detached, queue_fallback_disposal_with,
-        run_fallback_disposals,
+        DisposalJob, FallbackQueue, Isolated, dispatch_disposal_with, dispose_critical_with,
+        dispose_detached, queue_fallback_disposal_with, run_fallback_disposals,
     };
     use crate::{
         spawn::BlockingPoolJob,
@@ -502,30 +498,26 @@ mod tests {
     #[test]
     fn dropping_an_unstarted_disposal_job_contains_panic_and_completes_once() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let diagnostic = Arc::new(Mutex::new(None));
-        let completion_diagnostic = Arc::clone(&diagnostic);
-        let job = DisposalJob::new(PanickingDrop(Arc::clone(&drops)), move |panic| {
-            *completion_diagnostic
-                .lock()
-                .expect("diagnostic mutex poisoned") = Some(panic);
+        let completions = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::clone(&completions);
+        let job = DisposalJob::new(PanickingDrop(Arc::clone(&drops)), move || {
+            completed.fetch_add(1, Ordering::SeqCst);
         });
 
         drop(job);
 
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        let diagnostic = diagnostic.lock().expect("diagnostic mutex poisoned");
-        assert!(matches!(
-            diagnostic.as_ref(),
-            Some(Some(DisposalPanic {
-                message: Some(message)
-            })) if message == "cancelled disposal job payload"
-        ));
+        assert_eq!(
+            completions.load(Ordering::SeqCst),
+            1,
+            "a contained destructor panic still completes the job exactly once"
+        );
     }
 
     #[test]
     fn critical_disposal_stays_queued_when_the_fallback_thread_cannot_start() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let job = DisposalJob::critical(PanickingDrop(Arc::clone(&drops)), |_| {});
+        let job = DisposalJob::critical(PanickingDrop(Arc::clone(&drops)), || {});
         let disposals = FallbackQueue::new();
 
         assert!(!queue_fallback_disposal_with(
@@ -564,7 +556,7 @@ mod tests {
     ) {
         let disposals: &'static FallbackQueue = Box::leak(Box::new(FallbackQueue::new()));
         let (destroyed, destroyed_rx) = mpsc::channel();
-        let job = DisposalJob::critical(RecordingDrop(destroyed), |_| {});
+        let job = DisposalJob::critical(RecordingDrop(destroyed), || {});
         assert!(!queue_fallback_disposal_with(
             disposals,
             Arc::clone(&job) as Arc<dyn BlockingPoolJob>,
@@ -615,7 +607,7 @@ mod tests {
             .expect("test runtime");
         let _entered = runtime.enter();
 
-        dispatch_disposal_with(DisposalJob::new((), |_| {}), disposals, || {
+        dispatch_disposal_with(DisposalJob::new((), || {}), disposals, || {
             start_local_worker(disposals)
         });
 
@@ -685,13 +677,11 @@ mod tests {
     #[test]
     fn exhausted_runtime_and_thread_creation_finishes_disposal_inline() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let diagnostic = Arc::new(Mutex::new(None));
-        let completion_diagnostic = Arc::clone(&diagnostic);
+        let completions = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::clone(&completions);
         let disposals = FallbackQueue::new();
-        let job = DisposalJob::new(PanickingDrop(Arc::clone(&drops)), move |panic| {
-            *completion_diagnostic
-                .lock()
-                .expect("diagnostic mutex poisoned") = Some(panic);
+        let job = DisposalJob::new(PanickingDrop(Arc::clone(&drops)), move || {
+            completed.fetch_add(1, Ordering::SeqCst);
         });
 
         // A plain test has no Tokio context, so blocking-pool submission is
@@ -711,18 +701,16 @@ mod tests {
                 .is_empty(),
             "a non-critical job rejected by the spawner returns to its submitter"
         );
-        let diagnostic = diagnostic.lock().expect("diagnostic mutex poisoned");
-        assert!(matches!(
-            diagnostic.as_ref(),
-            Some(Some(DisposalPanic {
-                message: Some(message)
-            })) if message == "cancelled disposal job payload"
-        ));
+        assert_eq!(
+            completions.load(Ordering::SeqCst),
+            1,
+            "a contained destructor panic still completes the job exactly once"
+        );
     }
 
     #[test]
     fn pending_query_tolerates_a_poisoned_disposal_job() {
-        let job = DisposalJob::new((), |_| {});
+        let job = DisposalJob::new((), || {});
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = job.state.lock().expect("state starts healthy");
             panic!("inject disposal state poison");
@@ -740,7 +728,7 @@ mod tests {
     fn dropping_the_last_critical_job_reroutes_off_the_owning_thread() {
         let owning_thread = thread::current().id();
         let (destroyed, destroyed_rx) = mpsc::channel();
-        let job = DisposalJob::critical(RecordingDrop(destroyed), |_| {});
+        let job = DisposalJob::critical(RecordingDrop(destroyed), || {});
 
         drop(job);
 
@@ -760,9 +748,9 @@ mod tests {
 
     #[test]
     fn fallback_detection_distinguishes_blocking_spawn_outcomes() {
-        let accepted = DisposalJob::new((), |_| {});
-        let rejected = DisposalJob::new((), |_| {});
-        let completed = DisposalJob::new((), |_| {});
+        let accepted = DisposalJob::new((), || {});
+        let rejected = DisposalJob::new((), || {});
+        let completed = DisposalJob::new((), || {});
         assert_blocking_pool_outcomes(accepted, rejected, completed);
     }
 

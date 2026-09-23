@@ -191,14 +191,16 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
     );
 
     scope.spawn_child(key);
-    assert!(scope.children[key].is_disposing());
+    assert!(scope.supervisor.is_disposing(key));
+    // The exit publishes at dispatch; only pruning waits for the release
+    // edge (SPEC §9).
     assert!(matches!(
         scope.children[key].slot.member.record().stage,
-        MemberStage::Restarting
+        MemberStage::Terminal(ref exit) if exit == &previous
     ));
     assert_eq!(root.snapshot().children.len(), 1);
 
-    let (child, panic) = recv_construction_disposed(
+    let child = recv_construction_disposed(
         &mut scope.disposal_event_receiver,
         DRIVER_PROGRESS_WAIT,
         "the construction disposal completion",
@@ -208,9 +210,9 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
         event_receiver.try_recv(),
         Some(DriverEvent::Child(ChildEvent::Ready { .. }))
     ));
-    scope.handle_construction_disposed(child, panic);
+    scope.handle_construction_disposed(child);
 
-    assert!(!scope.children[key].is_disposing());
+    assert!(!scope.supervisor.is_disposing(key));
     assert!(matches!(
         scope.children[key].slot.member.record().stage,
         MemberStage::Terminal(ref exit) if exit == &previous
@@ -253,15 +255,15 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
     );
 
     scope.spawn_child(key);
-    assert!(scope.children[key].is_disposing());
+    assert!(scope.supervisor.is_disposing(key));
 
-    let (child, panic) = recv_construction_disposed(
+    let child = recv_construction_disposed(
         &mut scope.disposal_event_receiver,
         DRIVER_PROGRESS_WAIT,
         "the construction disposal completion",
     )
     .await;
-    scope.handle_construction_disposed(child, panic);
+    scope.handle_construction_disposed(child);
 
     assert!(matches!(
         scope.children[key].slot.member.record().stage,
@@ -359,13 +361,13 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
     );
     assert!(scope.children[key].restart_deadline.is_none());
 
-    let (child, panic) = recv_construction_disposed(
+    let child = recv_construction_disposed(
         &mut scope.disposal_event_receiver,
         DRIVER_PROGRESS_WAIT,
         "the construction disposal completion",
     )
     .await;
-    scope.handle_construction_disposed(child, panic);
+    scope.handle_construction_disposed(child);
     assert!(matches!(
         scope.children[key].slot.member.record().stage,
         MemberStage::Terminal(_)
@@ -709,9 +711,9 @@ async fn settlement_terminates_when_the_first_spawn_exhausts_incarnations() {
     // The pre-loop settlement in `run_scope_incarnation`: the reducer asks for
     // construction, the funnel exhausts, and the child terminalizes in place.
     scope.settle_supervisor();
-    assert!(scope.children[key].is_disposing());
-    // §7: the pre-readiness terminal fails startup at dispatch; only the
-    // member's terminal publication waits for the construction disposal.
+    assert!(scope.supervisor.is_disposing(key));
+    // §7: the pre-readiness terminal publishes and fails startup at dispatch;
+    // only the release edge waits for construction disposal.
     assert!(
         scope.supervisor.lifecycle().startup_failed(),
         "the pre-readiness position routes the scope's startup failure at dispatch"
@@ -721,13 +723,13 @@ async fn settlement_terminates_when_the_first_spawn_exhausts_incarnations() {
     // membership gates ordered startup, but can no longer be constructed.
     scope.settle_supervisor();
 
-    let (child, panic) = recv_construction_disposed(
+    let child = recv_construction_disposed(
         &mut scope.disposal_event_receiver,
         DRIVER_PROGRESS_WAIT,
         "the construction disposal completion",
     )
     .await;
-    scope.handle_construction_disposed(child, panic);
+    scope.handle_construction_disposed(child);
     scope.settle_supervisor();
     assert!(scope.children[key].is_terminal());
     assert!(scope.supervisor.lifecycle().startup_failed());

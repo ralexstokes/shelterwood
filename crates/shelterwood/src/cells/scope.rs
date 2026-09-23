@@ -301,6 +301,8 @@ pub(crate) struct RuntimeStorage {
 }
 
 mod projection;
+#[cfg(test)]
+mod stress_tests;
 
 use projection::ObservationConfig;
 pub(crate) use projection::ScopeRecord;

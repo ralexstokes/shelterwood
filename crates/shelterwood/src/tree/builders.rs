@@ -20,6 +20,13 @@ use super::{
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum BuildError {
     /// No ambient supported async runtime exists.
+    ///
+    /// Only the runtime's presence is checked. It must also have its time
+    /// driver enabled (Tokio's `enable_time`, or `enable_all`): a runtime
+    /// without timers is not detected here. A timer-backed operation panics
+    /// when first polled, which may happen in a framework task or in the
+    /// caller's future (for example, during shutdown), rather than returning
+    /// this variant.
     #[error("no ambient Tokio runtime is available")]
     NoRuntime,
     /// One or more reserved slots were left undefined.
@@ -358,7 +365,8 @@ impl Tree {
     ///
     /// Returns [`BuildError::NoRuntime`] outside an ambient supported async
     /// runtime, and [`BuildError::UnfilledReservations`] when any reserved
-    /// slot was left undefined.
+    /// slot was left undefined. The runtime must have timers enabled; that is
+    /// not checked here (see [`BuildError::NoRuntime`]).
     pub fn spawn(self) -> Result<System<ScopeRef>, BuildError> {
         spawn_builder(self.core, |scope| scope)
     }
@@ -419,7 +427,8 @@ impl DynamicTree {
     ///
     /// Returns [`BuildError::NoRuntime`] outside an ambient supported async
     /// runtime, and [`BuildError::UnfilledReservations`] when any reserved
-    /// slot was left undefined.
+    /// slot was left undefined. The runtime must have timers enabled; that is
+    /// not checked here (see [`BuildError::NoRuntime`]).
     pub fn spawn(self) -> Result<System<DynamicScopeRef>, BuildError> {
         spawn_builder(self.core, DynamicScopeRef)
     }

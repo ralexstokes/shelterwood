@@ -30,6 +30,13 @@ pub fn alive_task_count() -> usize {
         .num_alive_tasks()
 }
 
+/// Whether an ambient runtime is reachable.
+///
+/// This cannot tell whether that runtime has its time driver enabled: the
+/// pinned Tokio exposes no non-panicking probe for it (the handle's time
+/// accessor is `tokio_unstable`-only), and provoking the panic would run the
+/// user's panic hook. `BuildError::NoRuntime` documents the requirement at
+/// the public surface instead.
 pub fn is_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }

@@ -6,8 +6,9 @@
 //! schedule: whatever interleaving ran, each message must be destroyed exactly
 //! once and must end in exactly one of the SPEC §5 outcomes — delivered to the
 //! incarnation that accepted it, returned to its sender in a `SendError`, or
-//! (only when accepted and unread, or withdrawn by cancellation) disposed by
-//! the framework. A lost wake shows up as a sender that never resolves, which
+//! disposed by the framework. When cancellation races acceptance or
+//! termination, a dropped send does not report which outcome won; undelivered
+//! messages in that case are counted as unobserved, not proven withdrawals. A lost wake shows up as a sender that never resolves, which
 //! the per-task deadline turns into a failure instead of a hang.
 
 use std::{
@@ -38,10 +39,10 @@ const MESSAGES_PER_SENDER: usize = 400;
 /// The controller terminates once senders have started this share of their
 /// messages, so the remainder races a terminal mailbox.
 const TERMINATE_AFTER_PERCENT: usize = 75;
-/// Generous next to the test's real runtime (well under a second); only a
-/// lost wake or a deadlock should ever reach it.
 /// Independent rounds per policy; each is a fresh mailbox and ledger.
 const ROUNDS: usize = 25;
+/// Generous next to the test's real runtime (well under a second); only a
+/// lost wake or a deadlock should ever reach it.
 const STALL: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,7 +190,7 @@ async fn run_sender(sender: usize, actor: ActorRef<Probe>, ledger: Arc<Ledger>) 
                 if outcome.is_none() {
                     ledger.record(id).cancelled_pending = true;
                     // Dropping the parked future withdraws it; the message is
-                    // then disposed unless acceptance already won.
+                    // then disposed unless acceptance or termination already won.
                     drop(send);
                 }
                 outcome
@@ -296,7 +297,7 @@ type Fates = [usize; 5];
 const FATES: [&str; 5] = [
     "delivered",
     "disposed unread",
-    "withdrawn by cancellation",
+    "disposed after cancellation (outcome unobserved)",
     "timed out",
     "terminated",
 ];
@@ -393,7 +394,7 @@ async fn stress_round(policy: ResolvedMailbox) -> Fates {
 
     let mut delivered = 0;
     let mut disposed_unread = 0;
-    let mut withdrawn = 0;
+    let mut cancelled_unobserved = 0;
     let mut timed_out = 0;
     let mut terminated = 0;
     let mut last_delivery = vec![None::<(usize, Incarnation)>; SENDERS];
@@ -440,7 +441,12 @@ async fn stress_round(policy: ResolvedMailbox) -> Fates {
             (None, Some(_)) => disposed_unread += 1,
             (None, None) if record.returned.is_none() => {
                 assert!(record.cancelled_pending);
-                withdrawn += 1;
+                // Pending was observed before dropping the future, not at
+                // withdrawal's linearization point. Acceptance (followed by
+                // unread disposal) or termination can win in between. None
+                // of those outcomes is observed by the dropped future, so
+                // this bucket proves disposal, not successful withdrawal.
+                cancelled_unobserved += 1;
             }
             (None, None) => {}
         }
@@ -463,7 +469,13 @@ async fn stress_round(policy: ResolvedMailbox) -> Fates {
         last_delivery[sender] = Some((id, incarnation));
     }
 
-    [delivered, disposed_unread, withdrawn, timed_out, terminated]
+    [
+        delivered,
+        disposed_unread,
+        cancelled_unobserved,
+        timed_out,
+        terminated,
+    ]
 }
 
 #[crate::runtime::test(flavor = "multi_thread", worker_threads = 4)]

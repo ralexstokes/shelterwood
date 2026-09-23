@@ -203,6 +203,20 @@ can destroy, every callback it can invoke, and every panic it can raise. If
 any of those is user code, hand it to a transaction (`txn.defer`), an effects
 struct, or the caller.
 
+## Teardown evidence
+
+Evidence that teardown must report — caught panics, retained payloads,
+recorded outcomes — lives in an owner whose `Drop` reports it, never in an
+async local held across an `.await`. A hard abort drops the future at whatever
+await it is parked on, and every local with it, silently; only a
+`Drop`-bearing owner (`PanicSlot`, `RetainedExitResult`,
+`RawIncarnationOwner`) still sees the evidence on that path. The shape to
+avoid is an epilogue that drains panics into a local and then awaits a join:
+an abort during the join publishes `Aborted` where SPEC §8's verdict
+precedence ("a panic is never masked, wherever it lands") requires `Panicked`.
+Keep the evidence in its owner across the await, and take it out only after
+the last suspension point.
+
 ## Impossible states
 
 Classify a defensive check by what makes its state impossible.

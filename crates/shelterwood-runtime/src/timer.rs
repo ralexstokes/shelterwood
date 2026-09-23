@@ -119,7 +119,9 @@ where
     F: Future,
 {
     // An unarmable budget never elapses, matching absolute-deadline
-    // overflow semantics. A due deadline needs no timer arming.
+    // overflow semantics. A due deadline still goes through `timeout_at`:
+    // the operation gets its first poll, and the sleep then resolves without
+    // arming a runtime timer.
     let Some(deadline) = deadline(duration).instant() else {
         return Timeout::Completed(future.await);
     };

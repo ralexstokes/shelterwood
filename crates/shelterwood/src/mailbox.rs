@@ -37,8 +37,10 @@ pub(crate) type MailboxDisposal = Box<dyn Send>;
 /// Linear permission to bind one mailbox incarnation.
 ///
 /// Configuration mints the initial permission and a successful close returns
-/// the next one. The token is intentionally neither `Clone` nor constructible
-/// outside the mailbox module.
+/// the next one. The token is intentionally not `Clone`. Its constructor is
+/// crate-visible so driver test doubles of [`MailboxControl`] can mint one;
+/// a token only binds the mailbox whose permit it carries, so a foreign
+/// token is rejected by [`Self::claim`] rather than unconstructible.
 #[must_use = "binding permission must be consumed by the next mailbox bind"]
 pub(crate) struct MailboxBindToken {
     permit: Arc<AtomicBool>,

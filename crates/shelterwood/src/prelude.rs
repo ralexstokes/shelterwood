@@ -126,7 +126,7 @@ pub mod errors {
         BuildError, CallError, CallErrorKind, Cancellation, Exit, ExitError, ExitKind, ExitResult,
         GracePhase, IntensityTrip, PolicyError, ReplyError, SendError, SendErrorKind,
         ShutdownStraggler, ShutdownTimeout, StartOrShutdownError, StartupError, StartupFailure,
-        StartupFailureCause, StopReason,
+        StartupFailureCause, StaticReserveError, StopReason,
     };
 }
 
@@ -148,12 +148,13 @@ pub mod raw {
 ///
 /// Slots split reservation from definition, which is what lets cyclically
 /// wired children hold each other's handles before either is defined.
-/// Subtree composition rides in the same file, and [`crate::BuildError`] is what
-/// both report.
+/// Subtree composition rides in the same file. Declaring either reports
+/// [`crate::StaticReserveError`], and spawning a tree that leaves a slot
+/// undefined reports [`crate::BuildError`].
 pub mod wiring {
     #[doc(no_inline)]
     pub use crate::{
-        ActorSlot, BuildError, DynamicActorSlot, DynamicSubtreeSlot, DynamicTaskSlot, Subtree,
-        SubtreeOnceDef, SubtreeSlot, TaskSlot,
+        ActorSlot, BuildError, DynamicActorSlot, DynamicSubtreeSlot, DynamicTaskSlot,
+        StaticReserveError, Subtree, SubtreeOnceDef, SubtreeSlot, TaskSlot,
     };
 }

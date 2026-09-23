@@ -1508,7 +1508,7 @@ mod tests {
     /// the window; it cannot discriminate `charge`'s `checked_duration_since`
     /// from the saturating `duration_since`. That guard is defence in depth:
     /// the saturating form yields `Duration::ZERO` for a regressed clock, and
-    /// `Intensity::validate` rejects a zero `within`, so `ZERO > within` is
+    /// `Intensity::new` rejects a zero `within`, so `ZERO > within` is
     /// already false for every constructible policy. Replacing the checked
     /// call with the saturating one leaves this assertion — and the rest of
     /// the suite — green.

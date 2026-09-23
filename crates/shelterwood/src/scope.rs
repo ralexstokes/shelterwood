@@ -16,7 +16,9 @@ use crate::{
     policy::ScopeFlavor,
 };
 
-/// A cheap, membership-addressed ordered scope handle.
+/// A cheap, membership-addressed handle to any scope, ordered or dynamic.
+///
+/// [`ScopeRef::dynamic`] recovers the admission surface of a dynamic scope.
 #[derive(Clone)]
 pub struct ScopeRef {
     pub(crate) cell: Arc<ScopeCell>,

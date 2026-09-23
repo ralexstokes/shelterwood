@@ -133,7 +133,7 @@
 //!
 //! ## Scopes and admission
 //!
-//! [`ScopeRef`] addresses an ordered scope; [`DynamicScopeRef`] adds
+//! [`ScopeRef`] addresses any scope; [`DynamicScopeRef`] adds
 //! runtime admission and removal, whose outcomes are [`Admission`],
 //! [`Removal`], [`RemoveOutcome`], [`ReserveError`], and
 //! [`NotAdmittingCause`]. Pre-spawn declarations return

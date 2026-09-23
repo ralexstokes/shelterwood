@@ -29,7 +29,9 @@
           pkgs,
           craneLibStable,
           craneLibNightly,
+          cargoSrc,
           commonArgs,
+          cargoArtifactsStable,
           cargoArtifactsNightly,
           ...
         }:
@@ -92,24 +94,19 @@
           # The book's code blocks are includes of anchored regions from
           # examples/, so a successful build proves the include paths and
           # anchors resolve; the compile/run half lives in examples-run.
-          book-build = craneLibNightly.mkCargoDerivation (
-            commonArgs
-            // {
-              cargoArtifacts = cargoArtifactsNightly;
-              nativeBuildInputs = [ pkgs.mdbook ];
-              buildPhaseCargoCommand = ''
-                mdbook build book
-              '';
-              doInstallCargoArtifacts = false;
-            }
-          );
+          # `mdbook build` needs no Rust toolchain, so this is a plain
+          # derivation over the filtered source rather than a crane one.
+          book-build = pkgs.runCommandLocal "book-build" { nativeBuildInputs = [ pkgs.mdbook ]; } ''
+            mdbook build ${cargoSrc}/book --dest-dir $out
+          '';
 
           # Examples are asserting smoke tests; running them is the check.
-          # The shared runner also serves the justfile's `examples` recipe.
-          examples-run = craneLibNightly.mkCargoDerivation (
+          # The shared runner also serves the justfile's `examples` recipe, so
+          # both run on the pinned stable toolchain users build with.
+          examples-run = craneLibStable.mkCargoDerivation (
             commonArgs
             // {
-              cargoArtifacts = cargoArtifactsNightly;
+              cargoArtifacts = cargoArtifactsStable;
               buildPhaseCargoCommand = ''
                 bash ./tools/run-examples.sh
               '';

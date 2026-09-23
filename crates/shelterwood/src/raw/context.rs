@@ -1093,6 +1093,21 @@ impl<M: Send + 'static> RawContext<M> {
     /// [`try_recv`](Self::try_recv) bypasses this selector and drains the
     /// accepted prefix directly according to the caller's shutdown policy.
     fn next_ready(&mut self) -> Option<M> {
+        let message = self.select_ready()?;
+        // Selection itself runs incarnation-owned disposal — a cancelled
+        // completion, a fired one-shot timer's key — after this call's last
+        // loop-top check. SPEC §6.2 fails the incarnation on a disposal panic
+        // retained when a receive boundary is reached, so resume it instead
+        // of delivering. The selected message goes through the funnel first
+        // so its destructor never runs on the unwind.
+        if let Some(panic) = self.resources.disposal.panic.take() {
+            self.resources.disposal.dispose(message);
+            runtime::resume_panic(panic);
+        }
+        Some(message)
+    }
+
+    fn select_ready(&mut self) -> Option<M> {
         // A permanently busy actor never reaches `wait_for_event`; reclaim at
         // its other guaranteed re-entry point so completed task handles do not
         // accumulate for the lifetime of the incarnation. This is the point
@@ -2125,6 +2140,61 @@ mod tests {
                 .kind,
             crate::SendErrorKind::NotRunning
         );
+    }
+
+    #[test]
+    fn a_disposal_panic_retained_during_selection_fails_the_receive() {
+        let (mut context, _actor, _shutdown) = bound_raw_context_for::<u8>();
+        let cancellation = Latch::default();
+        cancellation.fire();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let event_payload = PanickingDrop(Arc::clone(&drops));
+        context.resources.events.push(QueuedEvent {
+            cancellation,
+            make_message: Box::new(move || {
+                drop(event_payload);
+                7
+            }),
+        });
+        context.resources.events.push(QueuedEvent {
+            cancellation: Latch::default(),
+            make_message: Box::new(|| 9),
+        });
+
+        let result = catch_unwind(AssertUnwindSafe(|| context.try_recv()));
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let panic = result.expect_err(
+            "a destructor panic retained by this receive fails it before the next delivery",
+        );
+        assert_eq!(
+            panic_message(&panic),
+            Some("contained raw payload destructor panic")
+        );
+        assert!(context.resources.disposal.panic.take().is_none());
+    }
+
+    #[test]
+    fn a_fired_timer_key_destructor_panic_fails_the_receive() {
+        #[derive(Hash, PartialEq, Eq)]
+        struct PanickingKey;
+
+        impl Drop for PanickingKey {
+            fn drop(&mut self) {
+                panic!("timer key destructor panic");
+            }
+        }
+
+        let (mut context, _actor, _shutdown) = bound_raw_context_for::<u8>();
+        context
+            .set_timeout(PanickingKey, 5, Duration::ZERO)
+            .unwrap_or_else(|_| panic!("the timer is armed"));
+
+        let result = catch_unwind(AssertUnwindSafe(|| context.try_recv()));
+
+        let panic = result.expect_err("the fired timer's message is not delivered");
+        assert_eq!(panic_message(&panic), Some("timer key destructor panic"));
+        assert_eq!(context.try_recv(), None, "the timer was consumed");
     }
 
     #[test]

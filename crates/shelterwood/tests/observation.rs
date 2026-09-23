@@ -10,8 +10,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_quiet, next_event,
-    next_item, poll_once,
+    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_eventually_frozen,
+    assert_quiet, next_event, next_item, poll_once,
     waiting::{gate_released_manual_ready_task, task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
@@ -599,7 +599,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
         }
     };
 
-    assert_eventually!(|| {
+    assert_eventually_frozen!(|| {
         root.snapshot()
             .child("nested")
             .is_some_and(|child| matches!(child.state, ChildState::Restarting))
@@ -656,7 +656,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
     assert_eq!(nested.membership(), scope_membership);
     assert_eq!(nested.snapshot().total_restarts, TotalRestarts::ZERO);
     assert!(nested.snapshot().lifecycle_seq >= starting.seq);
-    assert_eventually!(|| {
+    assert_eventually_frozen!(|| {
         root.snapshot().child("nested").is_some_and(|child| {
             matches!(child.state, ChildState::Running) && child.restart_at.is_none()
         })
@@ -1176,7 +1176,7 @@ async fn snapshot_subscriptions_conflate_unobserved_transitions_to_the_latest_va
         .await
         .expect("ephemeral task is admitted");
     task.wait().await;
-    assert_eventually!(
+    assert_eventually_frozen!(
         || scope.as_scope().child("ephemeral").is_none(),
         "terminal removal reaches the latest snapshot"
     )

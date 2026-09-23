@@ -10,8 +10,9 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, advance_time, assert_eventually, assert_quiet,
-    next_event, poll_once, poll_until, startup_failed_child, waiting::task as waiting_task,
+    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, advance_time, assert_eventually,
+    assert_eventually_frozen, assert_quiet, next_event, poll_once, poll_until,
+    startup_failed_child, waiting::task as waiting_task,
 };
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, CallErrorKind, Cancellation, ChildState, Context,
@@ -508,9 +509,9 @@ async fn intensity_window_ages_out_between_restart_schedules() {
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     advance_time(Duration::from_secs(11)).await;
-    assert_eventually!(|| starts.load(Ordering::SeqCst) >= 2).await;
+    assert_eventually_frozen!(|| starts.load(Ordering::SeqCst) >= 2).await;
     advance_time(Duration::from_secs(11)).await;
-    assert_eventually!(|| starts.load(Ordering::SeqCst) >= 3).await;
+    assert_eventually_frozen!(|| starts.load(Ordering::SeqCst) >= 3).await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -690,7 +691,7 @@ async fn dynamic_and_always_members_do_not_finish_naturally() {
         .expect("valid task");
     let ordered = ordered.spawn().expect("runtime is available");
     ordered.wait_started().await.expect("ordered starts");
-    assert_eventually!(|| starts.load(Ordering::SeqCst) >= 2).await;
+    assert_eventually_frozen!(|| starts.load(Ordering::SeqCst) >= 2).await;
     let ordered_scope = ordered.scope();
     let mut ordered_stopped = Box::pin(ordered_scope.wait_stopped());
     assert_quiet(Duration::from_millis(20), || {

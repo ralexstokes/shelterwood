@@ -12,7 +12,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_quiet, next_event,
+    POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, assert_eventually, assert_eventually_frozen,
+    assert_quiet, next_event,
     policy::never,
     poll_once,
     waiting::{cancellation_signalled_waiting_task, task as waiting_task},
@@ -315,16 +316,20 @@ async fn ordered_teardown_is_reverse_and_joins_before_advancing() {
     system.wait_started().await.expect("tree starts");
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
 
-    assert_eventually!(|| order.lock().expect("order mutex poisoned").as_slice() == [2]).await;
+    assert_eventually_frozen!(|| order.lock().expect("order mutex poisoned").as_slice() == [2])
+        .await;
     assert_quiet(Duration::from_millis(15), || {
         order.lock().expect("order mutex poisoned").len() > 1
     })
     .await;
     gates[2].release();
-    assert_eventually!(|| order.lock().expect("order mutex poisoned").as_slice() == [2, 1]).await;
-    gates[1].release();
-    assert_eventually!(|| { order.lock().expect("order mutex poisoned").as_slice() == [2, 1, 0] })
+    assert_eventually_frozen!(|| order.lock().expect("order mutex poisoned").as_slice() == [2, 1])
         .await;
+    gates[1].release();
+    assert_eventually_frozen!(|| {
+        order.lock().expect("order mutex poisoned").as_slice() == [2, 1, 0]
+    })
+    .await;
     gates[0].release();
     shutdown
         .await

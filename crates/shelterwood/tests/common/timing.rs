@@ -73,6 +73,11 @@ pub(crate) async fn poll_until(
 }
 
 /// Waits for an eventually-consistent predicate and reports its source text.
+///
+/// Under a paused clock each unsatisfied probe auto-advances virtual time by
+/// 1 ms. That is how a predicate waiting on a timer makes progress. A
+/// predicate that needs no timer should use
+/// [`assert_eventually_frozen_predicate`] instead.
 #[track_caller]
 pub(crate) fn assert_eventually_predicate(
     expression: &'static str,
@@ -90,6 +95,63 @@ pub(crate) fn assert_eventually_predicate(
             ),
             None => panic!(
                 "predicate `{expression}` did not become true within {POLL_TIMEOUT:?} at {caller}"
+            ),
+        }
+    }
+}
+
+/// Waits for an eventually-consistent predicate without moving a paused
+/// virtual clock, and reports its source text.
+///
+/// [`assert_eventually_predicate`] paces with a 1 ms `sleep`. Under
+/// `start_paused` an idle runtime auto-advances to that sleep's deadline, so
+/// every unsatisfied probe moves virtual time. Work Tokio does not track, such
+/// as a native thread, then burns the whole virtual budget in a few real
+/// milliseconds, and any probe can fire a framework deadline mid-assertion.
+/// This variant yields instead. A yielding task keeps the runtime busy, so the
+/// clock cannot auto-advance, and the budget is [`POLL_TIMEOUT`] of wall
+/// time. It also asserts that virtual time did not move while it waited,
+/// which makes it a paused-clock-only helper.
+///
+/// It is for paused-clock waits whose predicate needs task or thread progress
+/// but no timer. A predicate that needs a timer to fire must use
+/// `assert_eventually!`, or advance time explicitly first.
+#[track_caller]
+pub(crate) fn assert_eventually_frozen_predicate(
+    expression: &'static str,
+    mut predicate: impl FnMut() -> bool,
+    context: impl FnOnce() -> Option<String>,
+) -> impl Future<Output = ()> {
+    let caller = Location::caller();
+    async move {
+        let frozen_at = tokio::time::Instant::now();
+        let deadline = Instant::now() + POLL_TIMEOUT;
+        let satisfied = loop {
+            if predicate() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            // Give OS threads the CPU too: the work being awaited may run on
+            // one, and this loop otherwise spins its runtime thread.
+            std::thread::yield_now();
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(
+            tokio::time::Instant::now(),
+            frozen_at,
+            "virtual time moved while `{expression}` was awaited at {caller}"
+        );
+        if satisfied {
+            return;
+        }
+        match context() {
+            Some(context) => panic!(
+                "predicate `{expression}` did not become true within {POLL_TIMEOUT:?} of wall time at {caller}: {context}"
+            ),
+            None => panic!(
+                "predicate `{expression}` did not become true within {POLL_TIMEOUT:?} of wall time at {caller}"
             ),
         }
     }

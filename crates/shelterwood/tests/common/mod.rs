@@ -18,8 +18,8 @@ pub(crate) use ownership::{ConsumeCount, ConsumeGuard, LiveFlag, PanicOnDrop};
 pub(crate) use recorder::{GatedRecorder, MessageRecorder};
 pub(crate) use startup::startup_failed_child;
 pub(crate) use timing::{
-    POLL_TIMEOUT, SHUTDOWN_BUDGET, advance_time, assert_eventually_predicate, assert_quiet,
-    poll_once, poll_until, poll_until_ready,
+    POLL_TIMEOUT, SHUTDOWN_BUDGET, advance_time, assert_eventually_frozen_predicate,
+    assert_eventually_predicate, assert_quiet, poll_once, poll_until, poll_until_ready,
 };
 pub(crate) use waker::{
     LiveWakerCounter, OrdinalWakerState, counting_waker, hostile_waker, ordinal_drop_waker,
@@ -40,3 +40,24 @@ macro_rules! assert_eventually {
 }
 
 pub(crate) use assert_eventually;
+
+/// `assert_eventually!` for a paused clock: yields on wall time instead of
+/// advancing virtual time; see [`assert_eventually_frozen_predicate`].
+macro_rules! assert_eventually_frozen {
+    ($predicate:expr $(,)?) => {
+        $crate::common::assert_eventually_frozen_predicate(
+            stringify!($predicate),
+            $predicate,
+            || None,
+        )
+    };
+    ($predicate:expr, $($context:tt)+) => {
+        $crate::common::assert_eventually_frozen_predicate(
+            stringify!($predicate),
+            $predicate,
+            || Some(format!($($context)+)),
+        )
+    };
+}
+
+pub(crate) use assert_eventually_frozen;

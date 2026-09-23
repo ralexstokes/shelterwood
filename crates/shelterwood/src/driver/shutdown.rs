@@ -195,18 +195,12 @@ impl ScopeRuntime {
             ladder.force(now);
         }
         self.advance_ladder(key, now);
-        // A retained-factory destructor may already have completed even
-        // though its disposal event has not reached ordinary dispatch. Fold
-        // every arrived completion before the hard-force fallback; the drain
-        // is non-blocking, so still-running disposal remains detached.
-        let mut panics = runtime::PanicAccumulator::default();
-        self.drain_arrived_disposal_events(&mut panics);
         if self.supervisor.is_disposing(key) {
-            // The incarnation has already exited; only its retained factory
-            // remains, and the fold above found no completion reported for
-            // it. Hard escalation detaches that cleanup and keeps the
-            // recorded verdict.
-            panics.run(|| self.handle_construction_disposed(key, None));
+            // The incarnation has already exited and its exit has published;
+            // only its retained factory's release edge remains. Hard
+            // escalation stops waiting for it: the disposal job stays
+            // detached, and its later completion finds nothing to join.
+            self.handle_construction_disposed(key);
         }
     }
 

@@ -135,6 +135,13 @@ async fn dynamic_add_resolves_at_admission_and_removal_is_exact() {
         .await
         .expect("first removal completes");
     assert!(matches!(first_exit.kind(), ExitKind::Completed));
+    // `wait()` resolves at terminal publication; the id frees at pruning,
+    // after the definition's release edge (SPEC §9).
+    assert_eventually!(
+        || scope.as_scope().snapshot().child("worker").is_none(),
+        "detached removal prunes the first worker"
+    )
+    .await;
 
     let second = scope
         .add_task_once(

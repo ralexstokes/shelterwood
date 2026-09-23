@@ -754,13 +754,13 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
         }
     }
 
-    let (child, panic) = recv_construction_disposed(
+    let child = recv_construction_disposed(
         &mut scope.disposal_event_receiver,
         DRIVER_PROGRESS_WAIT,
         "the construction disposal completion",
     )
     .await;
-    scope.handle_construction_disposed(child, panic);
+    scope.handle_construction_disposed(child);
 
     assert!(
         scope.supervisor.lifecycle().startup_complete(),

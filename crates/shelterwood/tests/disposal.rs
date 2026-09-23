@@ -352,8 +352,11 @@ async fn panicking_unread_messages_are_all_disposed_without_reclassifying_the_ac
     assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
 
+/// A retained factory is membership-owned, not incarnation-owned, so its
+/// destructor panic is a disposal fault outside every verdict (SPEC §8): it is
+/// contained on the disposal lane and never reclassifies the published exit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn factory_capture_destructor_panics_are_isolated_classified_and_independent() {
+async fn factory_capture_destructor_panics_are_contained_without_reclassifying_the_exit() {
     let drops = Arc::new(AtomicUsize::new(0));
     let mut tree = Tree::new();
     let first = tree
@@ -388,20 +391,16 @@ async fn factory_capture_destructor_panics_are_isolated_classified_and_independe
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(drops.load(Ordering::SeqCst), 2);
 
-    let first_exit = first.wait().await;
-    assert!(matches!(
-        first_exit.kind(),
-        ExitKind::Panicked { message } if message.as_deref() == Some("first factory destructor")
-    ));
-    let second_exit = second.wait().await;
-    assert!(matches!(
-        second_exit.kind(),
-        ExitKind::Panicked { message } if message.as_deref() == Some("second factory destructor")
-    ));
+    for exit in [first.wait().await, second.wait().await] {
+        assert!(
+            matches!(exit.kind(), ExitKind::Completed),
+            "a factory destructor panic must not reclassify the exit: {exit:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn non_string_factory_destructor_panic_remains_a_panic_exit() {
+async fn non_string_factory_destructor_panic_is_contained_without_reclassifying_the_exit() {
     let mut tree = Tree::new();
     let task = tree
         .add_task(
@@ -420,14 +419,11 @@ async fn non_string_factory_destructor_panic_remains_a_panic_exit() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("task starts");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
-    assert!(matches!(
-        task.wait().await.kind(),
-        ExitKind::Panicked { message: None }
-    ));
+    assert!(matches!(task.wait().await.kind(), ExitKind::Completed));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn factory_capture_destructor_panic_is_classified_during_shutdown() {
+async fn factory_capture_destructor_panic_is_contained_during_shutdown() {
     let drops = Arc::new(AtomicUsize::new(0));
     let mut tree = Tree::new();
     let task = tree
@@ -455,11 +451,11 @@ async fn factory_capture_destructor_panic_is_classified_during_shutdown() {
         .expect("factory destruction stays off the scope driver");
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     let exit = task.wait().await;
-    assert!(matches!(
-        exit.kind(),
-        ExitKind::Panicked { message }
-            if message.as_deref() == Some("shutdown factory destructor")
-    ));
+    assert!(
+        matches!(exit.kind(), ExitKind::Completed),
+        "a factory destructor panic must not reclassify the exit: {exit:?}"
+    );
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -832,7 +828,7 @@ async fn unadmitted_removal_completes_after_blocking_definition_disposal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restart_window_removal_joins_factory_disposal_before_terminality() {
+async fn restart_window_removal_publishes_terminality_before_factory_release() {
     let gate = DestructorGate::default();
     let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
     let mut tree = DynamicTree::new();
@@ -872,15 +868,19 @@ async fn restart_window_removal_joins_factory_disposal_before_terminality() {
     poll_pending(&mut removal).await;
     wait_for_destructor(&gate).await;
     assert_disposed_off_current(&mut drops, "factory disposal reports its thread").await;
-    poll_pending(&mut removal).await;
-    let mut terminal = Box::pin(task.wait());
-    poll_pending(&mut terminal).await;
-
-    gate.release();
+    // The exit is final at dispatch: exit-awaiting surfaces resolve while
+    // the factory's destruction is still blocked (SPEC §9). Removal is the
+    // release edge, so it keeps waiting for that destruction.
+    let terminal = tokio::time::timeout(POLL_TIMEOUT, task.wait())
+        .await
+        .expect("wait() resolves before the factory is released");
     assert!(matches!(
-        terminal.await.kind(),
+        terminal.kind(),
         ExitKind::Failed(error) if error.to_string() == "restart me"
     ));
+    poll_pending(&mut removal).await;
+
+    gate.release();
     assert_eq!(removal.await, RemoveOutcome::Removed);
     system
         .shutdown(Duration::from_secs(1))
@@ -1073,7 +1073,7 @@ async fn startup_rollback_detaches_never_started_one_shot_state_after_escalation
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn startup_rollback_joins_never_started_disposal_before_terminality() {
+async fn startup_rollback_publishes_never_started_terminality_before_disposal() {
     let gate = DestructorGate::default();
     let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
     let mut tree = Tree::new();
@@ -1103,19 +1103,19 @@ async fn startup_rollback_joins_never_started_disposal_before_terminality() {
     poll_pending(&mut rollback).await;
     wait_for_destructor(&gate).await;
     assert_disposed_off_current(&mut drops, "one-shot state reports its thread").await;
+    // The never-started suffix publishes its terminal at dispatch; only the
+    // scope's drained test waits for the state's destruction (SPEC §9).
+    let terminal = tokio::time::timeout(POLL_TIMEOUT, completion.wait())
+        .await
+        .expect("the never-started terminal publishes before its disposal completes");
+    assert!(matches!(
+        terminal.expect_err("the ordered suffix never ran").kind(),
+        ExitKind::NeverStarted
+    ));
     poll_pending(&mut rollback).await;
-    let mut terminal = Box::pin(completion.wait());
-    poll_pending(&mut terminal).await;
 
     gate.release();
     assert!(rollback.await.is_err(), "startup failure is preserved");
-    assert!(matches!(
-        terminal
-            .await
-            .expect_err("the ordered suffix never ran")
-            .kind(),
-        ExitKind::NeverStarted
-    ));
 }
 
 #[tokio::test]

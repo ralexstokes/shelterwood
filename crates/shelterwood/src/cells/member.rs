@@ -357,7 +357,7 @@ impl MemberCell {
     /// reads.
     ///
     /// * A marker load that observes the *clear* synchronizes with the store the
-    ///   driver issues after `terminalize_child` published
+    ///   driver issues after `publish_terminal` published
     ///   `MemberStage::Terminal`, so the sampler's following record read is
     ///   ordered after that publication. It cannot pair a stale nonterminal
     ///   projection with an already-cleared marker.

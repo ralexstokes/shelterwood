@@ -737,20 +737,6 @@ pub fn classify_exit(
     )
 }
 
-/// Adds a destructor panic to an already-classified exit without erasing an
-/// earlier panic, which has equal diagnostic precedence and happened first.
-/// The discarded exit remains owned by the caller for venue-safe retirement;
-/// framework callers use
-/// the façade's `classify_disposal_panic_retaining` wrapper.
-pub fn classify_disposal_panic(exit: Exit, message: Option<String>) -> (Exit, Exit) {
-    let Exit { kind, cancellation } = exit;
-    let (selected, discarded) = prefer_earlier(kind, ExitKind::Panicked { message });
-    (
-        Exit::from_kind(selected, cancellation),
-        Exit::from_kind(discarded, cancellation),
-    )
-}
-
 /// Diagnostic precedence shared by provisional and final exit evidence.
 ///
 /// Variant order is weakest to strongest so derived ordering selects the
@@ -813,9 +799,9 @@ mod tests {
     use super::{
         Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase, IntensityTrip, JoinOutcome,
         RecordedOutcome, StartupError, StartupFailure, StartupFailureCause, StopReason,
-        classify_disposal_panic, classify_exit, exit_kind_eq, prefer_earlier,
-        reconcile_recorded_outcomes, stop_reason_into_nested_result, stop_reason_precedence,
-        stop_reason_root_exit, structured_intensity_trip_error, structured_startup_failure_error,
+        classify_exit, exit_kind_eq, prefer_earlier, reconcile_recorded_outcomes,
+        stop_reason_into_nested_result, stop_reason_precedence, stop_reason_root_exit,
+        structured_intensity_trip_error, structured_startup_failure_error,
     };
 
     fn exit(kind: ExitKind, cancellation: Cancellation) -> Exit {
@@ -1225,58 +1211,6 @@ mod tests {
             assert_eq!(classified, expected, "{case}");
             assert_eq!(discarded, expected_discarded, "{case}: discarded exit");
         }
-    }
-
-    #[test]
-    fn disposal_panic_uses_exit_precedence_and_preserves_cancellation() {
-        let (classified, discarded) = classify_disposal_panic(
-            Exit::completed(Cancellation::Observed),
-            Some("destructor".to_owned()),
-        );
-        assert_eq!(
-            classified,
-            exit(
-                ExitKind::Panicked {
-                    message: Some("destructor".to_owned())
-                },
-                Cancellation::Observed
-            )
-        );
-        assert_eq!(discarded, Exit::completed(Cancellation::Observed));
-
-        let deadline = Instant::now() + Duration::from_secs(1);
-        for weaker in [
-            ExitKind::Failed(ExitError::message("failed")),
-            ExitKind::ReadinessTimedOut { deadline },
-        ] {
-            let weaker = exit(weaker, Cancellation::NotObserved);
-            let (classified, discarded) =
-                classify_disposal_panic(weaker.clone(), Some("destructor".to_owned()));
-            assert_eq!(
-                classified,
-                exit(
-                    ExitKind::Panicked {
-                        message: Some("destructor".to_owned())
-                    },
-                    Cancellation::NotObserved
-                )
-            );
-            assert_eq!(discarded, weaker);
-        }
-
-        let earlier = exit(
-            ExitKind::Panicked {
-                message: Some("task".to_owned()),
-            },
-            Cancellation::NotObserved,
-        );
-        let (classified, discarded) =
-            classify_disposal_panic(earlier.clone(), Some("destructor".to_owned()));
-        assert_eq!(classified, earlier);
-        assert_eq!(
-            discarded,
-            Exit::panicked(Some("destructor".to_owned()), Cancellation::NotObserved)
-        );
     }
 
     #[test]

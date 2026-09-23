@@ -366,6 +366,18 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
             .await
             .expect("auto-removing task admission");
         automatic.wait().await;
+        // `wait()` resolves at terminal publication; pruning follows the
+        // release edge, once the factory's destruction has completed on the
+        // blocking pool (SPEC §9).
+        let empty = RuntimeStorage {
+            children: 0,
+            child_slots: 0,
+            deadlines: 0,
+            deadline_slots: 0,
+        };
+        while cell.runtime_storage() != empty {
+            crate::runtime::yield_now().await;
+        }
         assert_eq!(
             cell.runtime_storage(),
             RuntimeStorage {
@@ -1103,13 +1115,13 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
     )
     .await
     .dispatch(&mut scope);
-    let (child, panic) = recv_construction_disposed(
+    let child = recv_construction_disposed(
         &mut scope.disposal_event_receiver,
         DRIVER_PROGRESS_WAIT,
         "retained construction disposal completes",
     )
     .await;
-    scope.handle_construction_disposed(child, panic);
+    scope.handle_construction_disposed(child);
     assert_eq!(
         removal_response.receive().await,
         Some(RemoveOutcome::Removed)
@@ -1525,7 +1537,7 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
     )
     .await
     .dispatch(&mut scope);
-    assert!(scope.children[key].pending_terminal.is_some());
+    assert!(scope.supervisor.is_disposing(key));
 
     if let Some(response) = &mut removal_response {
         assert_eq!(
@@ -1535,14 +1547,14 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
         );
     }
 
-    let (child, panic) = recv_construction_disposed(
+    let child = recv_construction_disposed(
         &mut scope.disposal_event_receiver,
         DRIVER_PROGRESS_WAIT,
         "retained construction disposal completes",
     )
     .await;
     assert_eq!(child, key);
-    scope.handle_construction_disposed(child, panic);
+    scope.handle_construction_disposed(child);
 
     assert!(scope.children.get(key).is_none());
     assert!(root.snapshot().child("worker").is_none());
@@ -1712,12 +1724,12 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     .await;
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
-    let (child, panic) = recv_construction_disposed(
+    let child = recv_construction_disposed(
         &mut scope.disposal_event_receiver,
         DRIVER_PROGRESS_WAIT,
         "removal joins retained construction disposal",
     )
     .await;
-    scope.handle_construction_disposed(child, panic);
+    scope.handle_construction_disposed(child);
     assert!(scope.children.get(key).is_none());
 }

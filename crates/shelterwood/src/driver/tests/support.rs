@@ -118,13 +118,13 @@ pub(super) async fn recv_construction_disposed(
     receiver: &mut crate::runtime::UnboundedMpscReceiver<DriverEvent>,
     timeout: Duration,
     expectation: &str,
-) -> (ChildKey, Option<crate::runtime::DisposalPanic>) {
-    let ChildEvent::ConstructionDisposed { child, panic } =
+) -> ChildKey {
+    let ChildEvent::ConstructionDisposed { child } =
         recv_child_event(receiver, timeout, expectation).await
     else {
         panic!("expected {expectation}")
     };
-    (child, panic)
+    child
 }
 
 pub(super) use super::super::{
@@ -134,10 +134,9 @@ pub(super) use super::super::{
     ResidentProjection, RetainedRecordedOutcome, RuntimeStorage, ScopeCell, ScopeControlEvent,
     ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, ScopeRuntimeTestWiring,
     StartupDisposition, cancel_dynamic_reservation, child::dispatch_child_construction_for_test,
-    discharge_child_terminality, events::collect_driver_events, monitor_root_driver,
-    nested_scope_start, report_slot, reserve_dynamic, resident_projection, restart_shutdown_work,
-    run_nested_factory, run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation,
-    wait_for_scope_wake,
+    discharge_child_terminality, monitor_root_driver, nested_scope_start, report_slot,
+    reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
+    run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation, wait_for_scope_wake,
 };
 
 pub(super) async fn begin_admission(

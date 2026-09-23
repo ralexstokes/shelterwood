@@ -184,7 +184,7 @@ Two conventions that are not the rule itself but travel with it: panicking
 while holding a mutex the codebase `.expect()`s poisons it for every later
 caller, so compute the verdict, release, *then* panic (`MailboxCell::bind` is
 the pattern; where releasing is impossible, `debug_assert!` instead, as
-`MailboxState::take_waiters` does). And a value that may block on destruction
+`MailboxState::take_waiters` does, and see "Impossible states" below). And a value that may block on destruction
 goes to `runtime::dispose_detached`, not merely past the unlock. That second
 convention is currently met for mailbox payloads, construction closures,
 blocking-offload captured state, displaced resident graphs, and rejected
@@ -203,6 +203,25 @@ Reviewing a new `.lock()` is one pass: name every value the critical section
 can destroy, every callback it can invoke, and every panic it can raise. If
 any of those is user code, hand it to a transaction (`txn.defer`), an effects
 struct, or the caller.
+
+## Impossible states
+
+Classify a defensive check by what makes its state impossible.
+
+- **Types or ownership** (an owned token, a monotonic mint, a value just
+  read under the same lock): delete the check. No `debug_assert!` stands in.
+  If a structural `Option` must still be unwrapped, `.expect()` it outside
+  any framework lock.
+- **Protocol or lock order only**: `debug_assert!` plus the cheapest release
+  behaviour that is safe on its own (return, no-op, treat as terminal). A
+  debug assertion is never load-bearing, and the release path never panics
+  under a framework mutex — compute the verdict, release, then act. No
+  diagnostic lanes, no effect variants, no tests.
+- **Spec-mandated** (B.8's fail-closed outcomes, for example): keep, with
+  tests.
+
+A test that needs a hook to reach a state pins complexity rather than
+behaviour; delete it with its hook.
 
 ## Runtime naming
 

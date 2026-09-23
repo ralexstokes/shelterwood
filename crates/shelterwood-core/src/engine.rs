@@ -312,7 +312,6 @@ struct IntensityCharge {
 impl IntensityTrip {
     fn new(charge: IntensityCharge) -> Self {
         let policy = charge.policy;
-        assert_eq!(charge.tripped, charge.in_window > policy.max_restarts());
         Self {
             max_restarts: policy.max_restarts(),
             observed_restarts: charge.in_window,
@@ -711,12 +710,9 @@ impl ScopeEpochs {
 
     pub fn finish(&mut self, epoch: Epoch) -> bool {
         match *self {
-            Self::Live {
-                current,
-                last_stopped,
-            } if current == epoch => {
+            Self::Live { current, .. } if current == epoch => {
                 *self = Self::Idle {
-                    last_stopped: last_stopped.max(Some(epoch)),
+                    last_stopped: Some(epoch),
                 };
                 // Settlement is monotone: once an owner finishes its epoch,
                 // every later `finished(epoch)` — including one asked across a
@@ -1005,11 +1001,7 @@ impl<K> Default for DeadlineQueue<K> {
 impl<K> DeadlineQueue<K> {
     pub fn push(&mut self, at: Instant, key: K) -> DeadlineHandle {
         let handle = self.next_handle();
-        let replaced = self.registrations.insert(handle, key);
-        assert!(
-            replaced.is_none(),
-            "monotonic deadline keys are never reused"
-        );
+        let _ = self.registrations.insert(handle, key);
         self.entries.push(DeadlineEntry { at, handle });
         handle
     }

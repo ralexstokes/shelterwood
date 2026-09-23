@@ -207,19 +207,17 @@ impl SharedOffloadState {
     ) -> Option<OffloadFuture> {
         let mut state = self.state.lock().expect("offload future mutex poisoned");
         state.polling = false;
-        if outcome == OffloadPoll::Pending && !state.cancelled {
-            if state.future.is_none() {
-                state.future = Some(future);
-                None
-            } else {
-                // A duplicate poll completion cannot overwrite and destroy
-                // the already-retained user future under this mutex. Return
-                // the duplicate to the caller's disposal path instead.
-                Some(future)
-            }
-        } else {
-            Some(future)
+        let duplicate = state.future.is_some();
+        if outcome == OffloadPoll::Pending && !state.cancelled && !duplicate {
+            state.future = Some(future);
+            return None;
         }
+        drop(state);
+        debug_assert!(
+            !duplicate,
+            "only the poller that took the offload future completes a poll"
+        );
+        Some(future)
     }
 
     fn record(&self, payload: PanicPayload) {

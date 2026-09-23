@@ -231,7 +231,7 @@ async fn run_receiver(
             yield_now().await;
             continue;
         };
-        let message = if pass % 3 == 0 {
+        let message = if pass.is_multiple_of(3) {
             active.try_recv_live_through(active.accepted_sequence())
         } else {
             active.try_recv()
@@ -249,7 +249,7 @@ async fn run_receiver(
         }
         // Keep the receiver slower than the senders so queues fill, senders
         // park, and closes find unread payload.
-        if pass % 2 == 0 {
+        if pass.is_multiple_of(2) {
             yield_now().await;
         }
     }
@@ -264,12 +264,12 @@ async fn run_controller(
     let (_, mut incarnations) = mint_actor_membership();
     let mut token = configure(&mailbox, policy);
     let terminate_at = SENDERS * MESSAGES_PER_SENDER * TERMINATE_AFTER_PERCENT / 100;
-    for cycle in 0.. {
+    for cycle in 0usize.. {
         let incarnation = incarnations.mint().expect("incarnation available");
         bind(&mailbox, token, incarnation);
         *current.lock().expect("current incarnation mutex") = Some(incarnation);
         yields(8 + (cycle as u64 % 7) * 4).await;
-        if cycle % 2 == 0 {
+        if cycle.is_multiple_of(2) {
             freeze(&mailbox, incarnation);
             yields(4).await;
         }

@@ -669,6 +669,7 @@ impl Default for JitterRng {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // raw-waker test doubles
 mod tests {
     use std::{
         mem::ManuallyDrop,

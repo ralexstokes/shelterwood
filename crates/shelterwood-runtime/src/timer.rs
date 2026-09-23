@@ -128,6 +128,7 @@ where
     timeout_at(deadline, future).await
 }
 #[cfg(test)]
+#[allow(unsafe_code)] // raw-waker test doubles
 mod tests {
     use std::{
         future::Future,

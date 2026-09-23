@@ -1,3 +1,4 @@
+#[allow(unsafe_code)] // raw-waker probes
 mod waker;
 
 pub(crate) use waker::{probe_waker, probe_waker_with_wake};

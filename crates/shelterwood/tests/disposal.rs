@@ -1202,7 +1202,7 @@ async fn ordered_teardown_with_out_of_order_disposal(release: FirstRelease) {
     let first = starts.recv().await.expect("first task starts");
     system.wait_started().await.expect("ordered root starts");
     wait_for_destructor(&middle_gate).await;
-    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(1)));
+    let shutdown = tokio::spawn(system.shutdown(SHUTDOWN_BUDGET));
     wait_for_destructor(&last_gate).await;
     assert!(
         !first.is_cancelled(),

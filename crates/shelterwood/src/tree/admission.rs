@@ -234,9 +234,11 @@ impl<H> Drop for Admission<H> {
 /// invariant failure — debug builds panic and release builds resolve
 /// [`RemoveOutcome::Removed`]: the removal latched at the call, and its route
 /// becoming terminal satisfies the removal goal (SPEC B.8).
+/// Once complete, further polls return `Pending`, as on [`Admission`].
 #[must_use]
 pub struct Removal {
     inner: DisposingReceiver<RemoveOutcome>,
+    done: bool,
 }
 
 impl fmt::Debug for Removal {
@@ -249,6 +251,7 @@ impl Removal {
     pub(super) fn new(response: crate::driver::RemovalResponse) -> Self {
         Self {
             inner: DisposingReceiver::new(response),
+            done: false,
         }
     }
 }
@@ -257,14 +260,17 @@ impl Future for Removal {
     type Output = RemoveOutcome;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        self.inner.poll_receive(context).map(|result| {
-            fail_closed(
-                result,
-                LATCHED_REMOVAL_OUTCOME,
-                cfg!(debug_assertions),
-                "removal",
-            )
-        })
+        if self.done {
+            return Poll::Pending;
+        }
+        let response = std::task::ready!(self.inner.poll_receive(context));
+        self.done = true;
+        Poll::Ready(fail_closed(
+            response,
+            LATCHED_REMOVAL_OUTCOME,
+            cfg!(debug_assertions),
+            "removal",
+        ))
     }
 }
 
@@ -356,6 +362,30 @@ mod tests {
                 Ok(Poll::Ready(crate::RemoveOutcome::Removed))
             ));
         }
+    }
+
+    #[test]
+    fn completed_admission_and_removal_stay_pending_when_polled_again() {
+        let mut context = Context::from_waker(Waker::noop());
+
+        let mut admission = Admission::<()>::error(crate::ReserveError::EmptyId);
+        assert!(matches!(
+            Pin::new(&mut admission).poll(&mut context),
+            Poll::Ready(Err(crate::ReserveError::EmptyId))
+        ));
+        assert!(Pin::new(&mut admission).poll(&mut context).is_pending());
+
+        let (sender, response) = crate::runtime::oneshot();
+        assert!(sender.send(crate::RemoveOutcome::AlreadyAbsent).is_ok());
+        let mut removal = Removal::new(response);
+        assert_eq!(
+            Pin::new(&mut removal).poll(&mut context),
+            Poll::Ready(crate::RemoveOutcome::AlreadyAbsent)
+        );
+        assert!(
+            Pin::new(&mut removal).poll(&mut context).is_pending(),
+            "a completed removal neither panics nor reports a second outcome"
+        );
     }
 
     #[crate::runtime::test]

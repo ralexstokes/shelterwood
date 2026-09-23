@@ -792,3 +792,25 @@ async fn system_shutdown_joins_root_driver_teardown() {
         "shutdown returns only after root driver teardown drops dynamic state"
     );
 }
+
+#[test]
+fn epoch_guard_unwind_retires_the_epoch_despite_poisoned_control() {
+    let root = Arc::clone(&Tree::new().lower_for_test().root);
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
+    root.poison_control();
+
+    // A strict control lock in the guard's drop would panic inside this
+    // unwind and abort the process instead of returning `Err`.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _epoch = epoch;
+        panic!("unwind through the scope epoch guard");
+    }))
+    .expect_err("the fixture unwinds through the guard");
+
+    assert!(matches!(
+        root.snapshot().state,
+        ScopeState::Stopped {
+            reason: StopReason::ShutdownRequested
+        }
+    ));
+}

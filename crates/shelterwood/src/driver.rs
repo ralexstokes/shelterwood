@@ -1218,8 +1218,10 @@ impl ScopeEpochGuard {
 impl Drop for ScopeEpochGuard {
     fn drop(&mut self) {
         if let Some(epoch) = self.epoch.take() {
+            // Drop runs on unwind paths, so a poisoned control mutex must not
+            // turn this retirement into a second panic.
             self.scope
-                .finish_incarnation(epoch, StopReason::ShutdownRequested);
+                .finish_incarnation_ignoring_poison(epoch, StopReason::ShutdownRequested);
         }
     }
 }

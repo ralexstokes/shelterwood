@@ -94,7 +94,7 @@ pub mod policy {
         Backoff, BackoffFactor, DefaultsInheritance, ExponentialBackoff, FixedBackoff, Intensity,
         Jitter, JitterSample, Mailbox, MailboxShutdown, NonZeroDuration, PolicyError, Readiness,
         ReadinessDeadline, RestartAttempt, RestartCondition, RestartCount, RestartPolicy,
-        Retention, ScopeDefaults, ScopeFlavor, Shutdown, Strategy, TotalRestarts,
+        Retention, ScopeDefaults, Shutdown, TotalRestarts,
     };
 }
 
@@ -104,12 +104,16 @@ pub mod policy {
 /// ([`crate::ScopeSnapshot`]) and the lifecycle history ([`crate::LifecycleEvents`]);
 /// the identities they report ([`crate::Membership`], [`crate::Incarnation`],
 /// [`crate::ChildId`]) come with them because a reader almost always keys on one.
+/// [`crate::ScopeFlavor`] and [`crate::Strategy`] live here rather than in
+/// [`policy`]: no declaration takes them, and a program meets them only as
+/// fields of a [`crate::ScopeSnapshot`].
 pub mod observe {
     #[doc(no_inline)]
     pub use crate::{
         ChildId, ChildSnapshot, ChildState, Incarnation, LifecycleEvent, LifecycleEventKind,
         LifecycleEvents, LifecycleItem, LifecycleSeq, LifecycleTryRecvError, Membership,
-        MembershipStatus, ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver, WaitError,
+        MembershipStatus, ScopeFlavor, ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver,
+        Strategy, WaitError,
     };
 }
 
@@ -135,12 +139,14 @@ pub mod errors {
 /// A [`crate::RawActor`] owns its receive loop instead of returning to a callback
 /// dispatcher. The offload machinery in this bundle is shared with
 /// callback actors, so a file that leases work out without writing a raw
-/// loop still wants it.
+/// loop still wants it. [`crate::CancellationToken`] is the argument every
+/// `run_blocking` closure receives and what the contexts' shutdown and abort
+/// token accessors return.
 pub mod raw {
     #[doc(no_inline)]
     pub use crate::{
-        Blocking, DeadlineBudget, DeadlineElapsed, Guard, Handler, RawActor, RawContext, RawDef,
-        RawOnceDef, Rejected,
+        Blocking, CancellationToken, DeadlineBudget, DeadlineElapsed, Guard, Handler, RawActor,
+        RawContext, RawDef, RawOnceDef, Rejected,
     };
 }
 

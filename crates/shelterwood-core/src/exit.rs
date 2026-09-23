@@ -327,24 +327,26 @@ impl fmt::Display for StartupFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.cause {
             StartupFailureCause::Child { id, exit, .. } => {
-                write!(formatter, "child `{id}` failed during startup: ")?;
+                write!(formatter, "child `{id}` failed during startup")?;
                 match exit.kind() {
-                    ExitKind::Completed => formatter.write_str("completed before readiness"),
-                    ExitKind::Failed(error) => error.fmt(formatter),
+                    ExitKind::Completed => formatter.write_str(": completed before readiness"),
+                    // The application error is this failure's `source()`, so
+                    // naming it here would print it twice in an error chain.
+                    ExitKind::Failed(_) => Ok(()),
                     ExitKind::Panicked {
                         message: Some(message),
-                    } => write!(formatter, "panicked: {message}"),
-                    ExitKind::Panicked { message: None } => formatter.write_str("panicked"),
+                    } => write!(formatter, ": panicked: {message}"),
+                    ExitKind::Panicked { message: None } => formatter.write_str(": panicked"),
                     ExitKind::ReadinessTimedOut { deadline } => {
-                        write!(formatter, "readiness deadline expired at {deadline:?}")
+                        write!(formatter, ": readiness deadline expired at {deadline:?}")
                     }
                     ExitKind::Aborted {
                         phase: GracePhase::WithinGrace,
-                    } => formatter.write_str("aborted within shutdown grace"),
+                    } => formatter.write_str(": aborted within shutdown grace"),
                     ExitKind::Aborted {
                         phase: GracePhase::AfterGrace,
-                    } => formatter.write_str("aborted after shutdown grace"),
-                    ExitKind::NeverStarted => formatter.write_str("never started"),
+                    } => formatter.write_str(": aborted after shutdown grace"),
+                    ExitKind::NeverStarted => formatter.write_str(": never started"),
                 }
             }
             StartupFailureCause::Lowering { undefined } => {
@@ -801,7 +803,10 @@ pub struct ShutdownTimeout {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        error::Error,
+        time::{Duration, Instant},
+    };
 
     use crate::identity::ScopeIdentity;
 
@@ -845,7 +850,7 @@ mod tests {
             ),
             (
                 ExitKind::Failed(ExitError::message("application failure")),
-                "child `worker` failed during startup: application failure".to_owned(),
+                "child `worker` failed during startup".to_owned(),
             ),
             (
                 ExitKind::Panicked {
@@ -892,6 +897,43 @@ mod tests {
 
             assert_eq!(failure.to_string(), expected);
         }
+    }
+
+    #[test]
+    fn startup_failure_chain_renders_each_cause_once() {
+        let mut identity = ScopeIdentity::new();
+        let mut child_failure = |id: &str, error: ExitError| StartupFailure {
+            cause: StartupFailureCause::Child {
+                id: ChildId::from(id),
+                membership: identity
+                    .mint_membership(&ChildId::from(id))
+                    .expect("membership available")
+                    .membership(),
+                exit: exit(ExitKind::Failed(error), Cancellation::NotObserved),
+            },
+        };
+        // A nested scope whose own startup failed carries the structured
+        // failure as its application error, so the chain recurses.
+        let inner = child_failure("worker", ExitError::message("disk full"));
+        let outer = child_failure("nested", structured_startup_failure_error(inner));
+        let startup = StartupError::StartupFailed(outer);
+
+        let mut links = Vec::new();
+        let mut next: Option<&(dyn Error + 'static)> = Some(&startup);
+        while let Some(error) = next {
+            links.push(error.to_string());
+            next = error.source();
+        }
+
+        assert_eq!(
+            links,
+            [
+                "tree startup failed",
+                "child `nested` failed during startup",
+                "child `worker` failed during startup",
+                "disk full",
+            ]
+        );
     }
 
     #[test]

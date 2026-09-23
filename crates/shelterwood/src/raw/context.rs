@@ -1093,18 +1093,19 @@ impl<M: Send + 'static> RawContext<M> {
     /// [`try_recv`](Self::try_recv) bypasses this selector and drains the
     /// accepted prefix directly according to the caller's shutdown policy.
     fn next_ready(&mut self) -> Option<M> {
-        let message = self.select_ready()?;
+        let message = self.select_ready();
         // Selection itself runs incarnation-owned disposal — a cancelled
         // completion, a fired one-shot timer's key — after this call's last
         // loop-top check. SPEC §6.2 fails the incarnation on a disposal panic
-        // retained when a receive boundary is reached, so resume it instead
-        // of delivering. The selected message goes through the funnel first
-        // so its destructor never runs on the unwind.
+        // retained when a receive boundary is reached, even if selection found
+        // no message, so resume it before returning or waiting again. Any selected
+        // message goes through the funnel first so its destructor never runs
+        // on the unwind.
         if let Some(panic) = self.resources.disposal.panic.take() {
             self.resources.disposal.dispose(message);
             runtime::resume_panic(panic);
         }
-        Some(message)
+        message
     }
 
     fn select_ready(&mut self) -> Option<M> {
@@ -2215,11 +2216,8 @@ mod tests {
             }),
         });
 
-        assert_eq!(
-            context.try_recv(),
-            None,
-            "a completion cancelled after queueing does not deliver a message"
-        );
+        let payload = catch_unwind(AssertUnwindSafe(|| context.try_recv()))
+            .expect_err("an empty receive must surface selection's disposal panic");
         assert_eq!(
             invoked.load(Ordering::SeqCst),
             0,
@@ -2230,12 +2228,7 @@ mod tests {
             1,
             "the queued completion is disposed at materialization time"
         );
-        let payload = context
-            .resources
-            .disposal
-            .panic
-            .take()
-            .expect("the hostile event destructor is retained by raw disposal");
+        assert!(context.resources.disposal.panic.take().is_none());
         assert_eq!(
             panic_message(&payload),
             Some("contained raw payload destructor panic")

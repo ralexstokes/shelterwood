@@ -13,7 +13,7 @@ use std::{
 
 use crate::runtime::{ActorWork, Latch, PanicAccumulator, PanicPayload, catch_panic};
 
-use super::disposal::{PanicSlot, RawDisposal};
+use super::disposal::{Contained, PanicSlot, RawDisposal};
 
 type OffloadFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type SharedWork = Arc<SharedOffloadState>;
@@ -213,11 +213,12 @@ impl SharedOffloadState {
             return None;
         }
         drop(state);
+        let future = Contained::new(future, self.disposal.clone());
         debug_assert!(
             !duplicate,
             "only the poller that took the offload future completes a poll"
         );
-        Some(future)
+        Some(future.into_inner())
     }
 
     fn record(&self, payload: PanicPayload) {

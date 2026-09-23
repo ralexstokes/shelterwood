@@ -23,10 +23,10 @@ pub enum BuildError {
     ///
     /// Only the runtime's presence is checked. It must also have its time
     /// driver enabled (Tokio's `enable_time`, or `enable_all`): a runtime
-    /// without timers is not detected here. The tree spawns, the first
-    /// framework timer (typically armed during startup) panics inside a
-    /// framework task, and the failure surfaces as an unrelated startup or
-    /// shutdown outcome rather than as this variant.
+    /// without timers is not detected here. A timer-backed operation panics
+    /// when first polled, which may happen in a framework task or in the
+    /// caller's future (for example, during shutdown), rather than returning
+    /// this variant.
     #[error("no ambient Tokio runtime is available")]
     NoRuntime,
     /// One or more reserved slots were left undefined.

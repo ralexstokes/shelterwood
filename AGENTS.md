@@ -111,20 +111,21 @@ rests on:
   unrepresentable. No runtime capability is installed per object: the
   mailbox, reply channels and deadline futures reach the adapter through
   `crate::runtime` by static dispatch, like every other façade layer.
-  `WakerProxy` and its `retire_with` seam ride with them: the proxy is a
-  public doc-hidden cross-crate type whose `retire_with` takes a
-  caller-supplied `fn(Waker)`, but the effect is queued under the proxy's
-  leaf mutex and invoked only after unlock, so no foreign code runs under
-  the lock. The same `fn(Waker)` disposer is `WakerAction::Run` and the
-  argument of `ProxiedSleep::new`, and it is the only runtime service core
-  names; the adapter supplies `dispose_waker`, its detached disposal lane,
-  and it runs only from the post-unlock flush.
-  `ProxiedPoll`, the probe/register/re-poll state machine that wraps it,
-  rides under the same ruling: its `poll` takes caller-supplied
-  closures, but they are invoked only with no proxy mutex held, and its
-  ready-edge retirement flushes the stored caller waker through the same
-  post-unlock effects path. The supported façade re-exports neither type
-  nor anything that could install one.
+  `WakerProxy` is private to core's `waker_proxy` module and needs no
+  exemption of its own. Its one owner, `ProxiedPoll`, the
+  probe/register/re-poll state machine, is the only waker-proxy item core
+  exports. It is a public doc-hidden cross-crate type because the adapter's
+  proxied poll and the façade's reply receiver both drive it, and it rides
+  with the seams above. Its `poll` takes caller-supplied closures, but they
+  are invoked only with no proxy mutex held. Its single `retire` takes a
+  `WakerAction`, which may be `WakerAction::Run` with a caller-supplied
+  `fn(Waker)`. That action is queued under the proxy's leaf mutex, and
+  `retire` itself flushes it after unlock, so no foreign code runs under the
+  lock. Ready-edge retirement takes the same path. The same `fn(Waker)`
+  disposer is the argument of `ProxiedSleep::new`, and it is the only runtime
+  service core names; the adapter supplies `dispose_waker`, its detached
+  disposal lane. The supported façade re-exports neither `ProxiedPoll` nor
+  anything that could install one.
   `MailboxEffectSink` is the sharpest case: the framework calls
   `defer_mailbox_effect` while holding both the resident-tree observation gate
   and `MemberCell::mailbox`. It and `MailboxEffectQueue` are crate-private, so
@@ -145,7 +146,8 @@ rests on:
   exception to "no user code" is the process panic hook: when native-thread
   creation is exhausted, Tokio's `spawn_blocking` panics before
   `submit_blocking_job` contains it, and the hook runs on the submitting
-  thread.
+  thread. That is accepted (SPEC §15.4) and listed for re-audit beside the
+  Tokio pin.
   Retained exits retire from drop glue, which has no sink to reach, so they
   submit in place.
 - **Nested framework locks in one direction.** The resident-tree observation

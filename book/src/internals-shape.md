@@ -134,7 +134,7 @@ enforcement:
 - **`tools/check-external-consumer.sh`** compiles a real external crate
   against the façade, then runs negative compile probes that must fail
   with specific diagnostics — including one proving that every private
-  installation seam (`MailboxControl`, `WakerProxy`, `MemberCell`, and
+  installation seam (`MailboxControl`, `ProxiedPoll`, `MemberCell`, and
   the rest of the family) is unimportable from outside.
 
 Together they state one argument in three parts: no public item reachably

@@ -2886,6 +2886,15 @@ shapes, and moving a value out (rather than dropping it in place) is the
 degenerate case. What the rule buys is that a hostile waker or destructor
 is an ordinary, testable outcome instead of a liveness failure (§16.18).
 
+One exception is accepted. A framework-retained exit retired from drop
+glue has no effects value to reach, so it submits its disposal in place,
+possibly under a lock. A submission runs no user code except under
+native-thread exhaustion: the runtime's blocking-pool spawn then panics
+before the framework contains it, and the process panic hook runs on the
+submitting thread. The framework still contains that panic, and the
+submission falls back to its retained lane; only the hook runs under the
+lock, and only in that degraded mode.
+
 That outcome is pinned, not left to the flush site. A panic raised by
 user code the framework runs after unlock is contained until the effects
 value has discharged every other queued effect, then resumed on the task

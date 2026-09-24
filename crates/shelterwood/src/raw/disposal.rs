@@ -69,6 +69,13 @@ impl<F> Drop for CatchUnwindFuture<F> {
     }
 }
 
+/// The incarnation's one record of cleanup panics.
+///
+/// First wins: every caught cleanup panic — offload work, destructors run by
+/// the disposal funnel, wakes, and each teardown step — is recorded here the
+/// moment it is caught, so arrival order is precedence and a later loser is
+/// discarded. The raw incarnation owner holds the slot and reads it from its
+/// `Drop`, which is what keeps the evidence across a hard abort.
 #[derive(Default)]
 pub(super) struct PanicSlot {
     payload: Mutex<Option<PanicPayload>>,
@@ -88,26 +95,19 @@ impl PanicSlot {
         discard_panic(rejected);
     }
 
+    /// Runs one cleanup step, recording its panic, if any, behind whatever
+    /// the slot already holds.
+    pub(super) fn run(&self, step: impl FnOnce()) {
+        if let Err(payload) = catch_panic(step) {
+            self.record(payload);
+        }
+    }
+
     pub(super) fn take(&self) -> Option<PanicPayload> {
         self.payload
             .lock()
             .expect("offload panic mutex poisoned")
             .take()
-    }
-
-    /// Restores a payload already established to precede anything that can
-    /// have reached this slot in the meantime.
-    ///
-    /// Raw-resource freeze temporarily folds slot-retained disposal failures
-    /// into its cleanup-wide accumulator. An offload task may publish another
-    /// failure before that transaction installs its winner, so ordinary
-    /// first-wins [`Self::record`] would invert the observed cleanup order.
-    pub(super) fn restore_first(&self, payload: PanicPayload) {
-        let displaced = {
-            let mut pending = self.payload.lock().expect("offload panic mutex poisoned");
-            pending.replace(payload)
-        };
-        discard_panic(displaced);
     }
 }
 

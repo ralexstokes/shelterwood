@@ -16,8 +16,8 @@ use crate::{
     cells::{CancellationToken, ParentCancellationToken},
     mailbox::{AcceptedSequence, MailboxCell, MailboxReceiver},
     runtime::{
-        self, CompletionGatedLatch, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher,
-        UnwindPanics, catch_panic, resume_preferred_panic,
+        self, CompletionGatedLatch, Latch, Signal, SignalWatcher, UnwindPanics, catch_panic,
+        resume_preferred_panic,
     },
     scope::ScopeRef,
 };
@@ -385,32 +385,17 @@ impl<M> RawResources<M> {
             return;
         }
         self.accepting = false;
-        // Treat the whole freeze as one cleanup transaction. Cancellation
-        // contains each latch wake, future disposal and task abort
-        // independently, while this outer accumulator keeps one failure from
-        // skipping later offloads or any of the collection drains.
-        let mut panics = PanicAccumulator::default();
-        // An already-retained offload failure happened before this freeze and
-        // therefore precedes every synchronous cleanup failure below.
-        panics.record(self.disposal.panic.take());
-        for offload in &mut self.offloads {
-            panics.record(offload.cancel(&self.disposal.panic));
-            panics.record(self.disposal.panic.take());
+        // Each step records its own failure in the first-wins slot, so one
+        // failure cannot skip a later step and whatever was retained before
+        // the freeze keeps precedence over what the freeze releases.
+        let slot = &self.disposal.panic;
+        for offload in &self.offloads {
+            offload.cancel(slot);
         }
-        panics.run(|| self.continuations.clear());
-        panics.record(self.disposal.panic.take());
-        panics.run(|| self.timers.clear());
-        panics.record(self.disposal.panic.take());
-        panics.run(|| self.ready_batch = None);
-        panics.record(self.disposal.panic.take());
-        panics.run(|| self.events.clear());
-        panics.record(self.disposal.panic.take());
-        if let Some(payload) = panics.take() {
-            // The owned raw-incarnation epilogue drains this slot after the
-            // freeze and before joining, so publication is delayed until all
-            // synchronous cleanup has completed without losing the diagnostic.
-            self.disposal.panic.restore_first(payload);
-        }
+        slot.run(|| self.continuations.clear());
+        slot.run(|| self.timers.clear());
+        slot.run(|| self.ready_batch = None);
+        slot.run(|| self.events.clear());
     }
 
     /// Drops ledger entries for offloads that already finished, keeping a
@@ -483,13 +468,9 @@ impl<M> RawResources<M> {
 
 impl<M> Drop for RawResources<M> {
     fn drop(&mut self) {
-        let freeze_panic = catch_panic(|| self.freeze()).err();
-        let mut panics = PanicAccumulator::default();
-        // `freeze` can transfer a destructor panic into the shared slot. Take
-        // that retained application diagnostic after cleanup and preserve it
-        // ahead of a direct framework-cleanup panic.
-        panics.record(self.disposal.panic.take());
-        panics.record(freeze_panic);
+        // Evidence stays in the slot for the incarnation owner to report.
+        let slot = Arc::clone(&self.disposal.panic);
+        slot.run(|| self.freeze());
     }
 }
 
@@ -1343,8 +1324,9 @@ impl<M: Send + 'static> RawContext<M> {
         self.resources.join_offloads().await;
     }
 
-    pub(super) fn take_resource_panic(&self) -> Option<PanicPayload> {
-        self.resources.disposal.panic.take()
+    /// The incarnation's cleanup-panic slot, shared with every resource.
+    pub(super) fn panic_slot(&self) -> Arc<PanicSlot> {
+        Arc::clone(&self.resources.disposal.panic)
     }
 }
 
@@ -2497,8 +2479,10 @@ mod tests {
             finished.push(completion);
         }
 
-        let payload = catch_unwind(AssertUnwindSafe(|| drop(resources)))
-            .expect_err("the first destructor panic is surfaced");
+        let slot = Arc::clone(&resources.disposal.panic);
+        catch_unwind(AssertUnwindSafe(|| drop(resources)))
+            .expect("drop leaves cleanup evidence in the slot");
+        let payload = slot.take().expect("the first destructor panic is retained");
         assert_eq!(
             panic_message(&payload),
             Some("unit offload destructor panic")
@@ -2609,8 +2593,12 @@ mod tests {
             "the freeze transition is one-shot"
         );
 
-        let payload = catch_unwind(AssertUnwindSafe(|| drop(resources)))
-            .expect_err("drop resumes the failure retained by the first freeze");
+        let slot = Arc::clone(&resources.disposal.panic);
+        catch_unwind(AssertUnwindSafe(|| drop(resources)))
+            .expect("drop leaves cleanup evidence in the slot");
+        let payload = slot
+            .take()
+            .expect("the failure retained by the first freeze survives drop");
         assert_eq!(
             panic_message(&payload),
             Some("contained raw payload destructor panic")

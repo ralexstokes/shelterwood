@@ -12,7 +12,7 @@ use crate::common::{
     POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, advance_time, assert_eventually,
     assert_eventually_frozen, assert_quiet,
     policy::never,
-    poll_once,
+    poll_once, startup_failed_child,
     waiting::{
         liveness_probe, liveness_probed_waiting_task, signalled_waiting_once_task,
         signalled_waiting_task, task as waiting_task, tree as waiting_tree,
@@ -20,10 +20,10 @@ use crate::common::{
 };
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, Cancellation, ChildState, Context as ActorContext,
-    DynamicScopeRef, DynamicTree, ExitError, ExitKind, ExitResult, NotAdmittingCause, RawActor,
-    RawContext, RawDef, RawOnceDef, Readiness, RemoveOutcome, ReserveError, RestartCondition,
-    RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind, Shutdown, StopReason,
-    SubtreeDef, SubtreeOnceDef, System, TaskDef, TaskOnceDef, Tree,
+    DynamicScopeRef, DynamicTree, Exit, ExitError, ExitKind, ExitResult, Intensity,
+    NotAdmittingCause, RawActor, RawContext, RawDef, RawOnceDef, Readiness, RemoveOutcome,
+    ReserveError, RestartCondition, RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind,
+    Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, System, TaskDef, TaskOnceDef, Tree,
 };
 
 /// Waits until a fused drop has finished releasing its id.
@@ -1072,20 +1072,23 @@ async fn removing_a_member_releases_its_factory_before_scope_shutdown() {
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
+/// A pre-spawn stop on a member whose policy would not restart (a one-shot
+/// subtree) waits for the parent to reach the member, which then terminalizes
+/// it as `NeverStarted` without constructing it. The member is initial, so
+/// the parent's startup fails naming it.
 #[tokio::test(start_paused = true)]
-async fn pre_spawn_shutdown_waits_for_teardown_to_exist() {
-    let gate = ReleaseGate::default();
+async fn pre_spawn_stop_without_restart_terminalizes_never_started_at_the_members_turn() {
+    let tasks = Arc::new(AtomicUsize::new(0));
     let mut nested = Tree::new();
     nested
         .add_task(
             "worker",
             TaskDef::new({
-                let gate = gate.clone();
+                let tasks = Arc::clone(&tasks);
                 move |context| {
-                    let gate = gate.clone();
+                    tasks.fetch_add(1, Ordering::SeqCst);
                     async move {
                         context.shutdown_token().cancelled().await;
-                        gate.wait().await;
                         Ok(())
                     }
                 }
@@ -1106,11 +1109,81 @@ async fn pre_spawn_shutdown_waits_for_teardown_to_exist() {
     .await;
     let _nested_handle = slot.define_once(SubtreeOnceDef::new(nested));
     let system = root.spawn().expect("runtime is available");
-    let timeout = waiter.await.expect_err("live teardown exceeds its bound");
-    assert_eq!(timeout.stragglers.len(), 1);
-    assert_eq!(timeout.stragglers[0].path[0].as_str(), "worker");
-    gate.release();
-    assert_eq!(scope.wait_stopped().await, StopReason::ShutdownRequested);
+    tokio::time::timeout(POLL_TIMEOUT, waiter)
+        .await
+        .expect("the parent resolves the request at the member's turn")
+        .expect("no live teardown exists to exceed its bound");
+    assert_eq!(scope.wait_stopped().await, StopReason::NeverStarted);
+    assert_eq!(tasks.load(Ordering::SeqCst), 0, "nothing is constructed");
+    let startup = system
+        .wait_started()
+        .await
+        .expect_err("the never-started initial member fails startup");
+    let (id, exit) = startup_failed_child(startup);
+    assert_eq!(id.as_str(), "nested");
+    assert!(matches!(exit.kind(), ExitKind::NeverStarted));
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+/// A pre-spawn stop on an `Always` initial member resolves without stopping
+/// anything: the first spawn proceeds in its turn, the parent's startup
+/// succeeds, and the incarnation keeps running.
+#[tokio::test(start_paused = true)]
+async fn pre_spawn_always_stop_resolves_and_the_first_incarnation_runs() {
+    let factories = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let subtree = SubtreeDef::factory({
+        let factories = Arc::clone(&factories);
+        let started = Arc::clone(&started);
+        let cancelled = Arc::clone(&cancelled);
+        move || {
+            factories.fetch_add(1, Ordering::SeqCst);
+            let mut tree = Tree::new();
+            tree.add_task(
+                "worker",
+                signalled_waiting_task(Arc::clone(&started), Arc::clone(&cancelled)),
+            )
+            .expect("valid task");
+            tree
+        }
+    })
+    .restart(RestartPolicy::new(
+        RestartCondition::Always,
+        Backoff::fixed(Duration::from_secs(60), shelterwood::Jitter::None)
+            .expect("non-zero backoff"),
+    ));
+    let mut root = Tree::new();
+    let nested = root.add_subtree("nested", subtree).expect("valid subtree");
+    let mut waiter = Box::pin(nested.shutdown_and_wait(Duration::from_millis(10)));
+    assert!(poll_once(waiter.as_mut()).is_pending());
+
+    let system = root.spawn().expect("runtime is available");
+    tokio::time::timeout(POLL_TIMEOUT, waiter)
+        .await
+        .expect("the request resolves once the parent evaluates it")
+        .expect("a pre-spawn stop under `Always` resolves Ok");
+    system
+        .wait_started()
+        .await
+        .expect("the member does not fail its parent's startup");
+    assert_eventually_frozen!(|| started.load(Ordering::SeqCst)).await;
+    advance_time(Duration::from_secs(1)).await;
+    assert!(
+        !cancelled.load(Ordering::SeqCst),
+        "the first incarnation is not stopped"
+    );
+    assert_eq!(factories.load(Ordering::SeqCst), 1);
+    let child = system.scope().child("nested").expect("resident");
+    assert!(matches!(child.state, ChildState::Running));
+    assert!(
+        child.last_exit.is_none(),
+        "no incarnation exited or scheduled a restart"
+    );
+    assert_eq!(nested.snapshot().state, ScopeState::Running);
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -1479,65 +1552,79 @@ async fn ordered_pending_restart_fixture(
     (system, nested, factories, starts)
 }
 
-async fn assert_pending_restart_shutdown_is_expedited<R: Clone>(
+/// SPEC §11's `Always` contract for a stop landing in a restart window: the
+/// call resolves at once without constructing anything, the pending restart
+/// keeps its schedule, and the policy's own restart then runs an incarnation
+/// the stop does not touch.
+async fn assert_always_window_stop_constructs_nothing<R: Clone>(
     width: Duration,
     system: System<R>,
+    root: ScopeRef,
     nested: ScopeRef,
     factories: Arc<AtomicUsize>,
     starts: Arc<AtomicUsize>,
 ) {
+    let before = root.child("nested").expect("the nested member is resident");
+    assert!(matches!(before.state, ChildState::Restarting));
     tokio::time::timeout(
         Duration::from_secs(1),
         nested.shutdown_and_wait(Duration::from_secs(1)),
     )
     .await
-    .expect("shutdown does not wait for the pending restart deadline")
-    .expect("the pending incarnation stops cooperatively");
-    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    .expect("the stop does not wait for the pending restart deadline")
+    .expect("a window stop under `Always` resolves Ok");
     assert_eq!(
         factories.load(Ordering::SeqCst),
-        2,
-        "shutdown must start exactly the pending incarnation without waiting for backoff"
+        1,
+        "the stop constructs no incarnation"
     );
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    let after = root.child("nested").expect("the nested member is resident");
+    assert!(matches!(after.state, ChildState::Restarting));
+    assert_eq!(
+        after.restart_at, before.restart_at,
+        "the pending restart keeps its schedule"
+    );
+    assert_eq!(after.restart_count, before.restart_count);
+
     if width == Duration::MAX {
-        // An unrepresentable deadline has no substitute and never arrives,
-        // so there is no later incarnation to reach.
-        // Only the quiet window applies.
+        // An unrepresentable deadline has no substitute and never arrives:
+        // the membership stays in its window exactly as it would without the
+        // request.
         advance_time(Duration::from_secs(1)).await;
-        assert_eq!(
-            starts.load(Ordering::SeqCst),
-            2,
-            "an unrepresentable deadline must not resurrect the stopped incarnation"
-        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(factories.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            root.child("nested").expect("resident").state,
+            ChildState::Restarting
+        ));
         system.shutdown(Duration::ZERO).await.expect("root stops");
         return;
     }
 
-    // The expedited incarnation exited cooperatively, so `Always` schedules an
-    // ordinary backoff restart. Cross the whole window: a storm assertion that
-    // never reaches a *later* incarnation only re-measures the quiet interior
-    // of the window it already observed.
     advance_time(width + Duration::from_secs(1)).await;
     assert_eventually_frozen!(
-        || starts.load(Ordering::SeqCst) >= 3,
-        "a consumed pending request must not suppress the ordinary backoff restart"
+        || starts.load(Ordering::SeqCst) >= 2,
+        "the pending restart fires on its original schedule"
     )
     .await;
-    assert_eq!(
-        starts.load(Ordering::SeqCst),
-        3,
-        "exactly one incarnation follows the expedited stop"
-    );
-    assert_eq!(
-        factories.load(Ordering::SeqCst),
-        3,
-        "the backoff restart re-lowers the subtree exactly once"
-    );
+    assert_eq!(factories.load(Ordering::SeqCst), 2);
+    root.wait_for_child(
+        "nested",
+        |child| matches!(child.state, ChildState::Running),
+        POLL_TIMEOUT,
+    )
+    .await
+    .expect("the policy's own incarnation runs");
+    // Cross several more windows: the spent request must not stop the
+    // restarted incarnation, and nothing bounces it into another restart.
     advance_time(width * 3).await;
     assert_quiet(Duration::from_secs(1), || {
-        starts.load(Ordering::SeqCst) != 3
+        starts.load(Ordering::SeqCst) != 2
     })
     .await;
+    assert_eq!(nested.snapshot().state, ScopeState::Running);
+    assert_eq!(factories.load(Ordering::SeqCst), 2);
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -1545,19 +1632,207 @@ async fn assert_pending_restart_shutdown_is_expedited<R: Clone>(
 }
 
 #[tokio::test(start_paused = true)]
-async fn pending_restart_shutdown_expedites_finite_and_unrepresentable_backoff() {
+async fn always_window_stop_constructs_nothing_for_finite_and_unrepresentable_backoff() {
     for width in [Duration::from_secs(60 * 60), Duration::MAX] {
         let (system, nested, factories, starts) = pending_restart_fixture(width).await;
-        assert_pending_restart_shutdown_is_expedited(width, system, nested, factories, starts)
-            .await;
+        let root = system.scope().as_scope().clone();
+        assert_always_window_stop_constructs_nothing(
+            width, system, root, nested, factories, starts,
+        )
+        .await;
     }
 }
 
 #[tokio::test(start_paused = true)]
-async fn ordered_parent_pending_restart_shutdown_is_expedited() {
+async fn ordered_parent_always_window_stop_constructs_nothing() {
     let width = Duration::from_secs(60 * 60);
     let (system, nested, factories, starts) = ordered_pending_restart_fixture(width).await;
-    assert_pending_restart_shutdown_is_expedited(width, system, nested, factories, starts).await;
+    let root = system.scope();
+    assert_always_window_stop_constructs_nothing(width, system, root, nested, factories, starts)
+        .await;
+}
+
+/// Under `Always` the window stop adds no restart charge. The stopped
+/// incarnation used to be constructed and bounced, and its cancelled exit
+/// charged a second restart against a one-restart budget.
+#[tokio::test(start_paused = true)]
+async fn always_window_stop_charges_no_restart() {
+    let width = Duration::from_secs(60);
+    let factories = Arc::new(AtomicUsize::new(0));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let subtree = pending_restart_subtree(width, Arc::clone(&factories), Arc::clone(&starts));
+    let mut root = Tree::new();
+    root.intensity(Intensity::new(1, Duration::from_secs(24 * 60 * 60)).expect("valid intensity"));
+    let nested = root.add_subtree("nested", subtree).expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("first incarnation starts");
+    let root_scope = system.scope();
+    await_first_restart_window(&root_scope, &starts).await;
+
+    nested
+        .shutdown_and_wait(Duration::from_secs(1))
+        .await
+        .expect("a window stop under `Always` resolves Ok");
+    advance_time(width + Duration::from_secs(1)).await;
+    root_scope
+        .wait_for_child(
+            "nested",
+            |child| matches!(child.state, ChildState::Running),
+            POLL_TIMEOUT,
+        )
+        .await
+        .expect("the scheduled restart runs");
+    assert_quiet(Duration::from_secs(1), || {
+        root_scope.snapshot().state != ScopeState::Running
+    })
+    .await;
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    assert_eq!(factories.load(Ordering::SeqCst), 2);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+fn failing_startup_subtree(width: Duration, factories: Arc<AtomicUsize>) -> SubtreeDef<Tree> {
+    SubtreeDef::factory(move || {
+        factories.fetch_add(1, Ordering::SeqCst);
+        let mut tree = Tree::new();
+        tree.add_task(
+            "fails-before-ready",
+            TaskDef::new(|_| async { Err(ExitError::message("the incarnation fails startup")) })
+                .restart(never())
+                .readiness(Readiness::Manual)
+                .expect("manual readiness"),
+        )
+        .expect("valid task");
+        tree
+    })
+    .restart(RestartPolicy::new(
+        RestartCondition::OnFailure,
+        Backoff::fixed(width, shelterwood::Jitter::None).expect("non-zero backoff"),
+    ))
+}
+
+async fn last_window_exit(root: &ScopeRef) -> Exit {
+    root.wait_for_child(
+        "nested",
+        |child| matches!(child.state, ChildState::Restarting),
+        Duration::MAX,
+    )
+    .await
+    .expect("the failed incarnation enters its restart window");
+    let exit = root
+        .child("nested")
+        .expect("the nested member is resident")
+        .last_exit
+        .expect("a restart window carries its last exit");
+    assert!(exit.is_failure());
+    exit
+}
+
+/// SPEC §11 under `OnFailure`: the stop cancels the pending restart and the
+/// membership terminalizes with its previous real exit, constructing
+/// nothing now or at the old deadline.
+#[tokio::test(start_paused = true)]
+async fn on_failure_window_stop_publishes_the_last_exit_and_constructs_nothing() {
+    let width = Duration::from_secs(60);
+    let factories = Arc::new(AtomicUsize::new(0));
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let root = system.scope();
+    // A runtime member, so the window does not hold the parent's startup.
+    let nested = root
+        .add_subtree(
+            "nested",
+            failing_startup_subtree(width, Arc::clone(&factories)),
+        )
+        .await
+        .expect("subtree admitted");
+    let last_exit = last_window_exit(root.as_scope()).await;
+
+    tokio::time::timeout(
+        POLL_TIMEOUT,
+        nested.shutdown_and_wait(Duration::from_secs(1)),
+    )
+    .await
+    .expect("the stop resolves at terminality")
+    .expect("a window stop under `OnFailure` resolves Ok");
+    assert_eq!(factories.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        root.as_scope().child("nested").expect("retained").state,
+        ChildState::Stopped {
+            exit: last_exit.clone()
+        },
+        "the terminal carries the previous real exit"
+    );
+    assert!(
+        matches!(nested.wait_stopped().await, StopReason::StartupFailed(_)),
+        "wait_stopped reports the previous incarnation's reason"
+    );
+
+    advance_time(width + Duration::from_secs(1)).await;
+    assert_quiet(Duration::from_secs(1), || {
+        factories.load(Ordering::SeqCst) != 1
+    })
+    .await;
+    assert_eq!(
+        root.as_scope().child("nested").expect("retained").state,
+        ChildState::Stopped { exit: last_exit }
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+/// An initial member stopped in its restart window while the parent is still
+/// starting: the startup aggregate re-armed for it, so the terminal is a
+/// startup abort carrying the last exit, and the parent's startup fails
+/// naming it.
+#[tokio::test(start_paused = true)]
+async fn window_stop_while_the_parent_starts_fails_startup_with_the_last_exit() {
+    let width = Duration::from_secs(60);
+    let factories = Arc::new(AtomicUsize::new(0));
+    let mut root = Tree::new();
+    let nested = root
+        .add_subtree(
+            "nested",
+            failing_startup_subtree(width, Arc::clone(&factories)),
+        )
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    let root_scope = system.scope();
+    let last_exit = last_window_exit(&root_scope).await;
+
+    tokio::time::timeout(
+        POLL_TIMEOUT,
+        nested.shutdown_and_wait(Duration::from_secs(1)),
+    )
+    .await
+    .expect("the stop resolves at terminality")
+    .expect("a window stop under `OnFailure` resolves Ok");
+    assert_eq!(factories.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        root_scope.child("nested").expect("retained").state,
+        ChildState::StartupAborted {
+            exit: last_exit.clone()
+        }
+    );
+    let startup = tokio::time::timeout(POLL_TIMEOUT, system.wait_started())
+        .await
+        .expect("the parent's startup verdict is not left waiting")
+        .expect_err("the aborted initial member fails the parent's startup");
+    let (id, exit) = startup_failed_child(startup);
+    assert_eq!(id.as_str(), "nested");
+    assert_eq!(exit, last_exit);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1567,7 +1842,7 @@ async fn same_batch_removal_suppresses_pending_restart_shutdown() {
 
     // Both level-triggered commands are latched before yielding to the
     // driver. Removal owns restart suppression even though the nested scope's
-    // pending shutdown would otherwise expedite its next incarnation.
+    // pending shutdown would otherwise be resolved by the window-stop rule.
     let removal = system.scope().remove_scope(&nested);
     nested.request_shutdown();
     assert_eq!(

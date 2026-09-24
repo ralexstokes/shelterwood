@@ -70,7 +70,7 @@ fn pre_admission_restart_shutdown_is_published_when_the_scope_gets_a_parent() {
 
     assert_eq!(
         root.take_control_events(),
-        vec![ScopeControlEvent::RestartShutdown {
+        vec![ScopeControlEvent::WindowStop {
             membership: nested.member.membership(),
             target,
         }]
@@ -107,20 +107,42 @@ fn consumed_pre_admission_shutdown_is_not_published_when_the_scope_gets_a_parent
     );
 }
 
+fn nested_with_backoff(condition: RestartCondition) -> SubtreeDef<Tree> {
+    SubtreeDef::factory(pending_tree).restart(RestartPolicy::new(
+        condition,
+        Backoff::fixed(Duration::from_secs(60), crate::Jitter::None)
+            .expect("non-zero restart backoff"),
+    ))
+}
+
+fn failed_exit(message: &'static str) -> Option<RetainedRecordedOutcome> {
+    Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+        Err(ExitError::message(message)),
+    )))
+}
+
+/// Starts the child's incarnation and aborts its task before it is ever
+/// polled, so no user construction runs and the nested epoch plane stays
+/// idle: a request accepted now is a pending-incarnation request.
+fn spawn_unpolled(scope: &mut ScopeRuntime, key: ChildKey) -> Incarnation {
+    scope.spawn_child(key);
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("the spawned incarnation is active");
+    active.abort_handle.abort();
+    active.incarnation
+}
+
+/// SPEC §11, pre-spawn under `Always`: the construction site vacates the
+/// targeted first epoch and then constructs the policy's own incarnation,
+/// which mints the following epoch with a clear latch.
 #[crate::runtime::test]
-async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnation() {
+async fn pre_spawn_always_stop_is_vacated_at_the_construction_site() {
     let mut tree = Tree::new();
-    tree.add_subtree(
-        "nested",
-        SubtreeDef::factory(pending_tree).restart(RestartPolicy::new(
-            RestartCondition::Always,
-            Backoff::fixed(Duration::from_secs(60), crate::Jitter::None)
-                .expect("non-zero restart backoff"),
-        )),
-    )
-    .expect("valid subtree");
+    tree.add_subtree("nested", nested_with_backoff(RestartCondition::Always))
+        .expect("valid subtree");
     let fixture = OrderedScopeFixture::new(tree);
-    let root = Arc::clone(&fixture.root);
     let key = fixture.children.keys().next().expect("one child plan");
     let nested = Arc::clone(
         fixture.children[key]
@@ -132,103 +154,300 @@ async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnat
     let target = nested.request_shutdown();
     let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
 
-    scope.spawn_child(key);
-    let first = scope.children[key]
-        .active
-        .as_ref()
-        .expect("the first incarnation is active")
-        .incarnation;
-    assert_eq!(
-        nested.begin_incarnation(ScopeState::Starting),
-        Some(target),
-        "the first nested incarnation claims the pre-admission target"
-    );
-    assert!(nested.take_shutdown_request(target));
-    let event = root
-        .take_control_events()
-        .pop()
-        .expect("parent adoption publishes the pre-admission request");
-    let Some((_, Pending::RestartShutdown { child, target })) = scope.control_event_work(event)
-    else {
-        panic!("the control event resolves to restart-shutdown work");
-    };
-    assert_eq!(child, key);
-    scope.expedite_restart_shutdown(child, target);
-    nested.finish_incarnation(target, StopReason::ShutdownRequested);
-    scope.children[key]
-        .active
-        .as_ref()
-        .expect("the first incarnation is active")
-        .abort_handle
-        .abort();
+    spawn_unpolled(&mut scope, key);
 
-    scope.handle_exit(
-        key,
-        first,
-        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-            Err(ExitError::message("restart the nested scope")),
-        ))),
-        crate::runtime::JoinOutcome::Ok { value: () },
-        Cancellation::NotObserved,
-        false,
-    );
-
-    // Drive the deferred retry the exit queued: the consumed target must not
-    // expedite the following incarnation.
-    for (child, target) in std::mem::take(&mut scope.restart_shutdown_retries) {
-        scope.expedite_restart_shutdown(child, target);
-    }
-
+    assert_eq!(nested.pending_incarnation_shutdown(), None);
     assert!(
-        scope.children[key].active.is_none(),
-        "the consumed request must not bypass the following incarnation's backoff"
+        nested.settled(Some(target)),
+        "the vacated target settles every wait on it"
     );
-    assert!(scope.children[key].restart_deadline.is_some());
-    assert!(scope.children[key].restart_shutdown_pending.is_none());
+    let begun = nested
+        .begin_incarnation(ScopeState::Starting)
+        .expect("vacating leaves the epoch plane idle");
+    assert_ne!(
+        begun, target,
+        "the incarnation mints past the vacated target"
+    );
+    assert!(
+        !nested.has_stop_request(begun),
+        "the policy's own incarnation starts with a clear latch"
+    );
 }
 
-#[crate::runtime::test]
-async fn expedited_restart_progresses_synchronous_readiness() {
+/// A window stop whose event beats the incarnation's exit finds the child
+/// still active and leaves the request pending. The exit then re-checks the
+/// level. Returns the scope, the child key and the nested cell.
+async fn window_stop_before_exit(
+    condition: RestartCondition,
+) -> (ScopeRuntime, ChildKey, Arc<ScopeCell>, Epoch) {
     let mut tree = Tree::new();
-    tree.add_subtree("nested", SubtreeDef::factory(pending_tree))
+    tree.add_subtree("nested", nested_with_backoff(condition))
         .expect("valid subtree");
-    let mut fixture = OrderedScopeFixture::new(tree);
-    let root = Arc::clone(&fixture.root);
+    let fixture = OrderedScopeFixture::new(tree);
     let key = fixture.children.keys().next().expect("one child plan");
-    let nested_cell = Arc::clone(
-        fixture.children[key]
+    let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
+    let nested = Arc::clone(
+        scope.children[key]
             .slot
             .scope
             .as_ref()
             .expect("nested scope cell"),
     );
-    // Scope definitions currently resolve to Manual and expose no public
-    // readiness setter. Model that API invariant changing: the expedited
-    // restart must still release ordered startup when configuration produces
-    // an immediate readiness effect.
-    fixture.children[key].options.readiness = Readiness::Immediate;
-    let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
-    scope.reduce(SupervisorEvent::Spawned { child: key });
-    let target = nested_cell.request_shutdown();
+    let first = spawn_unpolled(&mut scope, key);
+    let target = nested.request_shutdown();
 
-    scope.expedite_restart_shutdown(key, target);
-
-    assert!(scope.supervisor.initial_ready(key));
-    assert!(
-        scope.supervisor.lifecycle().startup_complete(),
-        "synchronous readiness from an expedited spawn advances aggregate startup"
+    scope.resolve_window_stop(key, target);
+    assert_eq!(
+        nested.pending_incarnation_shutdown(),
+        Some(target),
+        "an active incarnation leaves the request to its exit"
     );
-    assert_eq!(root.record().startup, Some(Ok(())));
+
+    scope.handle_exit(
+        key,
+        first,
+        failed_exit("restart the nested scope"),
+        crate::runtime::JoinOutcome::Ok { value: () },
+        Cancellation::NotObserved,
+        false,
+    );
+    assert!(scope.children[key].active.is_none());
+    (scope, key, nested, target)
 }
 
-/// A shutdown request against a nested scope's *first* (still pending)
-/// incarnation, published before the ordered start reaches that child, must
-/// not expedite-spawn it: only a member in the restart gap may bypass
-/// `progress_startup`'s in-order gating. The request stays latched on the
-/// nested cell and is claimed when the child starts at its ordered turn.
 #[crate::runtime::test]
-async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child() {
-    let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+async fn always_window_stop_arriving_before_exit_is_spent_when_the_window_opens() {
+    let (scope, key, nested, target) = window_stop_before_exit(RestartCondition::Always).await;
+
+    assert_eq!(nested.pending_incarnation_shutdown(), None);
+    assert!(nested.settled(Some(target)));
+    assert!(
+        scope.children[key].restart_deadline.is_some(),
+        "the pending restart keeps its schedule"
+    );
+    assert_eq!(
+        scope.children[key].slot.member.record().stage,
+        MemberStage::Restarting
+    );
+}
+
+#[crate::runtime::test]
+async fn on_failure_window_stop_arriving_before_exit_cancels_the_opened_window() {
+    let (scope, key, nested, _target) = window_stop_before_exit(RestartCondition::OnFailure).await;
+
+    assert!(
+        scope.children[key].restart_deadline.is_none(),
+        "the pending restart is cancelled"
+    );
+    let record = scope.children[key].slot.member.record();
+    let MemberStage::Terminal(exit) = &record.stage else {
+        panic!("the window member terminalizes in place")
+    };
+    assert!(
+        matches!(exit.kind(), ExitKind::Failed(_)),
+        "the terminal carries the last exit, not a cancelled completion"
+    );
+    assert!(!record.startup_aborted);
+    assert!(
+        nested.settled(None),
+        "membership terminality settles the pending request"
+    );
+}
+
+/// A restart deadline executing ahead of a window stop's control event must
+/// not construct on the request's behalf: `spawn_child` re-checks the level at
+/// the construction site. Returns the scope, the child key and the nested
+/// cell, with the deadline already handled.
+async fn restart_deadline_ahead_of_window_stop(
+    condition: RestartCondition,
+) -> (ScopeRuntime, ChildKey, Arc<ScopeCell>, Epoch, Incarnation) {
+    let mut tree = Tree::new();
+    tree.add_subtree("nested", nested_with_backoff(condition))
+        .expect("valid subtree");
+    let fixture = OrderedScopeFixture::new(tree);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
+    let nested = Arc::clone(
+        scope.children[key]
+            .slot
+            .scope
+            .as_ref()
+            .expect("nested scope cell"),
+    );
+    let first = spawn_unpolled(&mut scope, key);
+    scope.handle_exit(
+        key,
+        first,
+        failed_exit("open the restart window"),
+        crate::runtime::JoinOutcome::Ok { value: () },
+        Cancellation::NotObserved,
+        false,
+    );
+    assert!(scope.children[key].restart_deadline.is_some());
+    let target = nested.request_shutdown();
+
+    scope.handle_deadline(super::super::DeadlineKind::Restart { child: key });
+    (scope, key, nested, target, first)
+}
+
+#[crate::runtime::test]
+async fn on_failure_restart_deadline_ahead_of_a_window_stop_constructs_nothing() {
+    let (scope, key, _nested, _target, _first) =
+        restart_deadline_ahead_of_window_stop(RestartCondition::OnFailure).await;
+
+    assert!(
+        scope.children[key].active.is_none(),
+        "the due restart constructs no incarnation for a stopped window"
+    );
+    assert!(scope.children[key].restart_deadline.is_none());
+    let MemberStage::Terminal(exit) = scope.children[key].slot.member.record().stage else {
+        panic!("the construction site terminalizes the window member")
+    };
+    assert!(matches!(exit.kind(), ExitKind::Failed(_)));
+}
+
+#[crate::runtime::test]
+async fn always_restart_deadline_ahead_of_a_window_stop_runs_the_policys_own_restart() {
+    let (scope, key, nested, target, first) =
+        restart_deadline_ahead_of_window_stop(RestartCondition::Always).await;
+
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("the scheduled restart still constructs");
+    assert_ne!(active.incarnation, first);
+    active.abort_handle.abort();
+    assert_eq!(nested.pending_incarnation_shutdown(), None);
+    assert!(nested.settled(Some(target)), "the request was spent first");
+    let begun = nested
+        .begin_incarnation(ScopeState::Starting)
+        .expect("the vacated plane stays idle until the restart begins");
+    assert!(
+        !nested.has_stop_request(begun),
+        "the restarted incarnation starts with a clear latch"
+    );
+}
+
+/// A window stop and an intensity-tripping sibling exit collected in one
+/// batch: the exit sorts first and drains the scope, so the drain owns the
+/// window member's terminal and the resolver leaves it alone.
+#[crate::runtime::test]
+async fn same_batch_intensity_trip_owns_a_window_stop_terminal() {
+    let mut tree = Tree::new();
+    tree.intensity(Intensity::new(1, Duration::from_secs(10)).expect("valid intensity"));
+    tree.add_subtree("nested", nested_with_backoff(RestartCondition::OnFailure))
+        .expect("valid subtree");
+    tree.add_task("trip", TaskDef::new(|_| future::pending()))
+        .expect("valid task");
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let find = |id: &str| {
+        fixture
+            .children
+            .keys()
+            .find(|key| fixture.children[*key].slot.member.id().as_str() == id)
+            .expect("fixture child key")
+    };
+    let nested = find("nested");
+    let trip = find("trip");
+    let next_ordered_start = fixture.children.keys().next();
+    let (mut scope, _event_receiver) = fixture
+        .with_lifecycle(ScopeLifecycle::running())
+        .with_next_ordered_start(next_ordered_start)
+        .build();
+
+    let nested_first = spawn_unpolled(&mut scope, nested);
+    scope.handle_exit(
+        nested,
+        nested_first,
+        failed_exit("open the restart window"),
+        crate::runtime::JoinOutcome::Ok { value: () },
+        Cancellation::NotObserved,
+        false,
+    );
+    assert!(scope.children[nested].restart_deadline.is_some());
+    let target = scope.children[nested]
+        .slot
+        .scope
+        .as_ref()
+        .expect("nested scope cell")
+        .request_shutdown();
+    let event = root
+        .take_control_events()
+        .pop()
+        .expect("the window request publishes one control event");
+    let work = scope
+        .control_event_work(event)
+        .expect("the event resolves to its member");
+    assert!(matches!(
+        work.1,
+        Pending::WindowStop { child, target: event_target }
+            if child == nested && event_target == target
+    ));
+
+    let trip_incarnation = spawn_unpolled(&mut scope, trip);
+    let trip_exit = DriverEvent::Child(ChildEvent::Exited {
+        child: trip,
+        incarnation: trip_incarnation,
+        recorded: failed_exit("trip intensity"),
+        join: crate::runtime::JoinOutcome::Ok { value: () },
+        cancellation: Cancellation::NotObserved,
+        readiness_signal_seen: false,
+    });
+    let mut pending = [work, Pending::from(trip_exit).classified()];
+    arbitrate(&mut pending);
+    let mut order = Vec::new();
+    for (_, event) in pending {
+        match event {
+            Pending::WindowStop { child, target } => {
+                order.push("window-stop");
+                scope.resolve_window_stop(child, target);
+            }
+            Pending::Child(ChildEvent::Exited {
+                child,
+                incarnation,
+                recorded,
+                join,
+                cancellation,
+                readiness_signal_seen,
+            }) => {
+                order.push("exit");
+                scope.handle_exit(
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                );
+            }
+            _ => unreachable!("the fixture queues only exit and window-stop work"),
+        }
+    }
+
+    assert_eq!(order, ["exit", "window-stop"]);
+    assert!(matches!(
+        scope.supervisor.lifecycle().draining_reason(),
+        Some(StopReason::IntensityTripped(_))
+    ));
+    // Ordered teardown reaches `nested` only after `trip` joins. The resolver
+    // must leave the member to that turn rather than terminalize it early.
+    assert!(!scope.supervisor.is_disposing(nested));
+    assert!(scope.children[nested].active.is_none());
+    assert_eq!(
+        scope.children[nested].slot.member.record().stage,
+        MemberStage::Restarting,
+        "the drain, not the window stop, owns the member's terminal"
+    );
+}
+
+/// A pre-spawn request on an ordered child that would not restart is left
+/// alone by its control event and resolved only at the child's ordered
+/// construction site, which terminalizes it as `NeverStarted` and routes the
+/// scope's startup failure through it.
+#[crate::runtime::test]
+async fn pre_spawn_stop_on_an_ordered_child_resolves_at_its_turn_without_constructing() {
+    let factories = Arc::new(AtomicUsize::new(0));
     let mut tree = Tree::new();
     tree.add_task(
         "a",
@@ -243,10 +462,14 @@ async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child(
         SubtreeDef::factory({
             let factories = Arc::clone(&factories);
             move || {
-                factories.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                factories.fetch_add(1, Ordering::SeqCst);
                 Tree::new()
             }
-        }),
+        })
+        .restart(RestartPolicy::new(
+            RestartCondition::OnFailure,
+            Backoff::Immediate,
+        )),
     )
     .expect("valid subtree");
 
@@ -268,10 +491,13 @@ async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child(
     let target = nested_cell.request_shutdown();
     let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(first)).build();
 
-    // Ordered startup spawns "a" and parks on its (never-fired) readiness.
+    // Ordered startup spawns "a" and parks on its never-fired readiness.
     scope.progress_startup();
-    assert!(scope.children[first].active.is_some());
-    assert!(!scope.supervisor.initial_ready(first));
+    let a_incarnation = scope.children[first]
+        .active
+        .as_ref()
+        .expect("the first ordered child is active")
+        .incarnation;
 
     let event = root
         .take_control_events()
@@ -279,385 +505,59 @@ async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child(
         .expect("parent adoption publishes the pre-admission request");
     let Some((
         _,
-        Pending::RestartShutdown {
+        Pending::WindowStop {
             child,
             target: event_target,
         },
     )) = scope.control_event_work(event)
     else {
-        panic!("the control event resolves to restart-shutdown work");
+        panic!("the control event resolves to window-stop work");
     };
-    assert_eq!(child, nested);
-    assert_eq!(event_target, target);
-    scope.expedite_restart_shutdown(child, event_target);
+    assert_eq!((child, event_target), (nested, target));
+    scope.resolve_window_stop(child, event_target);
 
+    assert!(
+        !matches!(
+            scope.children[nested].slot.member.record().stage,
+            MemberStage::Terminal(_)
+        ),
+        "the member is not terminalized ahead of its ordered turn"
+    );
+    assert_eq!(nested_cell.pending_incarnation_shutdown(), Some(target));
+
+    scope.handle_ready(first, a_incarnation);
     crate::runtime::yield_now().await;
     crate::runtime::yield_now().await;
 
     assert_eq!(
-        factories.load(std::sync::atomic::Ordering::SeqCst),
+        factories.load(Ordering::SeqCst),
         0,
-        "a never-started ordered child must not be expedite-spawned before its turn"
+        "the ordered turn constructs nothing on the request's behalf"
     );
     assert!(scope.children[nested].active.is_none());
     assert!(!scope.supervisor.spawned_once(nested));
-    assert!(scope.children[nested].restart_shutdown_pending.is_none());
-    assert_eq!(
-        nested_cell.begin_incarnation(ScopeState::Starting),
-        Some(target),
-        "the request stays latched for the first incarnation's ordered turn"
-    );
-}
-
-#[crate::runtime::test]
-async fn restart_shutdown_arriving_before_exit_is_retried_after_the_child_becomes_inactive() {
-    let mut tree = Tree::new();
-    tree.add_subtree(
-        "nested",
-        SubtreeDef::factory(pending_tree).restart(RestartPolicy::new(
-            RestartCondition::Always,
-            Backoff::fixed(Duration::from_secs(60), crate::Jitter::None)
-                .expect("non-zero restart backoff"),
-        )),
-    )
-    .expect("valid subtree");
-    let fixture = OrderedScopeFixture::new(tree);
-    let key = fixture.children.keys().next().expect("one child plan");
-    let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
-
-    let target = scope.children[key]
-        .slot
-        .scope
-        .as_ref()
-        .expect("nested scope cell")
-        .request_shutdown();
-    scope.spawn_child(key);
-    let first = scope.children[key]
-        .active
-        .as_ref()
-        .expect("the first incarnation is active")
-        .incarnation;
-    scope.expedite_restart_shutdown(key, target);
-    assert_eq!(
-        scope.children[key].restart_shutdown_pending,
-        Some(target),
-        "the early event remains owned until the active incarnation exits"
-    );
-    scope.children[key]
-        .active
-        .as_ref()
-        .expect("the first incarnation is active")
-        .abort_handle
-        .abort();
-
-    scope.handle_exit(
-        key,
-        first,
-        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-            Err(ExitError::message("restart the nested scope")),
-        ))),
-        crate::runtime::JoinOutcome::Ok { value: () },
-        Cancellation::NotObserved,
-        false,
-    );
-
-    // Exit handling queues the retry rather than expediting mid-batch; the
-    // driver loop drains it into the next wake's arbitration.
-    let retries = std::mem::take(&mut scope.restart_shutdown_retries);
-    assert_eq!(retries, vec![(key, target)]);
-    for (child, target) in retries {
-        scope.expedite_restart_shutdown(child, target);
-    }
-
-    let restarted = scope.children[key]
-        .active
-        .as_ref()
-        .expect("the retained event starts the next incarnation on the following wake");
-    assert_ne!(restarted.incarnation, first);
-    assert!(scope.children[key].restart_deadline.is_none());
-    assert!(scope.children[key].restart_shutdown_pending.is_none());
-}
-
-#[crate::runtime::test]
-async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
-    let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut tree = Tree::new();
-    tree.intensity(Intensity::new(0, Duration::from_secs(10)).expect("valid intensity"));
-    tree.add_subtree(
-        "nested",
-        SubtreeDef::factory({
-            let factories = Arc::clone(&factories);
-            move || {
-                factories.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Tree::new()
-            }
-        }),
-    )
-    .expect("valid subtree");
-    tree.add_task("trip", TaskDef::new(|_| future::pending()))
-        .expect("valid task");
-
-    let fixture = OrderedScopeFixture::new(tree);
-    let root = Arc::clone(&fixture.root);
-    let nested = fixture
-        .children
-        .keys()
-        .find(|key| fixture.children[*key].slot.member.id().as_str() == "nested")
-        .expect("nested child key");
-    let trip = fixture
-        .children
-        .keys()
-        .find(|key| fixture.children[*key].slot.member.id().as_str() == "trip")
-        .expect("tripping child key");
-    let next_ordered_start = fixture.children.keys().next();
-    let (mut scope, _event_receiver) = fixture
-        .with_lifecycle(ScopeLifecycle::running())
-        .with_next_ordered_start(next_ordered_start)
-        .build();
-
-    root.transition_child(
-        &scope.children[nested].slot.member,
-        |record| {
-            record.incarnation = None;
-            record.stage = MemberStage::Restarting;
-        },
-        None,
-    );
-    let target = scope.children[nested]
-        .slot
-        .scope
-        .as_ref()
-        .expect("nested scope cell")
-        .request_shutdown();
-    let event = root
-        .take_control_events()
-        .pop()
-        .expect("the request publishes one subject-carrying control event");
-    let Some((
-        _,
-        Pending::RestartShutdown {
-            child: subject,
-            target: event_target,
-        },
-    )) = scope.control_event_work(event)
-    else {
-        panic!("the control event resolves to restart-shutdown work");
+    let record = scope.children[nested].slot.member.record();
+    let MemberStage::Terminal(exit) = &record.stage else {
+        panic!("the ordered turn terminalizes the member")
     };
-    assert_eq!(subject, nested);
-    assert_eq!(event_target, target);
-
-    scope.spawn_child(trip);
-    let incarnation = scope.children[trip]
-        .active
-        .as_ref()
-        .expect("tripping child is active")
-        .incarnation;
-    scope.children[trip]
-        .active
-        .as_ref()
-        .expect("tripping child is active")
-        .abort_handle
-        .abort();
-    let exit = DriverEvent::Child(ChildEvent::Exited {
-        child: trip,
-        incarnation,
-        recorded: Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-            Err(ExitError::message("trip intensity")),
-        ))),
-        join: crate::runtime::JoinOutcome::Ok { value: () },
-        cancellation: Cancellation::NotObserved,
-        readiness_signal_seen: false,
-    });
-    let mut pending = [
-        restart_shutdown_work(nested, target),
-        Pending::from(exit).classified(),
-    ];
-    arbitrate(&mut pending);
-    for (_, event) in pending {
-        match event {
-            Pending::RestartShutdown { child, target } => {
-                scope.expedite_restart_shutdown(child, target);
-            }
-            Pending::Child(ChildEvent::Exited {
-                child,
-                incarnation,
-                recorded,
-                join,
-                cancellation,
-                readiness_signal_seen,
-            }) => scope.handle_exit(
-                child,
-                incarnation,
-                recorded,
-                join,
-                cancellation,
-                readiness_signal_seen,
-            ),
-            _ => unreachable!("the fixture queues only exit and restart work"),
+    assert!(matches!(exit.kind(), ExitKind::NeverStarted));
+    assert!(
+        !record.startup_aborted,
+        "a never-spawned member publishes plain NeverStarted"
+    );
+    assert_eq!(
+        nested_cell.record().state,
+        ScopeState::Stopped {
+            reason: StopReason::NeverStarted
         }
-    }
-
-    crate::runtime::yield_now().await;
-    crate::runtime::yield_now().await;
-
-    assert!(scope.supervisor.lifecycle().is_draining());
-    assert_eq!(
-        factories.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "the production guard must suppress the expedited factory after intensity drain"
     );
-}
-
-/// The retained-fact twin of the test above: a restart-shutdown fact retained
-/// while its subject was active is retried when the subject's exit is handled
-/// — but the retry must re-enter arbitration rather than expedite mid-batch,
-/// so an intensity-tripping exit collected in the same wake drains the scope
-/// before the retry can start a doomed incarnation.
-#[crate::runtime::test]
-async fn same_batch_intensity_exit_suppresses_retained_expedite_retry() {
-    let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut tree = Tree::new();
-    tree.intensity(Intensity::new(1, Duration::from_secs(10)).expect("valid intensity"));
-    tree.add_subtree(
-        "nested",
-        SubtreeDef::factory({
-            let factories = Arc::clone(&factories);
-            move || {
-                factories.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Tree::new()
-            }
-        })
-        .restart(RestartPolicy::new(
-            RestartCondition::Always,
-            Backoff::fixed(Duration::from_secs(60), crate::Jitter::None)
-                .expect("non-zero restart backoff"),
-        )),
-    )
-    .expect("valid subtree");
-    tree.add_task("trip", TaskDef::new(|_| future::pending()))
-        .expect("valid task");
-
-    let fixture = OrderedScopeFixture::new(tree);
-    let nested = fixture
-        .children
-        .keys()
-        .find(|key| fixture.children[*key].slot.member.id().as_str() == "nested")
-        .expect("nested child key");
-    let trip = fixture
-        .children
-        .keys()
-        .find(|key| fixture.children[*key].slot.member.id().as_str() == "trip")
-        .expect("tripping child key");
-    let next_ordered_start = fixture.children.keys().next();
-    let (mut scope, _event_receiver) = fixture
-        .with_lifecycle(ScopeLifecycle::running())
-        .with_next_ordered_start(next_ordered_start)
-        .build();
-
-    let target = scope.children[nested]
-        .slot
-        .scope
-        .as_ref()
-        .expect("nested scope cell")
-        .request_shutdown();
-    scope.spawn_child(nested);
-    let nested_first = scope.children[nested]
-        .active
-        .as_ref()
-        .expect("the first nested incarnation is active")
-        .incarnation;
-    // The subject-carrying event runs while the child is still active, so the
-    // fact is retained for the exit-time retry.
-    scope.expedite_restart_shutdown(nested, target);
-    assert_eq!(
-        scope.children[nested].restart_shutdown_pending,
-        Some(target)
-    );
-    scope.children[nested]
-        .active
-        .as_ref()
-        .expect("the first nested incarnation is active")
-        .abort_handle
-        .abort();
-
-    scope.spawn_child(trip);
-    let trip_incarnation = scope.children[trip]
-        .active
-        .as_ref()
-        .expect("tripping child is active")
-        .incarnation;
-    scope.children[trip]
-        .active
-        .as_ref()
-        .expect("tripping child is active")
-        .abort_handle
-        .abort();
-
-    let nested_exit = DriverEvent::Child(ChildEvent::Exited {
-        child: nested,
-        incarnation: nested_first,
-        recorded: Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-            Err(ExitError::message("restart the nested scope")),
-        ))),
-        join: crate::runtime::JoinOutcome::Ok { value: () },
-        cancellation: Cancellation::NotObserved,
-        readiness_signal_seen: false,
-    });
-    let trip_exit = DriverEvent::Child(ChildEvent::Exited {
-        child: trip,
-        incarnation: trip_incarnation,
-        recorded: Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-            Err(ExitError::message("trip intensity")),
-        ))),
-        join: crate::runtime::JoinOutcome::Ok { value: () },
-        cancellation: Cancellation::NotObserved,
-        readiness_signal_seen: false,
-    });
-    let mut pending = [
-        Pending::from(nested_exit).classified(),
-        Pending::from(trip_exit).classified(),
-    ];
-    arbitrate(&mut pending);
-    for (_, event) in pending {
-        match event {
-            Pending::Child(ChildEvent::Exited {
-                child,
-                incarnation,
-                recorded,
-                join,
-                cancellation,
-                readiness_signal_seen,
-            }) => scope.handle_exit(
-                child,
-                incarnation,
-                recorded,
-                join,
-                cancellation,
-                readiness_signal_seen,
-            ),
-            _ => unreachable!("the fixture queues only the two exits"),
-        }
-    }
-
-    // The nested exit deferred its retry through arbitration, so the trip
-    // exit from the same batch drained the scope first.
-    assert!(scope.supervisor.lifecycle().is_draining());
-    let retries = std::mem::take(&mut scope.restart_shutdown_retries);
-    assert_eq!(retries, vec![(nested, target)]);
-    for (child, target) in retries {
-        scope.expedite_restart_shutdown(child, target);
-    }
-
-    crate::runtime::yield_now().await;
-    crate::runtime::yield_now().await;
-
-    assert_eq!(
-        factories.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "the deferred retry must not start a doomed incarnation after intensity drain"
-    );
-    assert!(scope.children[nested].active.is_none());
-    assert!(scope.children[nested].restart_shutdown_pending.is_none());
+    let Some(Err(StartupError::StartupFailed(failure))) = root.record().startup else {
+        panic!("the never-started initial member fails the scope's startup")
+    };
+    assert!(matches!(
+        failure.cause,
+        StartupFailureCause::Child { ref id, .. } if id.as_str() == "nested"
+    ));
 }
 
 /// A `mark_ready(); stop()` child reports its local stop and exit on

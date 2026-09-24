@@ -231,7 +231,10 @@ impl ScopeRequestSlot {
 /// index, so stale events miss instead of addressing a replacement child.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScopeControlEvent {
-    RestartShutdown {
+    /// A shutdown request was accepted while the member scope had no live
+    /// incarnation — a restart window or a pre-spawn handle. The parent
+    /// resolves it in place, without constructing the targeted incarnation.
+    WindowStop {
         membership: Membership,
         target: Epoch,
     },
@@ -475,7 +478,7 @@ impl ScopeCell {
         drop(control);
         if let Some(request) = pending_shutdown {
             parent.publish_control_event_locked(
-                ScopeControlEvent::RestartShutdown {
+                ScopeControlEvent::WindowStop {
                     membership: self.member.membership(),
                     target: request.epoch,
                 },
@@ -820,23 +823,6 @@ impl ScopeCell {
             record.membership_status = MembershipStatus::Removing;
         });
         self.publish_snapshot_chain_locked(txn);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn transition_child(
-        &self,
-        member: &MemberCell,
-        update: impl FnOnce(&mut MemberRecord),
-        event: Option<LifecycleEventKind>,
-    ) {
-        self.with_observation_gate(|wakes| {
-            member.update_locked(wakes, update);
-            if let Some(event) = event {
-                self.emit_locked(wakes, event);
-            } else {
-                self.publish_snapshot_chain_locked(wakes);
-            }
-        });
     }
 
     /// Applies `transition` and publishes `event`, or refuses both.
@@ -1334,7 +1320,7 @@ impl ScopeCell {
             if pending_incarnation && let Some(parent) = self.parent() {
                 txn.retain_shared(&parent);
                 parent.publish_control_event_locked(
-                    ScopeControlEvent::RestartShutdown {
+                    ScopeControlEvent::WindowStop {
                         membership: self.member.membership(),
                         target,
                     },
@@ -1387,12 +1373,42 @@ impl ScopeCell {
         })
     }
 
-    pub(crate) fn has_pending_incarnation_shutdown(&self, target: Epoch) -> bool {
+    /// The epoch of a shutdown request accepted with no live incarnation to
+    /// consume it, if one is still pending.
+    ///
+    /// A pending request always targets the epoch the next `begin` would
+    /// mint, which is what makes this a level the parent can sample at every
+    /// construction site.
+    pub(crate) fn pending_incarnation_shutdown(&self) -> Option<Epoch> {
         let control = self.control.lock().expect("scope control mutex poisoned");
-        control.shutdown.is_some_and(|request| {
-            request.epoch == target
-                && !request.consumed
-                && control.epochs.request_is_pending(target)
+        control
+            .shutdown
+            .filter(|request| !request.consumed && control.epochs.request_is_pending(request.epoch))
+            .map(|request| request.epoch)
+    }
+
+    /// Spends a pending-incarnation shutdown request without constructing
+    /// the incarnation it targets (SPEC §11).
+    ///
+    /// The target epoch is marked finished without having run, so every
+    /// `shutdown_and_wait` on it settles, and the next incarnation mints the
+    /// epoch after it with a clear latch. Returns whether `target` was the
+    /// pending request and is now vacated.
+    pub(crate) fn vacate_pending_shutdown(&self, target: Epoch) -> bool {
+        self.with_observation_gate(|txn| {
+            let mut control = self.control.lock().expect("scope control mutex poisoned");
+            let pending = control
+                .shutdown
+                .is_some_and(|request| request.epoch == target && !request.consumed);
+            let vacated = pending && control.epochs.vacate(target);
+            if vacated {
+                control.shutdown = None;
+            }
+            drop(control);
+            if vacated {
+                txn.pulse(&self.member.record);
+            }
+            vacated
         })
     }
 
@@ -3222,7 +3238,7 @@ mod tests {
         root.control.clear_poison();
         assert_eq!(
             root.take_control_events(),
-            [ScopeControlEvent::RestartShutdown {
+            [ScopeControlEvent::WindowStop {
                 membership: nested.member.membership(),
                 target,
             }],

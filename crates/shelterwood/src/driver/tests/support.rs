@@ -135,8 +135,8 @@ pub(super) use super::super::{
     ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, ScopeRuntimeTestWiring,
     StartupDisposition, cancel_dynamic_reservation, child::dispatch_child_construction_for_test,
     discharge_child_terminality, monitor_root_driver, nested_scope_start, report_slot,
-    reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory, run_scope,
-    run_scope_incarnation, storage::Obligation, wait_for_scope_wake,
+    reserve_dynamic, resident_projection, run_nested_factory, run_scope, run_scope_incarnation,
+    storage::Obligation, wait_for_scope_wake,
 };
 
 pub(super) async fn begin_admission(

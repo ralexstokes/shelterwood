@@ -613,6 +613,7 @@ impl<T> OneShotReceiver<T> {
         value
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn receive(self) -> Option<T> {
         self.assert_not_completed();
         self.channel.await.ok()

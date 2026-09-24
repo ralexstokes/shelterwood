@@ -483,6 +483,7 @@ fn classify_join_result<T>(result: Result<T, task::JoinError>) -> JoinOutcome<T>
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 pub async fn join_resuming<T>(handle: JoinHandle<T>) -> T {
     let JoinHandle { inner } = handle;
     match inner.await {

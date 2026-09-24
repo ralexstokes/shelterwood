@@ -805,15 +805,12 @@ impl ScopeRuntime {
             );
         }
 
-        let mut readiness = ReadinessGate::new();
         let deadline = child
             .options
             .readiness_deadline()
             .and_then(|duration| Deadline::after(now, duration).instant());
-        let readiness_effect = readiness.step(ReadinessEvent::Configure {
-            readiness: child.options.readiness,
-            deadline,
-        });
+        let (readiness, readiness_effect) =
+            ReadinessGate::configure(child.options.readiness, deadline);
         let gated = readiness.needs_signal_watch();
 
         if construction_spent {
@@ -1131,12 +1128,12 @@ impl ScopeRuntime {
             .get_mut(key)
             .expect("the exiting child remains registered");
 
-        let mode = if self.supervisor.lifecycle().is_draining() {
-            ScopeMode::Draining
-        } else {
-            ScopeMode::Running
-        };
-        match dispatch_exit(exit.get(), child.options.restart, mode, membership_status) {
+        match dispatch_exit(
+            exit.get(),
+            child.options.restart,
+            self.supervisor.lifecycle().is_draining(),
+            membership_status,
+        ) {
             ExitDispatch::Terminal => {
                 self.begin_terminal_disposal(key, exit, Some(incarnation), startup);
             }

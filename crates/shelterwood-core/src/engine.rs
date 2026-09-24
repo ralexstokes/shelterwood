@@ -234,12 +234,6 @@ impl StopLadder {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScopeMode {
-    Running,
-    Draining,
-}
-
 /// Whether a child membership is active or undergoing planned removal.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MembershipStatus {
@@ -258,7 +252,7 @@ pub enum ExitDispatch {
 pub fn dispatch_exit(
     exit: &Exit,
     restart: RestartPolicy,
-    scope: ScopeMode,
+    scope_draining: bool,
     membership: MembershipStatus,
 ) -> ExitDispatch {
     // SPEC §8: `NeverStarted` is a membership fact, not an incarnation
@@ -272,7 +266,7 @@ pub fn dispatch_exit(
         !matches!(exit.kind(), ExitKind::NeverStarted),
         "NeverStarted is a membership outcome outside incarnation dispatch"
     );
-    if scope == ScopeMode::Draining || membership == MembershipStatus::Removing {
+    if scope_draining || membership == MembershipStatus::Removing {
         return ExitDispatch::Terminal;
     }
     if restart.should_restart(exit) {
@@ -453,7 +447,6 @@ pub fn schedule_restart(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadinessState {
-    Unconfigured,
     Waiting { deadline: Option<Instant> },
     Ready,
     Disarmed,
@@ -470,19 +463,10 @@ pub struct ReadinessGate {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadinessEvent {
-    Configure {
-        readiness: Readiness,
-        deadline: Option<Instant>,
-    },
     Signal,
-    Deadline {
-        now: Instant,
-        signal_seen: bool,
-    },
+    Deadline { now: Instant, signal_seen: bool },
     Shutdown,
-    Exit {
-        signal_seen: bool,
-    },
+    Exit { signal_seen: bool },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -494,46 +478,36 @@ pub enum ReadinessEffect {
 }
 
 impl ReadinessGate {
-    pub fn new() -> Self {
-        Self {
-            state: ReadinessState::Unconfigured,
+    /// Configures one incarnation's gate from its definition-level readiness
+    /// and returns the configuration's own effect: `Immediate` is ready at
+    /// once, and a gated mode arms its deadline, if it has one.
+    pub fn configure(
+        readiness: Readiness,
+        deadline: Option<Instant>,
+    ) -> (Self, Option<ReadinessEffect>) {
+        match readiness {
+            Readiness::Immediate => (
+                Self {
+                    state: ReadinessState::Ready,
+                },
+                Some(ReadinessEffect::BecameReady),
+            ),
+            Readiness::Manual | Readiness::AfterInit => (
+                Self {
+                    state: ReadinessState::Waiting { deadline },
+                },
+                deadline.map(|deadline| ReadinessEffect::ArmDeadline { deadline }),
+            ),
         }
     }
 
     /// Whether a retained signal watcher is needed for this incarnation.
-    ///
-    /// The `Unconfigured` case is unreachable from the driver, which
-    /// configures the gate at spawn now that readiness is definition-level;
-    /// it remains for the state machine's own completeness and unit tests.
     pub fn needs_signal_watch(self) -> bool {
-        matches!(
-            self.state,
-            ReadinessState::Unconfigured | ReadinessState::Waiting { .. }
-        )
+        matches!(self.state, ReadinessState::Waiting { .. })
     }
 
     pub fn step(&mut self, event: ReadinessEvent) -> Option<ReadinessEffect> {
         match (self.state, event) {
-            (
-                ReadinessState::Unconfigured,
-                ReadinessEvent::Configure {
-                    readiness: Readiness::Immediate,
-                    ..
-                },
-            ) => {
-                self.state = ReadinessState::Ready;
-                Some(ReadinessEffect::BecameReady)
-            }
-            (
-                ReadinessState::Unconfigured,
-                ReadinessEvent::Configure {
-                    readiness: Readiness::Manual | Readiness::AfterInit,
-                    deadline,
-                },
-            ) => {
-                self.state = ReadinessState::Waiting { deadline };
-                deadline.map(|deadline| ReadinessEffect::ArmDeadline { deadline })
-            }
             (ReadinessState::Waiting { .. }, ReadinessEvent::Signal)
             | (
                 ReadinessState::Waiting { .. },
@@ -557,15 +531,7 @@ impl ReadinessGate {
                 self.state = ReadinessState::Disarmed;
                 Some(ReadinessEffect::TimedOut { deadline })
             }
-            // The `Unconfigured` half of this arm is unreachable from the
-            // driver, which configures the gate at spawn now that readiness
-            // is definition-level; it remains for the state machine's own
-            // completeness and unit tests.
             (
-                ReadinessState::Unconfigured,
-                ReadinessEvent::Shutdown | ReadinessEvent::Exit { .. },
-            )
-            | (
                 ReadinessState::Waiting { .. },
                 ReadinessEvent::Shutdown | ReadinessEvent::Exit { signal_seen: false },
             ) => {
@@ -578,19 +544,8 @@ impl ReadinessGate {
                     signal_seen: false, ..
                 },
             )
-            | (ReadinessState::Ready | ReadinessState::Disarmed, _)
-            | (
-                ReadinessState::Unconfigured,
-                ReadinessEvent::Signal | ReadinessEvent::Deadline { .. },
-            )
-            | (ReadinessState::Waiting { .. }, ReadinessEvent::Configure { .. }) => None,
+            | (ReadinessState::Ready | ReadinessState::Disarmed, _) => None,
         }
-    }
-}
-
-impl Default for ReadinessGate {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -844,7 +799,7 @@ impl ScopeLifecycle {
                     StartupPhase::Complete => 1,
                     StartupPhase::Failed => 2,
                 },
-                stop_reason_precedence(reason),
+                stop_reason_precedence(reason) as u8,
             ),
         }
     }
@@ -1100,8 +1055,8 @@ mod tests {
     use super::{
         ArbitrationClass, ChildCompletionState, DeadlineQueue, Epoch, ExitDispatch, IncarnationRun,
         IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent, ReadinessGate,
-        RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode, ScopeState,
-        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
+        RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeState, StopAction,
+        StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
     };
 
     #[test]
@@ -1409,9 +1364,8 @@ mod tests {
 
         for cancellation in [Cancellation::NotObserved, Cancellation::Observed] {
             for (kind, failure) in &cases {
-                // Built through the per-kind constructors rather than a generic
-                // `Exit::new`, which no longer exists. `NeverStarted` is a
-                // membership fact outside dispatch's incarnation-exit domain.
+                // `NeverStarted` is a membership fact outside dispatch's
+                // incarnation-exit domain.
                 let exit = match kind {
                     ExitKind::Completed => Exit::completed(cancellation),
                     ExitKind::Failed(error) => Exit::failed(error.clone(), cancellation),
@@ -1431,7 +1385,7 @@ mod tests {
                         restart_completed
                     };
                     assert_eq!(
-                        dispatch_exit(&exit, policy, ScopeMode::Running, MembershipStatus::Active),
+                        dispatch_exit(&exit, policy, false, MembershipStatus::Active),
                         if expected {
                             ExitDispatch::ScheduleRestart
                         } else {
@@ -1440,17 +1394,12 @@ mod tests {
                         "condition={condition:?}, kind={kind:?}, cancellation={cancellation:?}"
                     );
                     assert_eq!(
-                        dispatch_exit(&exit, policy, ScopeMode::Draining, MembershipStatus::Active),
+                        dispatch_exit(&exit, policy, true, MembershipStatus::Active),
                         ExitDispatch::Terminal,
                         "draining suppresses every restart"
                     );
                     assert_eq!(
-                        dispatch_exit(
-                            &exit,
-                            policy,
-                            ScopeMode::Running,
-                            MembershipStatus::Removing
-                        ),
+                        dispatch_exit(&exit, policy, false, MembershipStatus::Removing),
                         ExitDispatch::Terminal,
                         "planned removal suppresses every restart"
                     );
@@ -1466,7 +1415,7 @@ mod tests {
         let _ = dispatch_exit(
             &exit,
             RestartPolicy::new(RestartCondition::Always, Backoff::Immediate),
-            ScopeMode::Running,
+            false,
             MembershipStatus::Active,
         );
     }
@@ -1617,15 +1566,9 @@ mod tests {
     #[test]
     fn readiness_configuration_and_signal_deadline_race_are_engine_owned() {
         let deadline = Instant::now();
-        let mut ready = ReadinessGate::new();
-        assert!(ready.needs_signal_watch());
-        assert_eq!(
-            ready.step(ReadinessEvent::Configure {
-                readiness: crate::Readiness::Manual,
-                deadline: Some(deadline),
-            }),
-            Some(ReadinessEffect::ArmDeadline { deadline })
-        );
+        let (mut ready, configured) =
+            ReadinessGate::configure(crate::Readiness::Manual, Some(deadline));
+        assert_eq!(configured, Some(ReadinessEffect::ArmDeadline { deadline }));
         assert!(ready.needs_signal_watch());
         assert_eq!(
             ready.step(ReadinessEvent::Deadline {
@@ -1643,35 +1586,21 @@ mod tests {
             None
         );
 
-        let mut exited = ReadinessGate::new();
-        assert_eq!(
-            exited.step(ReadinessEvent::Configure {
-                readiness: crate::Readiness::Manual,
-                deadline: None,
-            }),
-            None
-        );
+        let (mut exited, configured) = ReadinessGate::configure(crate::Readiness::Manual, None);
+        assert_eq!(configured, None);
         assert_eq!(
             exited.step(ReadinessEvent::Exit { signal_seen: true }),
             Some(ReadinessEffect::BecameReady)
         );
 
-        let mut unsignaled_exit = ReadinessGate::new();
-        unsignaled_exit.step(ReadinessEvent::Configure {
-            readiness: crate::Readiness::Manual,
-            deadline: None,
-        });
+        let (mut unsignaled_exit, _) = ReadinessGate::configure(crate::Readiness::Manual, None);
         assert_eq!(
             unsignaled_exit.step(ReadinessEvent::Exit { signal_seen: false }),
             Some(ReadinessEffect::Disarmed)
         );
         assert!(!unsignaled_exit.needs_signal_watch());
 
-        let mut unbounded = ReadinessGate::new();
-        unbounded.step(ReadinessEvent::Configure {
-            readiness: crate::Readiness::Manual,
-            deadline: None,
-        });
+        let (mut unbounded, _) = ReadinessGate::configure(crate::Readiness::Manual, None);
         assert_eq!(
             unbounded.step(ReadinessEvent::Deadline {
                 now: deadline,
@@ -1682,14 +1611,9 @@ mod tests {
         );
         assert!(unbounded.needs_signal_watch());
 
-        let mut timed_out = ReadinessGate::new();
-        assert_eq!(
-            timed_out.step(ReadinessEvent::Configure {
-                readiness: crate::Readiness::AfterInit,
-                deadline: Some(deadline),
-            }),
-            Some(ReadinessEffect::ArmDeadline { deadline })
-        );
+        let (mut timed_out, configured) =
+            ReadinessGate::configure(crate::Readiness::AfterInit, Some(deadline));
+        assert_eq!(configured, Some(ReadinessEffect::ArmDeadline { deadline }));
         assert_eq!(
             timed_out.step(ReadinessEvent::Deadline {
                 now: deadline,
@@ -1700,12 +1624,10 @@ mod tests {
         assert!(!timed_out.needs_signal_watch());
 
         let configured_deadline = deadline + Duration::from_secs(2);
-        let mut premature = ReadinessGate::new();
+        let (mut premature, configured) =
+            ReadinessGate::configure(crate::Readiness::Manual, Some(configured_deadline));
         assert_eq!(
-            premature.step(ReadinessEvent::Configure {
-                readiness: crate::Readiness::Manual,
-                deadline: Some(configured_deadline),
-            }),
+            configured,
             Some(ReadinessEffect::ArmDeadline {
                 deadline: configured_deadline
             })
@@ -1730,24 +1652,12 @@ mod tests {
             "the original deadline remains armed after a premature event"
         );
 
-        let mut immediate = ReadinessGate::new();
-        assert_eq!(
-            immediate.step(ReadinessEvent::Configure {
-                readiness: crate::Readiness::Immediate,
-                deadline: None,
-            }),
-            Some(ReadinessEffect::BecameReady)
-        );
+        let (immediate, configured) = ReadinessGate::configure(crate::Readiness::Immediate, None);
+        assert_eq!(configured, Some(ReadinessEffect::BecameReady));
         assert!(!immediate.needs_signal_watch());
 
-        let mut shutdown = ReadinessGate::new();
-        assert_eq!(
-            shutdown.step(ReadinessEvent::Configure {
-                readiness: crate::Readiness::Manual,
-                deadline: None,
-            }),
-            None
-        );
+        let (mut shutdown, configured) = ReadinessGate::configure(crate::Readiness::Manual, None);
+        assert_eq!(configured, None);
         assert_eq!(
             shutdown.step(ReadinessEvent::Shutdown),
             Some(ReadinessEffect::Disarmed)

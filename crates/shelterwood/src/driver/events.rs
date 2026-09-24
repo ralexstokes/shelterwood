@@ -238,7 +238,7 @@ impl ScopeRuntime {
             dispatch_exit(
                 &Exit::completed(Cancellation::Observed),
                 child.options.restart,
-                ScopeMode::Running,
+                false,
                 MembershipStatus::Active,
             ) == ExitDispatch::ScheduleRestart
         })

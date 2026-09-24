@@ -61,14 +61,14 @@ pub fn stop_reason_root_exit(reason: &StopReason) -> Exit {
     }
 }
 
-pub fn stop_reason_precedence(reason: &StopReason) -> u8 {
-    (match reason {
+pub fn stop_reason_precedence(reason: &StopReason) -> StopPrecedence {
+    match reason {
         StopReason::Finished => StopPrecedence::Finished,
         StopReason::IntensityTripped(_) => StopPrecedence::IntensityTripped,
         StopReason::StartupFailed(_) => StopPrecedence::StartupFailed,
         StopReason::ShutdownRequested => StopPrecedence::ShutdownRequested,
         StopReason::NeverStarted => StopPrecedence::NeverStarted,
-    }) as u8
+    }
 }
 
 /// Total precedence order over stop reasons: the single lattice that resolves
@@ -92,7 +92,7 @@ pub fn stop_reason_precedence(reason: &StopReason) -> u8 {
 /// either arrival order; it does not require the membership exit kind to match
 /// (SPEC B.6).
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum StopPrecedence {
+pub enum StopPrecedence {
     Finished,
     IntensityTripped,
     StartupFailed,

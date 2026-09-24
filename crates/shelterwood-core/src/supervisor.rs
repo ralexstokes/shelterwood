@@ -96,18 +96,6 @@ impl ChildState {
         }
     }
 
-    /// Whether the current incarnation has stopped executing.
-    pub fn incarnation_complete(self) -> bool {
-        matches!(
-            self.incarnation(),
-            IncarnationState::Unstarted
-                | IncarnationState::Complete
-                | IncarnationState::RestartPending
-                | IncarnationState::Disposing
-                | IncarnationState::Joined
-        )
-    }
-
     /// Whether terminal disposal has joined and no child work remains.
     pub fn joined(self) -> bool {
         self.incarnation() == IncarnationState::Joined
@@ -136,8 +124,8 @@ struct ChildRecord {
 }
 
 impl ChildRecord {
-    /// Whether a [`Effect::StartChild`] can still produce a [`Event::Spawned`]
-    /// edge, deliberately spelled as this event's own acceptance set.
+    /// [`Event::Spawned`]'s acceptance set: whether a [`Effect::StartChild`]
+    /// can still produce a spawn edge.
     ///
     /// Settlement is level-triggered and its driver re-enters [`Event::Settle`]
     /// until a pass emits nothing, so an effect the shell would decline is not
@@ -158,10 +146,11 @@ pub enum Event {
     Spawned {
         child: ChildKey,
     },
+    /// A readiness edge from the live incarnation. A fired removal latch is
+    /// sampled first, through [`Event::RemovalSampled`], so a removing
+    /// membership rejects the edge.
     Ready {
         child: ChildKey,
-        /// Sample of the synchronous removal latch at step entry.
-        removal_latched: bool,
     },
     IncarnationComplete {
         child: ChildKey,
@@ -191,11 +180,6 @@ pub enum Event {
     Reclaim {
         child: ChildKey,
     },
-    FailStartup,
-    BeginDrain {
-        reason: StopReason,
-    },
-    Force,
     /// Level-triggered startup, ordered-stop, and finish recomputation.
     Settle,
 }
@@ -269,6 +253,7 @@ impl SupervisorState {
         &self.lifecycle
     }
 
+    #[cfg(test)]
     pub fn flavor(&self) -> ScopeFlavor {
         self.flavor
     }
@@ -283,10 +268,6 @@ impl SupervisorState {
 
     pub fn contains(&self, child: ChildKey) -> bool {
         self.children.contains_key(&child)
-    }
-
-    pub fn membership(&self, child: ChildKey) -> Option<Membership> {
-        self.children.get(&child).map(|record| record.membership)
     }
 
     fn child_state(&self, child: ChildKey) -> Option<ChildState> {
@@ -322,11 +303,6 @@ impl SupervisorState {
             .is_some_and(|state| state.incarnation() == IncarnationState::Disposing)
     }
 
-    pub fn incarnation_complete(&self, child: ChildKey) -> bool {
-        self.child_state(child)
-            .is_some_and(ChildState::incarnation_complete)
-    }
-
     pub fn joined(&self, child: ChildKey) -> bool {
         self.child_state(child).is_some_and(ChildState::joined)
     }
@@ -340,14 +316,12 @@ impl SupervisorState {
         self.children.values().all(|record| record.state.joined())
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.children.is_empty()
     }
 
-    pub fn len(&self) -> usize {
-        self.children.len()
-    }
-
+    #[cfg(test)]
     pub fn keys(&self) -> impl DoubleEndedIterator<Item = ChildKey> + '_ {
         self.children.keys().copied()
     }
@@ -552,23 +526,13 @@ impl SupervisorState {
         match event {
             Event::Spawned { child } => {
                 if let Some(record) = self.children.get_mut(&child)
-                    && matches!(record.state, ChildState::Resident(_))
-                    && matches!(
-                        record.state.incarnation(),
-                        IncarnationState::Unstarted | IncarnationState::RestartPending
-                    )
+                    && record.startable()
                 {
                     record.spawned_once = true;
                     record.state = record.state.with_incarnation(IncarnationState::Active);
                 }
             }
-            Event::Ready {
-                child,
-                removal_latched,
-            } => {
-                if removal_latched {
-                    self.sample_removal(child);
-                }
+            Event::Ready { child } => {
                 let Some(record) = self.children.get_mut(&child) else {
                     return;
                 };
@@ -677,15 +641,6 @@ impl SupervisorState {
                     let _ = self.child_keys.remove(&membership);
                 }
             }
-            Event::FailStartup => {
-                let _ = self.fail_startup();
-            }
-            Event::BeginDrain { reason } => {
-                let _ = self.begin_drain(reason, effects);
-            }
-            Event::Force => {
-                let _ = self.force(effects);
-            }
             Event::Settle => {
                 self.settle_startup(effects);
                 self.settle_ordered_stop(effects);
@@ -740,6 +695,11 @@ impl SupervisorState {
 }
 
 /// Applies one total transition to [`SupervisorState`].
+///
+/// Each transition has exactly one entry point. The ones whose owner must
+/// publish a result — [`admit`], [`fail_startup`], [`begin_drain`] and
+/// [`force`] — are functions returning it; every other transition is an
+/// [`Event`] through here.
 pub fn step(state: &mut SupervisorState, event: Event, effects: &mut Vec<Effect>) {
     state.apply(event, effects);
 }
@@ -997,14 +957,7 @@ mod tests {
             );
             effects.clear();
             step(&mut state, Event::Spawned { child: expected }, &mut effects);
-            step(
-                &mut state,
-                Event::Ready {
-                    child: expected,
-                    removal_latched: false,
-                },
-                &mut effects,
-            );
+            step(&mut state, Event::Ready { child: expected }, &mut effects);
             assert!(effects.is_empty());
         }
 
@@ -1038,14 +991,7 @@ mod tests {
         );
         assert!(!state.initial_ready(child));
 
-        step(
-            &mut state,
-            Event::Ready {
-                child,
-                removal_latched: false,
-            },
-            &mut Vec::new(),
-        );
+        step(&mut state, Event::Ready { child }, &mut Vec::new());
 
         assert!(state.initial_ready(child));
         state.check_invariants();
@@ -1108,14 +1054,7 @@ mod tests {
             step(&mut state, Event::Settle, &mut effects);
             effects.clear();
             step(&mut state, Event::Spawned { child }, &mut effects);
-            step(
-                &mut state,
-                Event::Ready {
-                    child,
-                    removal_latched: false,
-                },
-                &mut effects,
-            );
+            step(&mut state, Event::Ready { child }, &mut effects);
         }
         effects.clear();
 
@@ -1329,10 +1268,7 @@ mod tests {
         let terminal = state.child_state(child);
         for event in [
             Event::Spawned { child },
-            Event::Ready {
-                child,
-                removal_latched: false,
-            },
+            Event::Ready { child },
             Event::IncarnationComplete { child },
             Event::RestartPending { child },
             Event::StopStarted { child },
@@ -1359,10 +1295,7 @@ mod tests {
         let child = admit(&mut state, membership, false);
 
         for event in [
-            Event::Ready {
-                child,
-                removal_latched: false,
-            },
+            Event::Ready { child },
             Event::IncarnationComplete { child },
             Event::RestartPending { child },
             Event::StopStarted { child },

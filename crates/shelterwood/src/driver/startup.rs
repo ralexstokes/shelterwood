@@ -54,11 +54,10 @@ impl ScopeRuntime {
                 if !live {
                     return false;
                 }
-                let removal_latched = self.removal_latched(key);
-                self.reduce(SupervisorEvent::Ready {
-                    child: key,
-                    removal_latched,
-                });
+                if self.removal_latched(key) {
+                    self.reduce(SupervisorEvent::RemovalSampled { child: key });
+                }
+                self.reduce(SupervisorEvent::Ready { child: key });
                 let removing = self.supervisor.membership_status(key) == MembershipStatus::Removing;
                 let Some(child) = self.children.get_mut(key) else {
                     return false;

@@ -21,7 +21,7 @@ use crate::{
     engine::ScopeLifecycle,
     supervisor::{
         ChildKey, ChildRecord, ChildState, Effect, Event, IncarnationState, StartupMembership,
-        SupervisorState, step,
+        SupervisorState, begin_drain, fail_startup, force, step,
     },
 };
 
@@ -147,9 +147,37 @@ fn fingerprint(state: &SupervisorState, keys: &[ChildKey]) -> u64 {
 /// that policy.
 type Roster = &'static [bool];
 
-/// Every event the walk offers in every state, including the ones the state
+/// One walk input: a reducer [`Event`], or one of the owner transitions that
+/// return a publication and therefore enter through their own functions. The
+/// walk discards those publications; what it checks is state and effects.
+#[derive(Clone, Debug)]
+enum Input {
+    Step(Event),
+    FailStartup,
+    BeginDrain(StopReason),
+    Force,
+}
+
+impl Input {
+    fn apply(&self, state: &mut SupervisorState, effects: &mut Vec<Effect>) {
+        match self {
+            Self::Step(event) => step(state, event.clone(), effects),
+            Self::FailStartup => {
+                let _ = fail_startup(state);
+            }
+            Self::BeginDrain(reason) => {
+                let _ = begin_drain(state, reason.clone(), effects);
+            }
+            Self::Force => {
+                let _ = force(state, effects);
+            }
+        }
+    }
+}
+
+/// Every input the walk offers in every state, including the ones the state
 /// will reject — totality is a property under test, not a precondition.
-fn alphabet(keys: &[ChildKey]) -> Vec<Event> {
+fn alphabet(keys: &[ChildKey]) -> Vec<Input> {
     let mut events = Vec::new();
     for &child in keys {
         events.extend([
@@ -165,23 +193,27 @@ fn alphabet(keys: &[ChildKey]) -> Vec<Event> {
             Event::Reclaim { child },
         ]);
     }
-    events.extend([
-        Event::FailStartup,
+    events.push(Event::Settle);
+    let mut inputs: Vec<_> = events.into_iter().map(Input::Step).collect();
+    inputs.extend([
+        Input::FailStartup,
         // Two drain reasons at opposite ends of the precedence lattice, so
         // both the upgrading and the ignored direction of S4 are reachable.
-        Event::BeginDrain {
-            reason: StopReason::Finished,
-        },
-        Event::BeginDrain {
-            reason: StopReason::ShutdownRequested,
-        },
-        Event::Force,
-        Event::Settle,
+        Input::BeginDrain(StopReason::Finished),
+        Input::BeginDrain(StopReason::ShutdownRequested),
+        Input::Force,
     ]);
-    for event in &events {
-        // Exhaustive over `Event` without restating its construction: a new
-        // variant does not compile until this guard is updated alongside the
-        // canonical list above, preventing silent pruning from the walk.
+    for input in &inputs {
+        // Exhaustive over `Input` and `Event` without restating their
+        // construction: a new variant does not compile until this guard is
+        // updated alongside the canonical list above, preventing silent
+        // pruning from the walk.
+        let Input::Step(event) = input else {
+            match input {
+                Input::Step(_) | Input::FailStartup | Input::BeginDrain(_) | Input::Force => {}
+            }
+            continue;
+        };
         match event {
             Event::Spawned { .. }
             | Event::Ready { .. }
@@ -193,18 +225,15 @@ fn alphabet(keys: &[ChildKey]) -> Vec<Event> {
             | Event::RemovalSampled { .. }
             | Event::RemovalLatched { .. }
             | Event::Reclaim { .. }
-            | Event::FailStartup
-            | Event::BeginDrain { .. }
-            | Event::Force
             | Event::Settle => {}
         }
     }
-    events
+    inputs
 }
 
 struct Transition<'a> {
     before: &'a SupervisorState,
-    event: &'a Event,
+    event: &'a Input,
     after: &'a SupervisorState,
     effects: &'a [Effect],
     keys: &'a [ChildKey],
@@ -243,7 +272,7 @@ fn explore(
         for event in &alphabet {
             let mut after = before.clone();
             effects.clear();
-            step(&mut after, event.clone(), &mut effects);
+            event.apply(&mut after, &mut effects);
             transitions += 1;
             after.check_invariants();
             check(&Transition {
@@ -336,7 +365,7 @@ fn check_e4_authoritative_membership_and_incarnation_state(transition: &Transiti
                     "only a joined child can leave the roster"
                 );
                 assert!(
-                    matches!(transition.event, Event::Reclaim { child: key } if *key == child),
+                    matches!(transition.event, Input::Step(Event::Reclaim { child: key }) if *key == child),
                     "only `Reclaim` removes a key, got {:?}",
                     transition.event
                 );
@@ -426,7 +455,7 @@ fn check_r5_effects_are_acknowledgeable(transition: &Transition<'_>) {
 /// consume, so re-settling reproduces exactly those and nothing else; any
 /// other repeated effect would spin the driver's level-triggered loop.
 fn check_r5_settlement_reaches_a_fixed_point(transition: &Transition<'_>) {
-    if !matches!(transition.event, Event::Settle) {
+    if !matches!(transition.event, Input::Step(Event::Settle)) {
         return;
     }
     let mut again = transition.after.clone();
@@ -464,7 +493,7 @@ fn check_r3_removal_is_sampled_at_publication(transition: &Transition<'_>) {
         }
     }
 
-    let Event::RemovalSampled { child } = transition.event else {
+    let Input::Step(Event::RemovalSampled { child }) = transition.event else {
         return;
     };
     if !transition.after.contains(*child) {
@@ -497,7 +526,7 @@ fn check_r1_r2_r6_startup_aggregate(transition: &Transition<'_>) {
         let after = transition.after.initial_ready(child);
         if !before && after {
             assert!(
-                matches!(transition.event, Event::Ready { child: key, .. } if *key == child),
+                matches!(transition.event, Input::Step(Event::Ready { child: key }) if *key == child),
                 "only a readiness edge sets the aggregate bit, got {:?}",
                 transition.event
             );
@@ -519,7 +548,7 @@ fn check_r1_r2_r6_startup_aggregate(transition: &Transition<'_>) {
             assert!(
                 matches!(
                     transition.event,
-                    Event::RestartPending { child: key } if *key == child
+                    Input::Step(Event::RestartPending { child: key }) if *key == child
                 ),
                 "only a restart clears the aggregate bit, got {:?}",
                 transition.event
@@ -542,8 +571,8 @@ fn check_r1_r2_r6_startup_aggregate(transition: &Transition<'_>) {
         .children
         .values()
         .any(|record| matches!(record.startup, StartupMembership::Initial { ready: false }));
-    let settling_a_starting_scope =
-        matches!(transition.event, Event::Settle) && transition.before.lifecycle().is_starting();
+    let settling_a_starting_scope = matches!(transition.event, Input::Step(Event::Settle))
+        && transition.before.lifecycle().is_starting();
 
     // The safety half of R6, universally: an unready initial member — and only
     // an initial one, which is R1 — always withholds the aggregate.
@@ -655,7 +684,7 @@ fn check_s3_s4_stop_sequencing_and_drain_lattice(transition: &Transition<'_>) {
         .collect();
 
     match transition.event {
-        Event::Force => {
+        Input::Force => {
             assert!(transition.after.hard_forced());
             assert!(transition.after.lifecycle().is_draining());
             assert_eq!(
@@ -663,7 +692,7 @@ fn check_s3_s4_stop_sequencing_and_drain_lattice(transition: &Transition<'_>) {
                 "force reaches exactly the children with work left to end"
             );
         }
-        Event::BeginDrain { .. } if !transition.before.lifecycle().is_draining() => {
+        Input::BeginDrain(_) if !transition.before.lifecycle().is_draining() => {
             assert!(transition.after.lifecycle().is_draining());
             if transition.before.flavor() == ScopeFlavor::Dynamic {
                 assert_eq!(
@@ -677,7 +706,7 @@ fn check_s3_s4_stop_sequencing_and_drain_lattice(transition: &Transition<'_>) {
                 );
             }
         }
-        Event::Settle if transition.before.flavor() == ScopeFlavor::Ordered => {
+        Input::Step(Event::Settle) if transition.before.flavor() == ScopeFlavor::Ordered => {
             assert!(
                 stops.len() <= 1,
                 "ordered settlement exposes one incomplete child at a time, got {stops:?}"
@@ -739,7 +768,7 @@ fn check_t9_removal_effects_are_issued_once(transition: &Transition<'_>) {
                 );
             }
             Effect::StopChild { child }
-                if matches!(transition.event, Event::RemovalLatched { .. }) =>
+                if matches!(transition.event, Input::Step(Event::RemovalLatched { .. })) =>
             {
                 assert!(
                     !matches!(
@@ -794,7 +823,7 @@ fn check_s5_derived_level_triggered_completion(transition: &Transition<'_>) {
     // And its liveness half: settlement is level-triggered, so a drained scope
     // whose children have all joined must publish on the very next settle
     // rather than wait for an edge that is not coming.
-    if matches!(transition.event, Event::Settle)
+    if matches!(transition.event, Input::Step(Event::Settle))
         && !transition.before.finish_emitted
         && transition.before.lifecycle().is_draining()
         && transition.after.all_children_joined()

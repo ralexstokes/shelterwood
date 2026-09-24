@@ -73,11 +73,7 @@ fn start_all(state: &mut SupervisorState, children: &[ChildKey], effects: &mut V
     for &child in children {
         effects.clear();
         supervisor::step(state, Event::Spawned { child }, effects);
-        supervisor::step(
-            state,
-            Event::Ready { child },
-            effects,
-        );
+        supervisor::step(state, Event::Ready { child }, effects);
         settle(state, effects);
     }
     assert_eq!(
@@ -207,13 +203,11 @@ fn bench_supervisor_settle(c: &mut Criterion, flavor: ScopeFlavor) {
                     (state, children, Vec::with_capacity(effects_capacity))
                 },
                 |(mut state, children, mut effects)| {
-                    supervisor::step(
+                    black_box(supervisor::begin_drain(
                         &mut state,
-                        Event::BeginDrain {
-                            reason: StopReason::ShutdownRequested,
-                        },
+                        StopReason::ShutdownRequested,
                         &mut effects,
-                    );
+                    ));
                     match flavor {
                         ScopeFlavor::Ordered => {
                             terminate_all(&mut state, children.iter().rev().copied(), &mut effects)

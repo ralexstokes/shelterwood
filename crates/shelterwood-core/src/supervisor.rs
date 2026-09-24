@@ -180,11 +180,6 @@ pub enum Event {
     Reclaim {
         child: ChildKey,
     },
-    FailStartup,
-    BeginDrain {
-        reason: StopReason,
-    },
-    Force,
     /// Level-triggered startup, ordered-stop, and finish recomputation.
     Settle,
 }
@@ -646,15 +641,6 @@ impl SupervisorState {
                     let _ = self.child_keys.remove(&membership);
                 }
             }
-            Event::FailStartup => {
-                let _ = self.fail_startup();
-            }
-            Event::BeginDrain { reason } => {
-                let _ = self.begin_drain(reason, effects);
-            }
-            Event::Force => {
-                let _ = self.force(effects);
-            }
             Event::Settle => {
                 self.settle_startup(effects);
                 self.settle_ordered_stop(effects);
@@ -709,6 +695,11 @@ impl SupervisorState {
 }
 
 /// Applies one total transition to [`SupervisorState`].
+///
+/// Each transition has exactly one entry point. The ones whose owner must
+/// publish a result — [`admit`], [`fail_startup`], [`begin_drain`] and
+/// [`force`] — are functions returning it; every other transition is an
+/// [`Event`] through here.
 pub fn step(state: &mut SupervisorState, event: Event, effects: &mut Vec<Effect>) {
     state.apply(event, effects);
 }

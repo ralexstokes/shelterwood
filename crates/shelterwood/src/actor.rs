@@ -95,6 +95,16 @@ macro_rules! context_common_forwarders {
         /// completion. Awaiting it resumes a panic raised inside the closure
         /// at the await point.
         ///
+        /// The closure's token is a child of the
+        /// [`shutdown_token`](Self::shutdown_token), and is also cancelled when
+        /// the returned future is dropped. From [`StopContext`] it is
+        /// therefore *always already cancelled*: `on_stop` runs only after
+        /// shutdown has fired, and the child inherits that state. Blocking
+        /// teardown that must finish should not bail out on that token; watch
+        /// a captured [`abort_token`](Self::abort_token) instead, which fires
+        /// only when the stop escalates to abort (grace expiry, or at once
+        /// under an abort shutdown policy).
+        ///
         /// Cancellation is cooperative; a hard-aborted operation's OS thread
         /// detaches and may outlive this actor incarnation.
         /// A blocking-pool rejection during runtime teardown uses a detached
@@ -659,8 +669,8 @@ impl<A: Actor> RawActor for Handler<A> {
     /// Runs one incarnation, leaning on the raw incarnation boundary for the
     /// panic machinery: a callback panic unwinds straight through this frame,
     /// and the raw runner freezes the mailbox and incarnation resources,
-    /// joins them, and only then drops this handler (§6.5's
-    /// resource-before-actor order), preserving the panic as the
+    /// joins them, and only then drops this handler (resources before actor
+    /// state), preserving the panic as the
     /// authoritative exit. Storing the actor in `self` rather than a frame
     /// local is what keeps its drop after that join on the `Err` and panic
     /// paths. Callback *errors* cannot lean on that boundary the same way:
@@ -683,7 +693,7 @@ impl<A: Actor> RawActor for Handler<A> {
     /// decorated raw stack returns, the raw incarnation boundary freezes the
     /// mailbox before joining resources and destroying the context and
     /// actor, which is where acceptance closes for an incarnation that ends
-    /// without a stop phase (§5.4).
+    /// without a stop phase.
     async fn run(&mut self, raw: &mut RawContext<Self::Msg>) -> ExitResult {
         let HandlerState::Uninit(args) = std::mem::replace(&mut self.state, HandlerState::Spent)
         else {

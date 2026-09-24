@@ -435,6 +435,9 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
     }
 
     /// Defines a restartable callback-oriented actor; dropping after first poll detaches.
+    ///
+    /// Dropped before its first poll, the [`Admission`] releases the
+    /// reservation instead and the child never starts.
     pub fn define<A>(self, definition: ActorDef<A>) -> Admission<ActorRef<M>>
     where
         A: crate::Actor<Msg = M>,
@@ -443,6 +446,9 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
     }
 
     /// Defines a one-shot callback-oriented actor; dropping after first poll detaches.
+    ///
+    /// Dropped before its first poll, the [`Admission`] releases the
+    /// reservation instead and the child never starts.
     pub fn define_once<A>(self, definition: ActorOnceDef<A>) -> Admission<ActorRef<M>>
     where
         A: crate::Actor<Msg = M>,
@@ -451,6 +457,9 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
     }
 
     /// Defines a restartable raw actor; dropping after first poll detaches.
+    ///
+    /// Dropped before its first poll, the [`Admission`] releases the
+    /// reservation instead and the child never starts.
     pub fn define_raw<R>(self, definition: RawDef<R>) -> Admission<ActorRef<M>>
     where
         R: crate::RawActor<Msg = M>,
@@ -459,6 +468,9 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
     }
 
     /// Defines a one-shot raw actor; dropping after first poll detaches.
+    ///
+    /// Dropped before its first poll, the [`Admission`] releases the
+    /// reservation instead and the child never starts.
     pub fn define_once_raw<R>(self, definition: RawOnceDef<R>) -> Admission<ActorRef<M>>
     where
         R: crate::RawActor<Msg = M>,
@@ -482,11 +494,17 @@ impl DynamicTaskSlot {
     }
 
     /// Defines a restartable task; dropping after first poll detaches admission.
+    ///
+    /// Dropped before its first poll, the [`Admission`] releases the
+    /// reservation instead and the child never starts.
     pub fn define(self, definition: TaskDef) -> Admission<TaskRef> {
         self.core.define(definition)
     }
 
     /// Defines a one-shot task; dropping after first poll detaches admission.
+    ///
+    /// Dropped before its first poll, the [`Admission`] releases the
+    /// reservation instead and the child never starts.
     pub fn define_once<T: Send + 'static>(
         self,
         definition: TaskOnceDef<T>,
@@ -510,11 +528,17 @@ impl<T: Subtree> DynamicSubtreeSlot<T> {
     }
 
     /// Defines a restartable subtree; dropping after first poll detaches.
+    ///
+    /// Dropped before its first poll, the [`Admission`] releases the
+    /// reservation instead and the child never starts.
     pub fn define(self, definition: SubtreeDef<T>) -> Admission<T::Ref> {
         self.core.define(definition)
     }
 
     /// Defines a one-shot subtree; dropping after first poll detaches.
+    ///
+    /// Dropped before its first poll, the [`Admission`] releases the
+    /// reservation instead and the child never starts.
     pub fn define_once(self, definition: SubtreeOnceDef<T>) -> Admission<T::Ref> {
         self.core.define(definition)
     }

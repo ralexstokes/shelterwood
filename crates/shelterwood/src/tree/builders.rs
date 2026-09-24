@@ -19,7 +19,7 @@ use super::{
 /// A root lowering error.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum BuildError {
-    /// No ambient supported async runtime exists.
+    /// No ambient supported async runtime (currently Tokio) exists.
     ///
     /// Only the runtime's presence is checked. It must also have its time
     /// driver enabled (Tokio's `enable_time`, or `enable_all`): a runtime
@@ -27,7 +27,7 @@ pub enum BuildError {
     /// when first polled, which may happen in a framework task or in the
     /// caller's future (for example, during shutdown), rather than returning
     /// this variant.
-    #[error("no ambient Tokio runtime is available")]
+    #[error("no ambient supported async runtime is available")]
     NoRuntime,
     /// One or more reserved slots were left undefined.
     #[error("tree contains undefined reserved slots")]

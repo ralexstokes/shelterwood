@@ -24,8 +24,8 @@ pub enum StaticReserveError {
 /// A child reservation or dynamic admission error.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ReserveError {
-    /// No ambient supported async runtime exists.
-    #[error("no ambient Tokio runtime is available")]
+    /// No ambient supported async runtime (currently Tokio) exists.
+    #[error("no ambient supported async runtime is available")]
     NoRuntime,
     /// The child id was empty.
     #[error("child id must not be empty")]

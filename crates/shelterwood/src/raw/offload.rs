@@ -70,8 +70,7 @@ impl Guard {
     /// This notification does not join work that is being hard-aborted.
     ///
     /// The waker driving this await is caller-owned, but the incarnation is
-    /// what runs it, so it belongs to SPEC §6.2's incarnation-owned disposal
-    /// funnel on the *ordinary* completion path and not only at teardown. A
+    /// what runs it, so it belongs to the incarnation-owned disposal funnel on the *ordinary* completion path and not only at teardown. A
     /// waker that panics while being woken has its payload retained, which
     /// fails the incarnation at its next receive boundary and suppresses
     /// `on_stop` — a third party awaiting this can therefore kill the actor.

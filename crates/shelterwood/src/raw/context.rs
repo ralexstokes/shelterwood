@@ -602,7 +602,7 @@ impl<M: Send + 'static> RawContext<M> {
     /// Returns the engine-resolved effective readiness mode for this
     /// incarnation: the definition-level override when one was given,
     /// otherwise the actor's declared mode. This is the single source the
-    /// gate is driven by (§7) — decorators and the blanket handler loop
+    /// readiness gate is driven by — decorators and the blanket handler loop
     /// consult it rather than re-deriving their own.
     #[must_use]
     pub fn readiness(&self) -> Readiness {
@@ -619,13 +619,13 @@ impl<M: Send + 'static> RawContext<M> {
     /// Requests a clean self-stop of this incarnation.
     ///
     /// External intake freezes at this call — the drained set is exactly the
-    /// already-accepted prefix (§5.4's close point) — queued continuations
+    /// already-accepted prefix — queued continuations
     /// and timers are discarded, and [`recv`](Self::recv) returns `None`.
     /// A raw loop honoring [`MailboxShutdown::Drain`] must then consume the
     /// frozen prefix with [`try_recv`](Self::try_recv); `recv` never drains a
     /// frozen mailbox. Idempotent. This is the primitive the blanket handler
-    /// loop's `Context::stop` is built on (§1 principle 5); the child's
-    /// configured §11 ladder bounds the stop.
+    /// loop's `Context::stop` is built on; the child's configured shutdown
+    /// escalation (grace, then abort) bounds the stop.
     ///
     /// A cleanup failure raised while freezing — a hostile waker woken by
     /// offload cancellation, or a released destructor — is retained as this
@@ -744,7 +744,7 @@ impl<M: Send + 'static> RawContext<M> {
     /// Starts incarnation-owned async work with one total deadline budget.
     ///
     /// Completions re-enter the loop through incarnation-internal storage
-    /// that does not consume mailbox capacity (SPEC §6.5). That storage is
+    /// that does not consume mailbox capacity. That storage is
     /// unbounded but cannot accumulate a backlog: it holds at most one entry
     /// per offload the actor itself started, and each bounded arbitration turn
     /// admits at most one mailbox delivery before its captured completion
@@ -837,8 +837,7 @@ impl<M: Send + 'static> RawContext<M> {
     /// those offloads wakes, and a panic raised by aborting an offload task.
     /// The completion-waiter class is not teardown-only: a third party
     /// awaiting `Guard::finished()` with a panicking waker fails a live
-    /// incarnation here, and per SPEC §6.2 a failed incarnation skips
-    /// `on_stop`. Retention is the guarantee, not a join: a payload recorded
+    /// incarnation here, and a failed incarnation skips `on_stop`. Retention is the guarantee, not a join: a payload recorded
     /// after this check is still the incarnation's exit, but is classified by
     /// the epilogue and cannot suppress `on_stop`. The one exception is that
     /// same completion wake: because retention has to be established before
@@ -900,8 +899,8 @@ impl<M: Send + 'static> RawContext<M> {
     /// class is not only offload work: a waker panic from the
     /// `Guard::finished()` waiters that ordinary offload completion wakes is
     /// retained the same way, so a third party awaiting `Guard::finished()`
-    /// with a panicking waker fails a live incarnation here and, per SPEC
-    /// §6.2, skips its `on_stop`. During drain it freezes first, then resumes
+    /// with a panicking waker fails a live incarnation here and skips its
+    /// `on_stop`. During drain it freezes first, then resumes
     /// any incarnation-owned disposal panic retained by that point — those
     /// two, plus a destructor panic from the continuations, timers, queued
     /// completions and offload futures the freeze releases, a waker panic

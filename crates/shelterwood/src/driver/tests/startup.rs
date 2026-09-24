@@ -328,6 +328,76 @@ async fn always_restart_deadline_ahead_of_a_window_stop_runs_the_policys_own_res
     );
 }
 
+/// Vacating an Always request wakes user code. That code must already see
+/// Starting, so a reentrant stop addresses the committed body instead of
+/// slipping into the idle gap between the stop decision and publication.
+#[crate::runtime::test]
+async fn vacated_stop_wakes_only_after_the_construction_boundary() {
+    struct StopOnWake {
+        scope: Arc<ScopeCell>,
+        starting: AtomicBool,
+    }
+    impl Wake for StopOnWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.starting.store(
+                matches!(self.scope.member.record().stage, MemberStage::Starting),
+                Ordering::SeqCst,
+            );
+            self.scope.request_shutdown();
+        }
+    }
+    let mut tree = Tree::new();
+    tree.add_subtree("nested", nested_with_backoff(RestartCondition::Always))
+        .expect("valid subtree");
+    let fixture = OrderedScopeFixture::new(tree);
+    let key = fixture.children.keys().next().expect("one child");
+    let nested = Arc::clone(
+        fixture.children[key]
+            .slot
+            .scope
+            .as_ref()
+            .expect("nested scope"),
+    );
+    let (mut scope, _events) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
+    let target = nested.request_shutdown();
+    let mut watcher = nested.member.record_watcher();
+    watcher.borrow_and_update_cloned();
+    let wake = Arc::new(StopOnWake {
+        scope: Arc::clone(&nested),
+        starting: AtomicBool::new(false),
+    });
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut changed = Box::pin(watcher.changed());
+    assert!(
+        changed
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+
+    spawn_unpolled(&mut scope, key);
+
+    assert!(
+        wake.starting.load(Ordering::SeqCst),
+        "a settled idle request cannot wake before Starting commits"
+    );
+    assert!(
+        nested.settled(Some(target)),
+        "the original idle request is vacated"
+    );
+    let live = nested
+        .begin_incarnation(ScopeState::Starting)
+        .expect("the committed body begins");
+    assert!(
+        nested.has_stop_request(live),
+        "the reentrant request addresses that body"
+    );
+    nested.finish_incarnation(live, StopReason::ShutdownRequested);
+}
+
 /// A window stop and an intensity-tripping sibling exit collected in one
 /// batch: the exit sorts first and drains the scope, so the drain owns the
 /// window member's terminal and the resolver leaves it alone.

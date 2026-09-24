@@ -856,6 +856,53 @@ impl ScopeCell {
         })
     }
 
+    /// Commits a nested member's construction boundary against shutdown.
+    /// Both cells share the resident-tree gate with `request_shutdown`, so a
+    /// request either prevents this start (or is vacated by restart policy),
+    /// or observes an already-starting member and addresses its live body.
+    /// Even vacated-request wakes run only after `Starting` is installed.
+    pub(crate) fn start_scope_child(
+        &self,
+        child: &ScopeCell,
+        incarnation: Incarnation,
+        restart_stopped: bool,
+    ) -> bool {
+        let started = self.with_observation_gate(|txn| {
+            let mut control = child.control.lock().expect("scope control mutex poisoned");
+            if let Some(request) = control.shutdown
+                && !request.consumed
+                && control.epochs.request_is_pending(request.epoch)
+            {
+                if !restart_stopped {
+                    return None;
+                }
+                control.epochs.vacate(request.epoch);
+                control.shutdown = None;
+            }
+            drop(control);
+            let member = &child.member;
+            if !member.transition_locked(txn, MemberTransition::Starting { incarnation }) {
+                return Some(false);
+            }
+            self.emit_locked(
+                txn,
+                LifecycleEventKind::Started {
+                    id: member.id().clone(),
+                    membership: member.membership(),
+                    incarnation,
+                },
+            );
+            Some(true)
+        });
+        // As with ordinary child starts, a rejected publication cannot launch
+        // an unannounced body. Report it only after the transaction unlocks.
+        debug_assert!(
+            started != Some(false),
+            "a scope spawn starts an admitted or restarting member"
+        );
+        started == Some(true)
+    }
+
     /// Publishes one restart schedule, or refuses the whole publication.
     ///
     /// Returns whether the reducer accepted the transition. The restart
@@ -3200,6 +3247,43 @@ mod tests {
             "the stale verdict must not rewrite the newer incarnation"
         );
         scope.finish_incarnation(live, StopReason::Finished);
+    }
+
+    #[test]
+    fn a_shutdown_winning_the_start_publication_gate_prevents_starting() {
+        let root = isolated_scope("root", ScopeFlavor::Dynamic);
+        let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
+        assert!(root.admit_child(ResidentProjection::new(
+            Arc::clone(&nested.member),
+            Some(Arc::clone(&nested)),
+        )));
+        let incarnation =
+            crate::identity::IncarnationCounter::fixture(nested.member.membership()).mint();
+        let captures = root.probe_gate_captures();
+        let start = root.with_observation_gate(|txn| {
+            captures
+                .recv_timeout(TEST_WAIT)
+                .expect("our transaction captured the gate");
+            let starting_root = Arc::clone(&root);
+            let starting_child = Arc::clone(&nested);
+            let start = std::thread::spawn(move || {
+                starting_root.start_scope_child(&starting_child, incarnation, false)
+            });
+            captures
+                .recv_timeout(TEST_WAIT)
+                .expect("the start is waiting for publication");
+            // Exercise the same shutdown transition as the public request,
+            // using the transaction we already hold to order it ahead of start.
+            let control = nested.lock_control(ControlPoison::Reject);
+            nested.request_shutdown_locked(control, txn, ControlPoison::Reject);
+            start
+        });
+        assert!(!start.join().expect("start decision completes"));
+        assert!(matches!(
+            nested.member.record().stage,
+            MemberStage::Admitted
+        ));
+        assert!(nested.pending_incarnation_shutdown().is_some());
     }
 
     #[test]

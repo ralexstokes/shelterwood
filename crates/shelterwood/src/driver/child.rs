@@ -730,26 +730,25 @@ impl ScopeRuntime {
         {
             return;
         }
-        // SPEC §11: a stop accepted while this member had no live
-        // incarnation never constructs one. The check is level-triggered here,
-        // at the single construction funnel, so no ordering between the
-        // request, its control event and a due restart deadline can construct
-        // an incarnation on the request's behalf. Either branch changes
-        // reducer state, so a settlement pass that asked for this start
-        // cannot re-derive it.
-        if let Some(scope) = child.slot.scope.as_ref().map(Arc::clone)
-            && let Some(target) = scope.pending_incarnation_shutdown()
+        let nested = child.slot.scope.as_ref().map(Arc::clone);
+        let restart_stopped = self.restarts_a_stopped_incarnation(key);
+        let incarnation = self
+            .children
+            .get_mut(key)
+            .expect("the spawnable child remains registered")
+            .incarnations
+            .mint();
+        // The pending-stop decision and Starting publication share the gate
+        // with request_shutdown. A separate peek leaves a race in which an
+        // idle request could be carried into a newly constructed body.
+        if let Some(nested) = &nested
+            && !self
+                .root
+                .start_scope_child(nested, incarnation, restart_stopped)
         {
-            if self.restarts_a_stopped_incarnation(key) {
-                // The construction that follows is the policy's own, into the
-                // epoch after the vacated target, with a clear latch.
-                let vacated = scope.vacate_pending_shutdown(target);
-                debug_assert!(vacated, "a sampled pending target is vacatable");
-            } else {
-                let startup = self.terminal_startup_disposition(key);
-                self.terminate_inactive(key, startup);
-                return;
-            }
+            let startup = self.terminal_startup_disposition(key);
+            self.terminate_inactive(key, startup);
+            return;
         }
         let child = self
             .children
@@ -758,7 +757,6 @@ impl ScopeRuntime {
         if let Some(deadline) = child.restart_deadline.take() {
             self.deadlines.cancel(deadline);
         }
-        let incarnation = child.incarnations.mint();
 
         // Per-incarnation latch topology:
         // - shutdown/abort flow from the ladder into application code;
@@ -784,24 +782,28 @@ impl ScopeRuntime {
                 .expect("configuration or close supplies each bind token");
             mailbox.bind(token, incarnation, &mut effects);
         }
+        // Non-scope children publish after mailbox binding. Nested members
+        // already committed Starting together with their stop decision.
         // A spawn reaches here only from `Admitted` (first incarnation) or
         // `Restarting` (a scheduled restart), both accepted sources. The body
         // and the mailbox bind above are already committed, so a refusal would
         // run the incarnation with no `Started` edge — see the partial-effect
         // note on issue #392.
-        let started = self.root.transition_child_stage(
-            &child.slot.member,
-            MemberTransition::Starting { incarnation },
-            Some(LifecycleEventKind::Started {
-                id: child.slot.member.id().clone(),
-                membership: child.slot.member.membership(),
-                incarnation,
-            }),
-        );
-        assert!(
-            started,
-            "a spawn starts an admitted or restarting member's projection"
-        );
+        if nested.is_none() {
+            let started = self.root.transition_child_stage(
+                &child.slot.member,
+                MemberTransition::Starting { incarnation },
+                Some(LifecycleEventKind::Started {
+                    id: child.slot.member.id().clone(),
+                    membership: child.slot.member.membership(),
+                    incarnation,
+                }),
+            );
+            assert!(
+                started,
+                "a spawn starts an admitted or restarting member's projection"
+            );
+        }
 
         let mut readiness = ReadinessGate::new();
         let deadline = child

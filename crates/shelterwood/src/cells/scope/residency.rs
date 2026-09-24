@@ -1,3 +1,7 @@
+//! A scope's resident child set and the edges that follow residency: the
+//! upward parent link, observation-gate handoff onto the resident tree, and
+//! admission, pruning and clearing with their `Added`/`Removed` edges.
+
 use std::sync::{Arc, MutexGuard, Weak};
 
 #[cfg(test)]

@@ -1,3 +1,6 @@
+//! Observation-visible state publication: scope state and startup records,
+//! child stage transitions, and the monotonic `Stopped` projection.
+
 use std::sync::{Arc, MutexGuard};
 
 use crate::runtime;
@@ -424,12 +427,12 @@ impl ScopeCell {
     /// precede its parent's terminal event and only then close the nested
     /// streams; a subscriber attaching after the final event and before that
     /// closure therefore resolves by closure alone, as it already does on the
-    /// stale-epoch path above.
+    /// stale-epoch path of `finish_incarnation_with_terminal`.
     ///
     /// Reachability note: in production the upgrade arm's only visitor is
-    /// `ShutdownRequested` outranking an already-recorded weaker reason —
-    /// the SPEC §11 stop-precedence order stands. The synthetic lattice
-    /// tests below (and `begin_drain`'s twin in `shelterwood-core`) drive
+    /// `ShutdownRequested` outranking an already-recorded weaker reason
+    /// under SPEC §11 stop precedence. The synthetic lattice tests in
+    /// `tests.rs` (and `begin_drain`'s twin in `shelterwood-core`) drive
     /// the full precedence table directly.
     pub(super) fn publish_stopped_locked(
         &self,

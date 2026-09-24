@@ -1,3 +1,6 @@
+//! The scope control plane: incarnation epochs, shutdown and force requests,
+//! control events for the parent driver, and the dynamic-admission route.
+
 use std::{
     any::Any,
     collections::VecDeque,
@@ -132,9 +135,9 @@ impl ScopeCell {
                     record.state = state.clone();
                 });
             });
-            // Hold epoch ownership through its observation projection. A
-            // stale finish and a newer begin can no longer cross these two
-            // state planes in opposite orders.
+            // Hold epoch ownership through its observation projection, so a
+            // stale finish and a newer begin cannot cross these two state
+            // planes in opposite orders.
             drop(control);
             wakes.pulse(&self.observation.record);
             wakes.pulse(&self.member.record);
@@ -500,7 +503,7 @@ impl ScopeCell {
     /// `None` is used only by the entry check, before a target epoch exists.
     ///
     /// This predicate is strictly weaker than membership terminality, so
-    /// shutdown liveness now rests on two structural invariants. First, every
+    /// shutdown liveness rests on two structural invariants. First, every
     /// live epoch has exactly one owner — the pre-driver epoch guard before a
     /// scope runtime exists, the scope runtime itself afterwards — and both
     /// finish it from `Drop`, so an unsettled target always has a pending

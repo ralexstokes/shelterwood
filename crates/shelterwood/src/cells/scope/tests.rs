@@ -1,3 +1,5 @@
+//! Unit tests for the scope cell.
+
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
@@ -902,12 +904,12 @@ impl DynamicRoute for InertRoute {
     fn close_admission(&self, _txn: &mut ObservationTxn<'_>) {}
 }
 
-/// Coverage for the surviving live-route assertion.
+/// Coverage for the live-route re-homing assertion.
 ///
 /// `admit_observation_gate` needs none: its legality probe
 /// refuses every stage a started driver can present, so a re-homed live
 /// route is unconstructible there. The reservation-time adoption path has
-/// no such probe, and this is its regression.
+/// no such probe, so this test pins the assertion there.
 #[test]
 #[should_panic(expected = "a scope with a live dynamic route is never re-homed")]
 fn plain_gate_adoption_rejects_a_scope_with_a_live_dynamic_route() {

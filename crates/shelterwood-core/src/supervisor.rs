@@ -96,18 +96,6 @@ impl ChildState {
         }
     }
 
-    /// Whether the current incarnation has stopped executing.
-    pub fn incarnation_complete(self) -> bool {
-        matches!(
-            self.incarnation(),
-            IncarnationState::Unstarted
-                | IncarnationState::Complete
-                | IncarnationState::RestartPending
-                | IncarnationState::Disposing
-                | IncarnationState::Joined
-        )
-    }
-
     /// Whether terminal disposal has joined and no child work remains.
     pub fn joined(self) -> bool {
         self.incarnation() == IncarnationState::Joined
@@ -269,6 +257,7 @@ impl SupervisorState {
         &self.lifecycle
     }
 
+    #[cfg(test)]
     pub fn flavor(&self) -> ScopeFlavor {
         self.flavor
     }
@@ -283,10 +272,6 @@ impl SupervisorState {
 
     pub fn contains(&self, child: ChildKey) -> bool {
         self.children.contains_key(&child)
-    }
-
-    pub fn membership(&self, child: ChildKey) -> Option<Membership> {
-        self.children.get(&child).map(|record| record.membership)
     }
 
     fn child_state(&self, child: ChildKey) -> Option<ChildState> {
@@ -322,11 +307,6 @@ impl SupervisorState {
             .is_some_and(|state| state.incarnation() == IncarnationState::Disposing)
     }
 
-    pub fn incarnation_complete(&self, child: ChildKey) -> bool {
-        self.child_state(child)
-            .is_some_and(ChildState::incarnation_complete)
-    }
-
     pub fn joined(&self, child: ChildKey) -> bool {
         self.child_state(child).is_some_and(ChildState::joined)
     }
@@ -340,14 +320,12 @@ impl SupervisorState {
         self.children.values().all(|record| record.state.joined())
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.children.is_empty()
     }
 
-    pub fn len(&self) -> usize {
-        self.children.len()
-    }
-
+    #[cfg(test)]
     pub fn keys(&self) -> impl DoubleEndedIterator<Item = ChildKey> + '_ {
         self.children.keys().copied()
     }

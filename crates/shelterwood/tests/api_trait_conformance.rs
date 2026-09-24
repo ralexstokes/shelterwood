@@ -5,13 +5,13 @@ use shelterwood::{
     CallFuture, Cancellation, CancellationToken, ChildId, Context, DeadlineBudget, DeadlineElapsed,
     DefaultsInheritance, DynamicActorSlot, DynamicScopeRef, DynamicSubtreeSlot, DynamicTaskSlot,
     DynamicTree, ExitError, ExitResult, GracePhase, Guard, Handler, Incarnation, Intensity,
-    LifecycleEvents, LifecycleTryRecvError, Mailbox, MailboxShutdown, Membership, MembershipStatus,
-    NonZeroDuration, OneShotTaskRef, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
-    ReadinessDeadline, Removal, Reply, ReplyReceive, ReplyReceiver, ReserveError, RestartAttempt,
-    RestartCount, RestartPolicy, Retention, ScopeDefaults, ScopeRef, SendError, SendFuture,
-    SendTimeout, Shutdown, SnapshotClosed, SnapshotReceiver, StaticReserveError, StopContext,
-    SubtreeDef, SubtreeOnceDef, SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot,
-    TotalRestarts, Tree, WaitError,
+    LifecycleEvents, LifecycleTryRecvError, Mailbox, MailboxShutdown, MemberHandle, Membership,
+    MembershipStatus, NonZeroDuration, OneShotTaskRef, RawActor, RawContext, RawDef, RawOnceDef,
+    Readiness, ReadinessDeadline, Removal, Reply, ReplyReceive, ReplyReceiver, ReserveError,
+    RestartAttempt, RestartCount, RestartPolicy, Retention, ScopeDefaults, ScopeRef, ScopeSnapshot,
+    SendError, SendFuture, SendTimeout, Shutdown, SnapshotClosed, SnapshotReceiver,
+    StaticReserveError, StopContext, SubtreeDef, SubtreeOnceDef, SubtreeSlot, System, TaskDef,
+    TaskOnceDef, TaskRef, TaskSlot, TotalRestarts, Tree, WaitError,
 };
 
 fn assert_error<T: Error>() {}
@@ -53,6 +53,35 @@ assert_not_impl!(OneShotTaskRef<Cell<()>>: Clone);
 assert_not_impl!(Membership: Ord);
 assert_not_impl!(Incarnation: Ord);
 assert_not_impl!(DynamicScopeRef: std::ops::Deref);
+
+#[test]
+fn every_public_id_parameter_takes_into_child_id() {
+    fn assert_into_child_id<T: Into<ChildId>>() {}
+    fn assert_member_handle<T: MemberHandle>() {}
+
+    assert_into_child_id::<&str>();
+    assert_into_child_id::<String>();
+    assert_into_child_id::<ChildId>();
+    assert_into_child_id::<&ChildId>();
+    assert_member_handle::<ActorRef<Cell<()>>>();
+    assert_member_handle::<TaskRef>();
+    assert_member_handle::<ScopeRef>();
+    assert_member_handle::<DynamicScopeRef>();
+
+    // Lookups, id-based removal and exact removal all take a held handle's
+    // id or the handle itself, with no text conversion at the call site.
+    let _by_handle = |scope: &DynamicScopeRef, snapshot: &ScopeSnapshot, task: &TaskRef| {
+        let _ = snapshot.child(task.id());
+        let _ = snapshot.descendant([task.id(), task.id()]);
+        let _ = scope.as_scope().child(task.id());
+        let _ = scope.as_scope().descendant(["nested", "worker"]);
+        let _wait = scope
+            .as_scope()
+            .wait_for_child(task.id(), |_| true, Duration::ZERO);
+        let _by_id: Removal = scope.remove(task.id());
+        let _exact: Removal = scope.remove_exact(task);
+    };
+}
 
 #[test]
 fn documented_identity_handle_token_and_owned_value_bounds_compile() {

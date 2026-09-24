@@ -52,6 +52,14 @@ impl From<String> for ChildId {
     }
 }
 
+/// Lets a borrowed id — typically a handle's `id()` — go wherever an owned
+/// one is expected. Ids are shared text, so this is a refcount bump.
+impl From<&ChildId> for ChildId {
+    fn from(value: &ChildId) -> Self {
+        value.clone()
+    }
+}
+
 /// A child's identity within one supervising scope.
 ///
 /// Membership identity survives incarnation restarts. It does not survive a

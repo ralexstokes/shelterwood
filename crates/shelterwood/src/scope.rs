@@ -57,7 +57,7 @@ impl ScopeRef {
 
     /// Looks up a direct child in an authoritative current snapshot.
     #[must_use]
-    pub fn child(&self, id: impl AsRef<str>) -> Option<ChildSnapshot> {
+    pub fn child(&self, id: impl Into<ChildId>) -> Option<ChildSnapshot> {
         self.snapshot().child(id).cloned()
     }
 
@@ -66,7 +66,7 @@ impl ScopeRef {
     pub fn descendant<I, S>(&self, path: I) -> Option<ChildSnapshot>
     where
         I: IntoIterator<Item = S>,
-        S: AsRef<str>,
+        S: Into<ChildId>,
     {
         self.snapshot().descendant(path).cloned()
     }
@@ -155,7 +155,7 @@ impl ScopeRef {
 
         loop {
             let (snapshot, closed) = snapshots.borrow_latest_and_closed();
-            if let Some(child) = snapshot.child(id.as_str())
+            if let Some(child) = snapshot.child(&id)
                 && pred(child)
             {
                 return Ok(child.clone());

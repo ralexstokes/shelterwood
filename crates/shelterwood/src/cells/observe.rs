@@ -305,9 +305,9 @@ pub struct ScopeSnapshot {
 impl ScopeSnapshot {
     /// Finds a direct child by its current resident label.
     #[must_use]
-    pub fn child(&self, id: impl AsRef<str>) -> Option<&ChildSnapshot> {
-        let id = id.as_ref();
-        self.children.iter().find(|child| child.id.as_str() == id)
+    pub fn child(&self, id: impl Into<ChildId>) -> Option<&ChildSnapshot> {
+        let id = id.into();
+        self.children.iter().find(|child| child.id == id)
     }
 
     /// Traverses a child-id path through recursive scope snapshots.
@@ -315,7 +315,7 @@ impl ScopeSnapshot {
     pub fn descendant<I, S>(&self, path: I) -> Option<&ChildSnapshot>
     where
         I: IntoIterator<Item = S>,
-        S: AsRef<str>,
+        S: Into<ChildId>,
     {
         let mut found: Option<&ChildSnapshot> = None;
         for id in path {

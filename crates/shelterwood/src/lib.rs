@@ -267,8 +267,8 @@ pub use scope::{DynamicScopeRef, ScopeRef};
 pub use task::{OneShotTaskRef, TaskContext, TaskDef, TaskOnceDef, TaskRef};
 pub use tree::{
     ActorSlot, Admission, BuildError, DynamicActorSlot, DynamicSubtreeSlot, DynamicTaskSlot,
-    DynamicTree, Removal, StartOrShutdownError, Subtree, SubtreeDef, SubtreeOnceDef, SubtreeSlot,
-    System, TaskSlot, Tree,
+    DynamicTree, MemberHandle, Removal, StartOrShutdownError, Subtree, SubtreeDef, SubtreeOnceDef,
+    SubtreeSlot, System, TaskSlot, Tree,
 };
 
 pub mod prelude;

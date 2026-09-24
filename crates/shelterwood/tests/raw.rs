@@ -523,7 +523,7 @@ async fn dynamic_scope_admits_uses_and_exactly_removes_a_raw_actor() {
             == [9]
     })
     .await;
-    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&actor).await, RemoveOutcome::Removed);
     let terminal = actor.send(10).await.expect_err("removed actor is terminal");
     assert_eq!(terminal.kind, SendErrorKind::Terminated);
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");

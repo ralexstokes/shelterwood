@@ -64,7 +64,8 @@ handle admission returned, and remove *that membership*:
 The protocol for replacing a child, step by step:
 
 1. Keep the handle admission returned.
-2. Call `remove_actor` (or `remove_task`, `remove_scope`) with it.
+2. Call `remove_exact` with it. It takes any child handle: `ActorRef`,
+   `TaskRef`, `ScopeRef`, or `DynamicScopeRef`.
 3. Await `RemoveOutcome::Removed`.
 4. Admit the replacement.
 

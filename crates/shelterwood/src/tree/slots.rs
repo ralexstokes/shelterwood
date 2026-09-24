@@ -8,18 +8,12 @@ use crate::{
     plan::{BuilderCore, ChildConstruction, SlotCell},
     policy::ScopeFlavor,
     raw::{RawDef, RawOnceDef},
-    runtime,
+    runtime::{self, Latch},
     scope::{DynamicScopeRef, ScopeRef},
     task::{OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
 };
 
 use super::{Admission, Subtree, SubtreeDef, SubtreeOnceDef, system::sealed};
-
-#[derive(Clone, Copy)]
-pub(super) enum AdmissionOwnership {
-    Split,
-    Fused,
-}
 
 pub(super) trait SlotEndpoint: Sized {
     type Output<H>;
@@ -46,14 +40,16 @@ impl SlotEndpoint for StaticSlotEndpoint {
 
 pub(super) struct DynamicSlotEndpoint {
     reservation: Option<DynamicReservation>,
-    ownership: AdmissionOwnership,
+    /// `Some` for a fused `add_*`: the cancellation latch its [`Admission`]
+    /// fires on drop. `None` for a split slot, whose admission detaches.
+    fused_cancel: Option<Latch>,
 }
 
 impl DynamicSlotEndpoint {
-    pub(super) fn new(reservation: DynamicReservation, ownership: AdmissionOwnership) -> Self {
+    pub(super) fn new(reservation: DynamicReservation, fused_cancel: Option<Latch>) -> Self {
         Self {
             reservation: Some(reservation),
-            ownership,
+            fused_cancel,
         }
     }
 
@@ -77,18 +73,14 @@ impl SlotEndpoint for DynamicSlotEndpoint {
             .take()
             .expect("dynamic slot reservation was already consumed");
         reservation.slot.define(construction);
-        Admission::new(reservation, handles, self.ownership)
+        Admission::new(reservation, handles, self.fused_cancel.take())
     }
 }
 
 impl Drop for DynamicSlotEndpoint {
     fn drop(&mut self) {
         if let Some(reservation) = &self.reservation {
-            crate::driver::cancel_dynamic_reservation(
-                &reservation.scope,
-                reservation.control.as_ref(),
-                &reservation.slot,
-            );
+            reservation.cancel();
         }
     }
 }
@@ -169,10 +161,10 @@ pub(super) fn reserve_static<K: SlotKind>(
 pub(super) fn reserve_dynamic<K: SlotKind>(
     scope: &DynamicScopeRef,
     id: impl Into<ChildId>,
-    ownership: AdmissionOwnership,
+    fused_cancel: Option<Latch>,
 ) -> Result<SlotCore<DynamicSlotEndpoint, K>, ReserveError> {
     crate::driver::reserve_dynamic(&scope.0.cell, id.into(), K::SCOPE_FLAVOR)
-        .map(|reservation| SlotCore::new(DynamicSlotEndpoint::new(reservation, ownership)))
+        .map(|reservation| SlotCore::new(DynamicSlotEndpoint::new(reservation, fused_cancel)))
 }
 
 /// Sealed semantic lowering for each nominal public definition type.

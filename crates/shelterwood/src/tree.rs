@@ -8,5 +8,6 @@ mod system;
 
 pub use admission::*;
 pub use builders::*;
+pub use dynamic_api::MemberHandle;
 pub use slots::*;
 pub use system::*;

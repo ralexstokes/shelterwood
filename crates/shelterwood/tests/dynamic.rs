@@ -192,7 +192,7 @@ async fn scope_dynamic_conversion_and_exact_dynamic_scope_removal_are_publicly_u
         .await
         .expect("dynamic subtree is admitted");
     assert_eq!(
-        dynamic_scope.remove_dynamic_scope(&nested).await,
+        dynamic_scope.remove_exact(&nested).await,
         RemoveOutcome::Removed
     );
     dynamic
@@ -220,9 +220,9 @@ async fn restartable_dynamic_surfaces_are_parallel_across_all_three_child_kinds(
         .await
         .expect("restartable subtree is admitted");
 
-    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
-    assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
-    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&raw).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&subtree).await, RemoveOutcome::Removed);
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
@@ -252,9 +252,9 @@ async fn consuming_dynamic_surfaces_are_parallel_across_all_three_child_kinds() 
         .await
         .expect("one-shot subtree is admitted");
 
-    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
-    assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
-    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&raw).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&subtree).await, RemoveOutcome::Removed);
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
@@ -278,7 +278,7 @@ async fn dynamic_actor_add_resolves_at_admission_without_awaiting_init() {
     .expect("admission does not wait for init")
     .expect("actor admitted");
     actor.send(()).await.expect("admitted mailbox is usable");
-    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&actor).await, RemoveOutcome::Removed);
     system
         .shutdown(SHUTDOWN_BUDGET)
         .await
@@ -354,9 +354,9 @@ async fn task_raw_and_subtree_admissions_resolve_before_manual_startup() {
         )
         .await;
     }
-    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
-    assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
-    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&raw).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&subtree).await, RemoveOutcome::Removed);
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
@@ -376,7 +376,7 @@ async fn successful_admission_is_fused_after_returning_its_handle() {
         "re-polling a successful Admission is fused rather than repeating its output"
     );
 
-    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&task).await, RemoveOutcome::Removed);
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
@@ -398,11 +398,11 @@ async fn exact_handles_reject_cross_scope_and_same_id_successors() {
         .expect("right admission");
 
     assert_eq!(
-        right_scope.remove_task(&left_task).await,
+        right_scope.remove_exact(&left_task).await,
         RemoveOutcome::AlreadyAbsent
     );
     assert_eq!(
-        left_scope.remove_task(&left_task).await,
+        left_scope.remove_exact(&left_task).await,
         RemoveOutcome::Removed
     );
     let replacement = left_scope
@@ -412,15 +412,15 @@ async fn exact_handles_reject_cross_scope_and_same_id_successors() {
     assert!(!replacement.membership().supersedes(left_task.membership()));
     assert!(!left_task.membership().supersedes(replacement.membership()));
     assert_eq!(
-        left_scope.remove_task(&left_task).await,
+        left_scope.remove_exact(&left_task).await,
         RemoveOutcome::AlreadyAbsent
     );
     assert_eq!(
-        left_scope.remove_task(&replacement).await,
+        left_scope.remove_exact(&replacement).await,
         RemoveOutcome::Removed
     );
     assert_eq!(
-        right_scope.remove_task(&right_task).await,
+        right_scope.remove_exact(&right_task).await,
         RemoveOutcome::Removed
     );
     left.shutdown(SHUTDOWN_BUDGET).await.expect("left stops");
@@ -458,7 +458,7 @@ async fn nested_declared_membership_is_incomparable_with_its_runtime_replacement
         "first lowering preserves the declared handle's identity"
     );
     assert_eq!(
-        nested_scope.remove_task(&declared).await,
+        nested_scope.remove_exact(&declared).await,
         RemoveOutcome::Removed
     );
     let replacement = nested_scope
@@ -511,7 +511,7 @@ async fn nested_actor_replacement_keeps_mailbox_evidence_in_each_exact_membershi
     let declared_incarnation = declared.try_send(()).expect("declared actor accepts");
     assert_eq!(declared_incarnation.membership(), declared.membership());
     assert_eq!(
-        nested_scope.remove_actor(&declared).await,
+        nested_scope.remove_exact(&declared).await,
         RemoveOutcome::Removed
     );
     let terminal = declared
@@ -552,7 +552,7 @@ async fn exact_scope_removal_does_not_touch_a_same_id_successor() {
         .await
         .expect("first subtree admitted");
     assert_eq!(
-        tokio::time::timeout(POLL_TIMEOUT, root.remove_scope(&first))
+        tokio::time::timeout(POLL_TIMEOUT, root.remove_exact(&first))
             .await
             .expect("first subtree removal completes"),
         RemoveOutcome::Removed
@@ -564,11 +564,11 @@ async fn exact_scope_removal_does_not_touch_a_same_id_successor() {
     assert!(!second.membership().supersedes(first.membership()));
     assert!(!first.membership().supersedes(second.membership()));
     assert_eq!(
-        root.remove_scope(&first).await,
+        root.remove_exact(&first).await,
         RemoveOutcome::AlreadyAbsent
     );
     assert_eq!(
-        tokio::time::timeout(POLL_TIMEOUT, root.remove_scope(&second))
+        tokio::time::timeout(POLL_TIMEOUT, root.remove_exact(&second))
             .await
             .expect("second subtree removal completes"),
         RemoveOutcome::Removed
@@ -595,13 +595,13 @@ async fn tombstones_occupy_ids_until_explicit_removal() {
         scope.add_task("tombstone", waiting_task()).await,
         Err(ReserveError::DuplicateId(ref id)) if id.as_str() == "tombstone"
     ));
-    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&task).await, RemoveOutcome::Removed);
     let replacement = scope
         .add_task("tombstone", waiting_task())
         .await
         .expect("removal frees id");
     assert_eq!(
-        scope.remove_task(&replacement).await,
+        scope.remove_exact(&replacement).await,
         RemoveOutcome::Removed
     );
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
@@ -635,8 +635,8 @@ async fn removal_is_synchronous_detached_and_shared() {
         .await
         .expect("task admitted");
 
-    let first = scope.remove_task(&task);
-    let second = scope.remove_task(&task);
+    let first = scope.remove_exact(&task);
+    let second = scope.remove_exact(&task);
     assert!(matches!(
         scope.reserve_task("worker"),
         Err(ReserveError::RemovalInProgress(ref id)) if id.as_str() == "worker"
@@ -650,14 +650,14 @@ async fn removal_is_synchronous_detached_and_shared() {
         .await
         .expect("id is free after detached removal");
     assert_eq!(
-        scope.remove_task(&replacement).await,
+        scope.remove_exact(&replacement).await,
         RemoveOutcome::Removed
     );
     let shared = scope
         .add_task("shared", waiting_task())
         .await
         .expect("shared-removal task admitted");
-    let (left, right) = tokio::join!(scope.remove_task(&shared), scope.remove_task(&shared));
+    let (left, right) = tokio::join!(scope.remove_exact(&shared), scope.remove_exact(&shared));
     assert_eq!(left, RemoveOutcome::Removed);
     assert_eq!(right, RemoveOutcome::Removed);
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
@@ -701,7 +701,7 @@ async fn reserved_cell_removal_wins_a_queued_split_definition() {
         .add_task("survivor", waiting_task())
         .await
         .expect("scope remains admitting");
-    assert_eq!(scope.remove_task(&survivor).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&survivor).await, RemoveOutcome::Removed);
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
@@ -751,7 +751,7 @@ fn admission_runtime_guards_leave_reservation_ids_reusable() {
                 .add_task(id, waiting_task())
                 .await
                 .unwrap_or_else(|error| panic!("id `{id}` remains reusable: {error:?}"));
-            assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+            assert_eq!(scope.remove_exact(&task).await, RemoveOutcome::Removed);
         }
         system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
     });
@@ -778,7 +778,7 @@ async fn select_and_timeout_preserve_fused_and_split_admission_ownership() {
         .add_task("fused-select", waiting_task())
         .await
         .expect("select dropping a fused admission frees its id");
-    assert_eq!(scope.remove_task(&reused).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&reused).await, RemoveOutcome::Removed);
 
     let split_started = Arc::new(AtomicBool::new(false));
     let split_cancelled = Arc::new(AtomicBool::new(false));
@@ -818,7 +818,7 @@ async fn select_and_timeout_preserve_fused_and_split_admission_ownership() {
     })
     .await;
     assert_positive_liveness(&split_liveness_gate, &split_liveness_seen).await;
-    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&task).await, RemoveOutcome::Removed);
     assert!(split_cancelled.load(Ordering::SeqCst));
 
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
@@ -843,7 +843,7 @@ async fn split_definition_dropped_before_first_poll_never_starts() {
         .add_task("split-unpolled", waiting_task())
         .await
         .expect("the released id is reusable");
-    assert_eq!(scope.remove_task(&reused).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&reused).await, RemoveOutcome::Removed);
 
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
@@ -859,7 +859,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
         .add_task("fused-before-poll", waiting_task())
         .await
         .expect("never-polled fused add withdraws");
-    assert_eq!(scope.remove_task(&reused).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&reused).await, RemoveOutcome::Removed);
 
     let fused_started = Arc::new(AtomicBool::new(false));
     let fused_cancelled = Arc::new(AtomicBool::new(false));
@@ -876,7 +876,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
         .add_task("fused-after-admission", waiting_task())
         .await
         .expect("post-admission fused drop removes");
-    assert_eq!(scope.remove_task(&reused).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&reused).await, RemoveOutcome::Removed);
 
     let split_started = Arc::new(AtomicBool::new(false));
     let split_cancelled = Arc::new(AtomicBool::new(false));
@@ -898,7 +898,10 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     })
     .await;
     assert_positive_liveness(&split_liveness_gate, &split_liveness_seen).await;
-    assert_eq!(scope.remove_task(&split_task).await, RemoveOutcome::Removed);
+    assert_eq!(
+        scope.remove_exact(&split_task).await,
+        RemoveOutcome::Removed
+    );
 
     let split_after_started = Arc::new(AtomicBool::new(false));
     let split_after_cancelled = Arc::new(AtomicBool::new(false));
@@ -923,7 +926,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     .await;
     assert_positive_liveness(&split_after_liveness_gate, &split_after_liveness_seen).await;
     assert_eq!(
-        scope.remove_task(&split_after_task).await,
+        scope.remove_exact(&split_after_task).await,
         RemoveOutcome::Removed
     );
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
@@ -958,7 +961,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
         .add_raw("fused-actor", RawDef::factory(|| WaitingRaw))
         .await
         .expect("fused actor drop frees its id");
-    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&actor).await, RemoveOutcome::Removed);
 
     let subtree_started = Arc::new(AtomicBool::new(false));
     let subtree_cancelled = Arc::new(AtomicBool::new(false));
@@ -979,7 +982,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
         .add_subtree_once("fused-subtree", SubtreeOnceDef::new(waiting_tree()))
         .await
         .expect("fused subtree drop frees its id");
-    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&subtree).await, RemoveOutcome::Removed);
 
     let actor_started = Arc::new(AtomicBool::new(false));
     let actor_cancelled = Arc::new(AtomicBool::new(false));
@@ -1005,7 +1008,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
     })
     .await;
     assert_positive_liveness(&actor_liveness_gate, &actor_liveness_seen).await;
-    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&actor).await, RemoveOutcome::Removed);
     assert!(actor_cancelled.load(Ordering::SeqCst));
 
     let subtree_started = Arc::new(AtomicBool::new(false));
@@ -1033,7 +1036,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
     })
     .await;
     assert_positive_liveness(&subtree_liveness_gate, &subtree_liveness_seen).await;
-    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&subtree).await, RemoveOutcome::Removed);
     assert!(subtree_cancelled.load(Ordering::SeqCst));
 
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
@@ -1066,7 +1069,7 @@ async fn removing_a_member_releases_its_factory_before_scope_shutdown() {
         .expect("task admitted");
     assert_eventually!(|| started.load(Ordering::SeqCst)).await;
 
-    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&task).await, RemoveOutcome::Removed);
     assert!(factory_dropped.load(Ordering::SeqCst));
 
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
@@ -1270,17 +1273,17 @@ async fn dropping_undefined_dynamic_slots_terminalizes_cells_and_frees_ids() {
         .add_task("worker", waiting_task())
         .await
         .expect("task id was released");
-    assert_eq!(scope.remove_task(&worker).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&worker).await, RemoveOutcome::Removed);
     let actor = scope
         .add_raw("actor", RawDef::factory(|| WaitingRaw))
         .await
         .expect("actor id was released");
-    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&actor).await, RemoveOutcome::Removed);
     let nested = scope
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await
         .expect("subtree id was released");
-    assert_eq!(scope.remove_scope(&nested).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&nested).await, RemoveOutcome::Removed);
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
@@ -1353,7 +1356,7 @@ async fn dynamic_scope_rejects_reservations_between_incarnations() {
         .await
         .expect("the replacement incarnation admits");
     assert_eq!(
-        scope.remove_task(&runtime_task).await,
+        scope.remove_exact(&runtime_task).await,
         RemoveOutcome::Removed
     );
     system
@@ -1436,7 +1439,7 @@ async fn restarted_dynamic_subtree_does_not_recreate_runtime_children() {
     assert!(!replacement.membership().supersedes(old_membership));
     assert!(!old_membership.supersedes(replacement.membership()));
     assert_eq!(
-        nested.remove_task(&replacement).await,
+        nested.remove_exact(&replacement).await,
         RemoveOutcome::Removed
     );
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
@@ -1843,7 +1846,7 @@ async fn same_batch_removal_suppresses_pending_restart_shutdown() {
     // Both level-triggered commands are latched before yielding to the
     // driver. Removal owns restart suppression even though the nested scope's
     // pending shutdown would otherwise be resolved by the window-stop rule.
-    let removal = system.scope().remove_scope(&nested);
+    let removal = system.scope().remove_exact(&nested);
     nested.request_shutdown();
     assert_eq!(
         tokio::time::timeout(POLL_TIMEOUT, removal)
@@ -1933,7 +1936,7 @@ async fn removal_of_a_polled_split_definition_keeps_the_scope_admitting() {
         .add_task("worker", waiting_task())
         .await
         .expect("the scope keeps admitting and the id is free");
-    assert_eq!(scope.remove_task(&survivor).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&survivor).await, RemoveOutcome::Removed);
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 
@@ -1974,7 +1977,7 @@ async fn ancestor_hard_abort_disposes_a_queued_admission_and_midflight_removal()
     system.wait_started().await.expect("nested scope starts");
     worker_started.wait().await;
 
-    let mut removal = Box::pin(nested.remove_task(&worker));
+    let mut removal = Box::pin(nested.remove_exact(&worker));
     worker_cancelled.wait().await;
     assert!(
         poll_once(removal.as_mut()).is_pending(),
@@ -2077,10 +2080,10 @@ async fn admissions_return_kind_specific_handles_directly() {
         .expect("subtree is admitted");
     assert_eq!(subtree.membership(), reserved_subtree.membership());
 
-    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
-    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
-    assert_eq!(scope.remove_task(&one_shot).await, RemoveOutcome::Removed);
-    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&actor).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&one_shot).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&subtree).await, RemoveOutcome::Removed);
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
 }
 

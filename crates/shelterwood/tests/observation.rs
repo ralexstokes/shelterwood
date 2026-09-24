@@ -246,7 +246,7 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
         )
     }));
 
-    assert_eq!(root.remove_scope(&nested).await, RemoveOutcome::Removed);
+    assert_eq!(root.remove_exact(&nested).await, RemoveOutcome::Removed);
     let after_removal = root.as_scope().snapshot();
     assert!(after_removal.child("nested").is_none());
     let mut saw_stale_descendant = false;
@@ -286,7 +286,7 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
     }
 
     assert_eq!(
-        root.remove_scope(&replacement).await,
+        root.remove_exact(&replacement).await,
         RemoveOutcome::Removed
     );
     system
@@ -354,7 +354,7 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
     assert!(saw_exit);
     assert!(!saw_restart, "planned remove/add is not a crash restart");
 
-    assert_eq!(root.remove_task(&task).await, RemoveOutcome::Removed);
+    assert_eq!(root.remove_exact(&task).await, RemoveOutcome::Removed);
     let removed = loop {
         let event = next_event(&mut events).await;
         if matches!(
@@ -498,7 +498,7 @@ async fn descendant_events_forward_with_origin_identity_path_and_causal_order() 
     assert_eq!(nested_child.scope_seq, Some(recursive.lifecycle_seq));
 
     let mut nested_events = nested.subscribe_lifecycle();
-    let removal = root.remove_scope(&nested);
+    let removal = root.remove_exact(&nested);
     let mut nested_stopped_before_parent_removed = false;
     loop {
         let event = next_event(&mut events).await;
@@ -1239,7 +1239,7 @@ async fn cloned_snapshot_receivers_observe_independently_and_inherit_the_seen_ge
     .await;
     drop(no_replay);
 
-    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&task).await, RemoveOutcome::Removed);
     let removed_from_original = original.changed().await.expect("original observes removal");
     let removed_from_inherited = inherited
         .changed()
@@ -1263,7 +1263,7 @@ async fn lifecycle_subscriptions_start_now_without_replaying_prior_history() {
         .add_task("old", waiting_task())
         .await
         .expect("old membership is admitted");
-    assert_eq!(scope.remove_task(&old).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&old).await, RemoveOutcome::Removed);
 
     let mut events = scope.as_scope().subscribe_lifecycle();
     assert_quiet(Duration::from_secs(1), || {
@@ -1282,7 +1282,7 @@ async fn lifecycle_subscriptions_start_now_without_replaying_prior_history() {
             if id.as_str() == "new" && membership == new.membership()
     ));
 
-    assert_eq!(scope.remove_task(&new).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&new).await, RemoveOutcome::Removed);
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -1428,7 +1428,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
     assert!(departing_row.nested.is_none());
     assert!(departing_row.scope_seq.is_none());
 
-    let removal = scope.remove_task(&departing);
+    let removal = scope.remove_exact(&departing);
     stop_entered.wait().await;
     let removing = scope
         .as_scope()
@@ -1501,7 +1501,7 @@ async fn state_predicates_hold_only_for_terminal_projections() {
     assert!(matches!(running.state, ChildState::Running));
     assert!(!running.state.is_terminal());
 
-    assert_eq!(scope.remove_task(&runner).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&runner).await, RemoveOutcome::Removed);
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");
     let stopped = scope.as_scope().snapshot().state.clone();
     assert!(matches!(stopped, ScopeState::Stopped { .. }));

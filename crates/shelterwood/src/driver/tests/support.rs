@@ -133,10 +133,9 @@ pub(super) use super::super::{
     MemberStage, MemberTransition, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses,
     ResidentProjection, Retained, RuntimeStorage, ScopeCell, ScopeControlEvent, ScopeEpochGuard,
     ScopeFlavor, ScopeRole, ScopeRuntime, ScopeRuntimeTestWiring, StartupDisposition,
-    cancel_dynamic_reservation, child::dispatch_child_construction_for_test,
-    discharge_child_terminality, monitor_root_driver, nested_scope_start, report_slot,
-    reserve_dynamic, resident_projection, run_nested_factory, run_scope, run_scope_incarnation,
-    storage::Obligation, wait_for_scope_wake,
+    child::dispatch_child_construction_for_test, discharge_child_terminality, monitor_root_driver,
+    nested_scope_start, report_slot, reserve_dynamic, resident_projection, run_nested_factory,
+    run_scope, run_scope_incarnation, storage::Obligation, wait_for_scope_wake,
 };
 
 pub(super) async fn begin_admission(
@@ -147,12 +146,9 @@ pub(super) async fn begin_admission(
     crate::runtime::OneShotReceiver<Result<(), ReserveError>>,
     AdmissionRequest,
 ) {
-    let response = super::super::start_admission(
-        Arc::clone(&reservation.control),
-        Arc::clone(&reservation.slot),
-        fused_cancel,
-    )
-    .expect("admission starts inside the runtime");
+    let response = reservation
+        .start_admission(fused_cancel)
+        .expect("admission starts inside the runtime");
     let Some(DriverEvent::Admission(request)) = receiver.recv().await else {
         panic!("admission enqueueing submits the request")
     };

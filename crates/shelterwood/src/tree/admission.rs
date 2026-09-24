@@ -2,7 +2,6 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -13,8 +12,6 @@ use crate::{
 };
 
 use crate::driver::{LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR};
-
-use super::slots::AdmissionOwnership;
 
 /// Resolves a driver response that may have been lost.
 ///
@@ -32,7 +29,9 @@ fn fail_closed<T>(response: Option<T>, fallback: T, debug_panics: bool, what: &s
 
 /// An admission future.
 ///
-/// Fused additions abort on drop; split definitions detach after their first
+/// *Fused* admissions — the `add_*` methods on [`DynamicScopeRef`](crate::DynamicScopeRef),
+/// which reserve and define in one call — abort on drop. *Split* admissions —
+/// `define` on a slot from a `reserve_*` method — detach once their first
 /// poll starts admission. Reservation and that first poll require an ambient
 /// Tokio runtime. A first poll outside one returns [`ReserveError::NoRuntime`]
 /// and releases the reservation.
@@ -45,14 +44,16 @@ fn fail_closed<T>(response: Option<T>, fallback: T, debug_panics: bool, what: &s
 /// detach: the handles taken from the slot beforehand stay valid but name a
 /// child that never ran.
 ///
-/// The driver's admission obligation publishes an outcome on every path,
-/// including its own drop fallback, so this future always resolves to the
-/// admitted handles or a [`ReserveError`]. Should that obligation ever be
-/// destroyed without publishing — a framework invariant failure, not a
-/// condition callers can provoke — debug builds panic and release builds
+/// Polled to completion, the future yields the admitted handles or a
+/// [`ReserveError`]: the driver's admission obligation publishes an outcome
+/// on every path, including its own drop fallback. Should that obligation
+/// ever be destroyed without publishing — a framework invariant failure, not
+/// a condition callers can provoke — debug builds panic and release builds
 /// fail closed, resolving [`ReserveError::NotAdmitting`] with a terminal
 /// cause.
-/// Once complete, further polls return `Pending`.
+///
+/// After it has produced its result, further polls return `Pending`; they
+/// neither panic nor produce a second result.
 #[must_use]
 pub struct Admission<H> {
     state: AdmissionState<H>,
@@ -68,20 +69,10 @@ struct PendingAdmission<H> {
 
 impl<H> PendingAdmission<H> {
     fn start(&self) -> Result<AdmissionWait, ReserveError> {
-        let response = crate::driver::start_admission(
-            Arc::clone(&self.reservation.control),
-            Arc::clone(&self.reservation.slot),
-            self.fused_cancel.clone(),
-        )?;
+        let response = self
+            .reservation
+            .start_admission(self.fused_cancel.clone())?;
         Ok(DisposingReceiver::new(response))
-    }
-
-    fn cancel_reservation(&self) {
-        crate::driver::cancel_dynamic_reservation(
-            &self.reservation.scope,
-            self.reservation.control.as_ref(),
-            &self.reservation.slot,
-        );
     }
 
     fn annul(&self) {
@@ -96,7 +87,7 @@ impl<H> PendingAdmission<H> {
             })
             .err()
         });
-        let cleanup_panic = crate::runtime::catch_panic(|| self.cancel_reservation()).err();
+        let cleanup_panic = crate::runtime::catch_panic(|| self.reservation.cancel()).err();
         crate::runtime::resume_preferred_panic(crate::runtime::UnwindPanics {
             primary: signal_panic,
             cleanup: cleanup_panic,
@@ -144,16 +135,13 @@ impl<H> Admission<H> {
     pub(super) fn new(
         reservation: DynamicReservation,
         handles: H,
-        ownership: AdmissionOwnership,
+        fused_cancel: Option<Latch>,
     ) -> Self {
         Self {
             state: AdmissionState::Unpolled(PendingAdmission {
                 reservation,
                 handles,
-                fused_cancel: match ownership {
-                    AdmissionOwnership::Split => None,
-                    AdmissionOwnership::Fused => Some(Latch::default()),
-                },
+                fused_cancel,
             }),
         }
     }
@@ -173,7 +161,7 @@ impl<H> Future for Admission<H> {
         loop {
             match &mut this.state {
                 AdmissionState::Immediate(error) => {
-                    let error = error.clone();
+                    let error = std::mem::replace(error, ReserveError::NoRuntime);
                     this.state = AdmissionState::Done;
                     return Poll::Ready(Err(error));
                 }
@@ -184,7 +172,7 @@ impl<H> Future for Admission<H> {
                     let wait = match pending.start() {
                         Ok(wait) => wait,
                         Err(error) => {
-                            pending.cancel_reservation();
+                            pending.reservation.cancel();
                             this.state = AdmissionState::Done;
                             return Poll::Ready(Err(error));
                         }
@@ -243,7 +231,8 @@ impl<H> Drop for Admission<H> {
 /// invariant failure — debug builds panic and release builds resolve
 /// [`RemoveOutcome::Removed`]: the removal latched at the call, and its route
 /// becoming terminal satisfies the removal goal.
-/// Once complete, further polls return `Pending`, as on [`Admission`].
+/// After it has produced its outcome, further polls return `Pending`, as on
+/// [`Admission`].
 #[must_use]
 pub struct Removal {
     inner: DisposingReceiver<RemoveOutcome>,
@@ -296,10 +285,7 @@ mod tests {
     use crate::{ExitKind, TaskDef, test_support::SHUTDOWN_BUDGET};
 
     use super::{Admission, Removal};
-    use crate::{
-        TaskRef,
-        tree::{DynamicTree, slots::AdmissionOwnership},
-    };
+    use crate::{TaskRef, runtime::Latch, tree::DynamicTree};
 
     struct DropAdmissionAndPanic {
         admission: Mutex<Option<Admission<TaskRef>>>,
@@ -399,7 +385,7 @@ mod tests {
     #[crate::runtime::test]
     async fn queued_fused_drop_before_exit_dispatch_suppresses_restart_accounting() {
         crate::driver::exercise_queued_fused_drop_before_exit_dispatch(|reservation| {
-            Admission::new(reservation, (), AdmissionOwnership::Fused)
+            Admission::new(reservation, (), Some(Latch::default()))
         })
         .await;
     }

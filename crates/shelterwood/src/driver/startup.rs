@@ -123,7 +123,7 @@ impl ScopeRuntime {
         self.record_storage();
     }
 
-    pub(super) fn fail_startup(&mut self, key: ChildKey, exit: &RetainedExit) {
+    pub(super) fn fail_startup(&mut self, key: ChildKey, exit: &Retained<Exit>) {
         // Several initial children can fail in one arbitration batch. The
         // first failure owns the startup verdict and its sole lifecycle edge;
         // later exits are still terminalized, but cannot republish the scope
@@ -135,7 +135,7 @@ impl ScopeRuntime {
             cause: StartupFailureCause::Child {
                 id: child.slot.member.id().clone(),
                 membership: child.slot.member.membership(),
-                exit: exit.as_exit().clone(),
+                exit: exit.get().clone(),
             },
         };
         let Some(state) = supervisor_fail_startup(&mut self.supervisor) else {
@@ -150,7 +150,7 @@ impl ScopeRuntime {
                 {
                     self.begin_terminal_disposal(
                         later,
-                        RetainedExit::new(Exit::never_started()),
+                        Retained::new(Exit::never_started()),
                         None,
                         StartupDisposition::NotAborted,
                     );

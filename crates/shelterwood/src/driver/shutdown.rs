@@ -135,7 +135,7 @@ impl ScopeRuntime {
         // startup failure recursively owns the triggering child's raw Exit,
         // so keep one cells-layer guard until every one of those slots has
         // retired.
-        RetainedExit::retain_stop_reason(&mut self.retained_exits, &reason);
+        Retained::retain_stop_reason(&mut self.retained_exits, &reason);
         let before = self.supervisor_effects.len();
         let Some((startup_pending, state)) =
             supervisor_begin_drain(&mut self.supervisor, reason, &mut self.supervisor_effects)

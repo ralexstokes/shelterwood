@@ -95,7 +95,7 @@ shell:
   `ScopeCell` is the supervising node's stable state and the publication
   point for observation; `cells/observe.rs` holds snapshots and lifecycle
   streams (L4); `cells/gate.rs` holds the observation gate and its
-  transaction; `cells/retained.rs` holds the `RetainedExit` family that
+  transaction; `cells/retained.rs` holds the `Retained<T>` carrier that
   keeps user errors off framework-critical destruction paths.
 - **`mailbox/`** — the mailbox kinds, the send flavors, and request/reply
   (L2's delivery half). `mailbox/cell.rs` is the restart-stable

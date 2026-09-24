@@ -40,9 +40,9 @@ fn pending_drain_suffix_contains_failed_outcome_destruction_during_unwind() {
     let exited = Pending::Child(ChildEvent::Exited {
         child,
         incarnation,
-        recorded: Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-            Err(ExitError::from(PanickingDrop(dropped))),
-        ))),
+        recorded: Some(Retained::new(RecordedOutcome::returned(Err(
+            ExitError::from(PanickingDrop(dropped)),
+        )))),
         join: crate::runtime::JoinOutcome::Ok { value: () },
         cancellation: Cancellation::NotObserved,
         readiness_signal_seen: false,
@@ -111,9 +111,7 @@ async fn a_join_panic_disposes_the_recorded_application_failure_off_the_driver()
     scope.handle_exit(
         key,
         incarnation,
-        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-            Err(recorded),
-        ))),
+        Some(Retained::new(RecordedOutcome::returned(Err(recorded)))),
         crate::runtime::JoinOutcome::Panic {
             message: Some("join panic".to_owned()),
         },
@@ -130,7 +128,7 @@ async fn a_join_panic_disposes_the_recorded_application_failure_off_the_driver()
     );
 }
 
-/// The selected failure must stay behind `RetainedExit` after classification,
+/// The selected failure must stay behind `Retained<Exit>` after classification,
 /// not only while the losing half of the fold is discarded. Poisoning the
 /// dynamic membership mutex injects the first fallible operation in that
 /// window and proves unwind drop glue transfers the selected user error to
@@ -188,9 +186,7 @@ async fn handle_exit_retains_the_selected_failure_across_dispatch_panics() {
             scope.handle_exit(
                 key,
                 incarnation,
-                Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-                    Err(recorded),
-                ))),
+                Some(Retained::new(RecordedOutcome::returned(Err(recorded)))),
                 crate::runtime::JoinOutcome::Ok { value: () },
                 Cancellation::NotObserved,
                 false,
@@ -263,9 +259,7 @@ async fn a_refused_restart_publication_retains_the_selected_failure() {
         scope.handle_exit(
             key,
             incarnation,
-            Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-                Err(recorded),
-            ))),
+            Some(Retained::new(RecordedOutcome::returned(Err(recorded)))),
             crate::runtime::JoinOutcome::Ok { value: () },
             Cancellation::NotObserved,
             false,

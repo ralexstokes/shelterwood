@@ -11,7 +11,7 @@ fn owned_report_token_consumes_or_falls_back_once() {
     let report = claim.receive();
     assert!(matches!(
         report.outcome,
-        Some(outcome) if matches!(outcome.as_outcome().kind(), ExitKind::Completed)
+        Some(outcome) if matches!(outcome.get().kind(), ExitKind::Completed)
     ));
     assert_eq!(report.cancellation, Cancellation::NotObserved);
     assert!(!report.readiness_signal_seen);
@@ -34,7 +34,7 @@ fn owned_report_token_records_prior_cancellation() {
     let report = claim.receive();
     assert!(matches!(
         report.outcome,
-        Some(outcome) if matches!(outcome.as_outcome().kind(), ExitKind::Completed)
+        Some(outcome) if matches!(outcome.get().kind(), ExitKind::Completed)
     ));
     assert_eq!(report.cancellation, Cancellation::Observed);
 }

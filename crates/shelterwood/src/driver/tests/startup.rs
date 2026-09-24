@@ -115,10 +115,10 @@ fn nested_with_backoff(condition: RestartCondition) -> SubtreeDef<Tree> {
     ))
 }
 
-fn failed_exit(message: &'static str) -> Option<RetainedRecordedOutcome> {
-    Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-        Err(ExitError::message(message)),
-    )))
+fn failed_exit(message: &'static str) -> Option<Retained<RecordedOutcome>> {
+    Some(Retained::new(RecordedOutcome::returned(Err(
+        ExitError::message(message),
+    ))))
 }
 
 /// Starts the child's incarnation and aborts its task before it is ever
@@ -668,9 +668,7 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
         Pending::Child(ChildEvent::Exited {
             child: key,
             incarnation,
-            recorded: Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(Ok(
-                (),
-            )))),
+            recorded: Some(Retained::new(RecordedOutcome::returned(Ok(())))),
             join: crate::runtime::JoinOutcome::Ok { value: () },
             cancellation: Cancellation::NotObserved,
             readiness_signal_seen: true,
@@ -1129,9 +1127,9 @@ async fn removal_before_pre_ready_exit_does_not_publish_startup_abort() {
     scope.handle_exit(
         key,
         incarnation,
-        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-            Err(ExitError::message("pre-ready failure racing removal")),
-        ))),
+        Some(Retained::new(RecordedOutcome::returned(Err(
+            ExitError::message("pre-ready failure racing removal"),
+        )))),
         crate::runtime::JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,

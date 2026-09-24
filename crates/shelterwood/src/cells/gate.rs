@@ -126,7 +126,7 @@ impl<'a> ObservationTxn<'a> {
 
     /// Places a structural surrender ahead of ordinary deferred effects.
     ///
-    /// [`crate::cells::RetainedExit`] owns the public entry point because it
+    /// [`crate::cells::Retained`] owns the public entry point because it
     /// alone may extract the guarded raw exit. Keeping surrender effects at
     /// the front is load-bearing: a later ordinary effect may hand the
     /// surrender's co-owner to a concurrent disposal worker.
@@ -245,7 +245,7 @@ mod tests {
 
     use crate::{
         cells::{
-            RetainedExit,
+            Retained,
             test_support::{TEST_WAIT, ThreadProbe},
         },
         runtime,
@@ -430,7 +430,7 @@ mod tests {
             ExitError::from(ThreadProbe(payload_dropped)),
             Cancellation::NotObserved,
         );
-        let retained = RetainedExit::new(exit.clone());
+        let retained = Retained::new(exit.clone());
         let (owner_dropped, owner_observed) = mpsc::sync_channel(1);
         let mut txn = ObservationTxn::new(&gate, gate.lock());
 
@@ -465,7 +465,7 @@ mod tests {
     fn observation_txn_surrender_releases_the_raw_exit_after_unlock() {
         let gate = ObservationGate::new();
         let (released, observed) = mpsc::sync_channel(1);
-        let retained = RetainedExit::new(Exit::failed(
+        let retained = Retained::new(Exit::failed(
             ExitError::from(GatePresenceProbe {
                 gate: gate.clone(),
                 observed: released,

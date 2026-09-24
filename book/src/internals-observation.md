@@ -53,7 +53,7 @@ is deliberately not API.
 
 An `Exited` event carries a projection of the child's `Exit`. The
 retained wrapper stores the public event before its retention guards, so
-ring eviction drops the projection while a `RetainedExit` still protects
+ring eviction drops the projection while a `Retained<Exit>` still protects
 the user error inside it — its eventual destruction goes through the
 critical disposal lane, never a subscriber's thread.
 

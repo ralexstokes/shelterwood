@@ -11,24 +11,120 @@ use shelterwood_core::{
     },
 };
 
-/// An exit copy retained by framework state.
+/// A value that may own a type-erased user error.
 ///
-/// Failed exits own a type-erased user error. Retiring such a copy always
-/// transfers it to isolated disposal, regardless of its current strong count:
-/// a count probe would race every other owner and could still leave one
-/// framework thread running the last user destructor inline.
-#[derive(Clone)]
-pub(crate) struct RetainedExit(Option<Exit>);
+/// A failed [`Exit`], a failed provisional [`RecordedOutcome`] and a failed
+/// incarnation [`ExitResult`] each own the application error an actor
+/// returned. [`Retained`] routes the destruction of such a value to critical
+/// disposal whenever framework state retires it.
+pub(crate) trait CarriesUserError: Send + 'static {
+    fn carries_user_error(&self) -> bool;
+}
 
-impl RetainedExit {
-    pub(crate) fn new(exit: Exit) -> Self {
-        Self(Some(exit))
+impl CarriesUserError for Exit {
+    fn carries_user_error(&self) -> bool {
+        matches!(self.kind(), ExitKind::Failed(_))
+    }
+}
+
+impl CarriesUserError for RecordedOutcome {
+    fn carries_user_error(&self) -> bool {
+        self.is_failed()
+    }
+}
+
+impl CarriesUserError for ExitResult {
+    fn carries_user_error(&self) -> bool {
+        self.is_err()
+    }
+}
+
+/// A user-error-bearing value retained by framework state.
+///
+/// Retiring a carrier that owns a user error always transfers it to critical
+/// disposal, regardless of its current strong count: a count probe would race
+/// every other owner and could still leave one framework thread running the
+/// last user destructor inline. Taking the value back out is the only way to
+/// give it ordinary drop timing, and each value type names its own exit:
+/// `Retained<Exit>::into_user_owned` is deliberately narrower than the
+/// others.
+pub(crate) struct Retained<T: CarriesUserError>(Option<T>);
+
+impl<T: CarriesUserError> Retained<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(Some(value))
     }
 
-    pub(crate) fn as_exit(&self) -> &Exit {
-        self.0.as_ref().expect("retained exit was already taken")
+    pub(crate) fn get(&self) -> &T {
+        self.0
+            .as_ref()
+            .expect("a retained value is taken only by value")
     }
 
+    fn take(mut self) -> T {
+        self.0
+            .take()
+            .expect("a retained value is taken only by value")
+    }
+}
+
+impl<T: CarriesUserError> Drop for Retained<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take()
+            && value.carries_user_error()
+        {
+            runtime::dispose_critical(value);
+        }
+    }
+}
+
+impl<T: CarriesUserError + Clone> Clone for Retained<T> {
+    fn clone(&self) -> Self {
+        Self::new(self.get().clone())
+    }
+}
+
+impl<T: CarriesUserError + fmt::Debug> fmt::Debug for Retained<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(formatter)
+    }
+}
+
+impl<T: CarriesUserError + PartialEq> PartialEq for Retained<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl<T: CarriesUserError + PartialEq> PartialEq<T> for Retained<T> {
+    fn eq(&self, other: &T) -> bool {
+        self.get() == other
+    }
+}
+
+impl<T: CarriesUserError + Eq> Eq for Retained<T> {}
+
+impl<T: CarriesUserError> From<T> for Retained<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+impl Retained<RecordedOutcome> {
+    /// Hands back the outcome a fold selected.
+    pub(crate) fn into_outcome(self) -> RecordedOutcome {
+        self.take()
+    }
+}
+
+impl Retained<ExitResult> {
+    /// Hands back the result on the raw epilogue's normal return path.
+    pub(crate) fn into_result(self) -> ExitResult {
+        self.take()
+    }
+}
+
+impl Retained<Exit> {
     /// Hands the raw exit to a public/user-owned value.
     ///
     /// Framework-internal copies must instead go through
@@ -37,8 +133,8 @@ impl RetainedExit {
     /// `pub(in crate::cells)` is what keeps that structural: no driver-layer
     /// caller can reach the raw exit at all, so a framework carrier crossing
     /// a driver seam has to stay a carrier.
-    pub(super) fn into_user_owned(mut self) -> Exit {
-        self.0.take().expect("retained exit was already taken")
+    pub(super) fn into_user_owned(self) -> Exit {
+        self.take()
     }
 
     pub(crate) fn retain_scope_state(exits: &mut Vec<Self>, state: &ScopeState) {
@@ -66,7 +162,7 @@ impl RetainedExit {
     }
 
     pub(crate) fn retain_exit(exits: &mut Vec<Self>, exit: &Exit) {
-        if !exits.iter().any(|retained| retained.as_exit() == exit) {
+        if !exits.iter().any(|retained| retained == exit) {
             exits.push(Self::new(exit.clone()));
         }
     }
@@ -87,23 +183,26 @@ impl RetainedExit {
     /// Records that hand out clones keep their guards behind one `Arc` so a
     /// read costs refcount traffic rather than one disposal job per exit. An
     /// unchanged guard set is therefore kept in place: the probe copies are
-    /// released as refcount traffic, because an equal retained copy — for
+    /// surrendered, because an equal retained copy — for
     /// `ExitKind::Failed`, equality is `Arc::ptr_eq` — proves the payload
-    /// stays owned.
+    /// stays owned. A changed set displaces the old allocation, which may be
+    /// the last owner of a user error the record no longer holds, so its
+    /// retirement leaves with the transaction's post-unlock effects.
     pub(super) fn install(
         guards: &mut Arc<Vec<Self>>,
         incoming: Vec<Self>,
-        surrendered: &mut Vec<Self>,
+        txn: &mut ObservationTxn<'_>,
     ) {
         if incoming.len() == guards.len()
             && incoming
                 .iter()
                 .all(|incoming| guards.iter().any(|current| current == incoming))
         {
-            surrendered.extend(incoming);
+            txn.surrender(incoming);
             return;
         }
-        *guards = Arc::new(incoming);
+        let displaced = std::mem::replace(guards, Arc::new(incoming));
+        txn.defer(move || drop(displaced));
     }
 }
 
@@ -114,131 +213,16 @@ impl ObservationTxn<'_> {
     /// every caller queues the surrender before commit. Surrenders flush first
     /// after unlock, while record owners still exist and before an ordinary
     /// deferred effect can hand a queued co-owner to concurrent disposal.
-    pub(crate) fn surrender(&mut self, exits: impl IntoIterator<Item = RetainedExit>) {
+    pub(crate) fn surrender(&mut self, exits: impl IntoIterator<Item = Retained<Exit>>) {
         let exits: Vec<_> = exits.into_iter().collect();
         if exits.is_empty() {
             return;
         }
         self.defer_surrender(move || {
-            for mut exit in exits {
-                drop(exit.0.take().expect("retained exit was already taken"));
+            for exit in exits {
+                drop(exit.take());
             }
         });
-    }
-}
-
-impl From<Exit> for RetainedExit {
-    fn from(exit: Exit) -> Self {
-        Self::new(exit)
-    }
-}
-
-impl fmt::Debug for RetainedExit {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.as_exit().fmt(formatter)
-    }
-}
-
-impl PartialEq for RetainedExit {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_exit() == other.as_exit()
-    }
-}
-
-impl PartialEq<Exit> for RetainedExit {
-    fn eq(&self, other: &Exit) -> bool {
-        self.as_exit() == other
-    }
-}
-
-impl Eq for RetainedExit {}
-
-impl Drop for RetainedExit {
-    fn drop(&mut self) {
-        let Some(exit) = self.0.take() else {
-            return;
-        };
-        if matches!(exit.kind(), ExitKind::Failed(_)) {
-            runtime::dispose_critical(exit);
-        }
-    }
-}
-
-/// A provisional outcome retained by framework event and driver state.
-///
-/// The failed variant owns a type-erased application error just like a failed
-/// [`Exit`]. If framework control flow retires the carrier without selecting
-/// that outcome, its user value is transferred to critical disposal.
-pub(crate) struct RetainedRecordedOutcome(Option<RecordedOutcome>);
-
-impl RetainedRecordedOutcome {
-    pub(crate) fn new(outcome: RecordedOutcome) -> Self {
-        Self(Some(outcome))
-    }
-
-    pub(crate) fn as_outcome(&self) -> &RecordedOutcome {
-        self.0
-            .as_ref()
-            .expect("retained recorded outcome was already taken")
-    }
-
-    pub(crate) fn into_outcome(mut self) -> RecordedOutcome {
-        self.0
-            .take()
-            .expect("retained recorded outcome was already taken")
-    }
-}
-
-impl fmt::Debug for RetainedRecordedOutcome {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.as_outcome().fmt(formatter)
-    }
-}
-
-impl Drop for RetainedRecordedOutcome {
-    fn drop(&mut self) {
-        let Some(outcome) = self.0.take() else {
-            return;
-        };
-        if outcome.is_failed() {
-            runtime::dispose_critical(outcome);
-        }
-    }
-}
-
-/// A completed incarnation result retained across a fallible teardown epilogue.
-///
-/// The failed variant owns a type-erased application error that no framework
-/// copy has reached yet: the first retention point downstream is
-/// [`RetainedRecordedOutcome`], one hop after the incarnation future returns.
-/// The raw epilogue runs several contained teardown steps while holding the
-/// completed result and then resumes any surviving panic, so the carrier is
-/// dropped during that unwind — and destroying a user error there is a second
-/// panic inside the first one's cleanup, which aborts the process.
-/// [`Self::into_result`] on the normal return path preserves ordinary
-/// downstream ownership.
-pub(crate) struct RetainedExitResult(Option<ExitResult>);
-
-impl RetainedExitResult {
-    pub(crate) fn new(result: ExitResult) -> Self {
-        Self(Some(result))
-    }
-
-    pub(crate) fn into_result(mut self) -> ExitResult {
-        self.0
-            .take()
-            .expect("retained exit result was already taken")
-    }
-}
-
-impl Drop for RetainedExitResult {
-    fn drop(&mut self) {
-        let Some(result) = self.0.take() else {
-            return;
-        };
-        if let Err(error) = result {
-            runtime::dispose_critical(error);
-        }
     }
 }
 
@@ -249,12 +233,12 @@ impl Drop for RetainedExitResult {
 /// reason to choose anything but isolated disposal, so this is the shape they
 /// use: the raw fold is reached only from core's own unit tests.
 pub(crate) fn reconcile_recorded_outcomes_retaining(
-    recorded: Option<RetainedRecordedOutcome>,
+    recorded: Option<Retained<RecordedOutcome>>,
     forced: Option<RecordedOutcome>,
 ) -> Option<RecordedOutcome> {
     let (selected, discarded) =
-        reconcile_recorded_outcomes(recorded.map(RetainedRecordedOutcome::into_outcome), forced);
-    drop(discarded.map(RetainedRecordedOutcome::new));
+        reconcile_recorded_outcomes(recorded.map(Retained::into_outcome), forced);
+    drop(discarded.map(Retained::new));
     selected
 }
 
@@ -271,7 +255,7 @@ pub(crate) fn classify_exit_retaining(
     cancellation: Cancellation,
 ) -> Exit {
     let (exit, discarded) = classify_exit(recorded, join, hard_abort_phase, cancellation);
-    drop(discarded.map(RetainedExit::new));
+    drop(discarded.map(Retained::new));
     exit
 }
 
@@ -283,13 +267,13 @@ pub(crate) fn classify_exit_retaining(
 #[derive(Clone, Debug)]
 pub(crate) struct RetainedStopReason {
     reason: Option<StopReason>,
-    retained_exits: Vec<RetainedExit>,
+    retained_exits: Vec<Retained<Exit>>,
 }
 
 impl RetainedStopReason {
     pub(crate) fn new(reason: StopReason) -> Self {
         let mut retained_exits = Vec::new();
-        RetainedExit::retain_stop_reason(&mut retained_exits, &reason);
+        Retained::retain_stop_reason(&mut retained_exits, &reason);
         Self {
             reason: Some(reason),
             retained_exits,
@@ -334,17 +318,11 @@ mod tests {
             ExitError::from(ThreadProbe(dropped)),
             Cancellation::NotObserved,
         );
-        let mut guards = Arc::new(vec![RetainedExit::new(exit.clone())]);
+        let mut guards = Arc::new(vec![Retained::new(exit.clone())]);
         let original = Arc::clone(&guards);
 
         let mut txn = ObservationTxn::detached();
-        let mut surrendered = Vec::new();
-        RetainedExit::install(
-            &mut guards,
-            vec![RetainedExit::new(exit.clone())],
-            &mut surrendered,
-        );
-        txn.surrender(surrendered);
+        Retained::install(&mut guards, vec![Retained::new(exit.clone())], &mut txn);
         drop(txn);
 
         assert!(
@@ -368,30 +346,35 @@ mod tests {
     }
 
     #[test]
-    fn retained_exit_install_replaces_and_isolates_a_changed_last_owned_set() {
+    fn retained_exit_install_retires_a_changed_last_owned_set_after_commit() {
         let retiring_thread = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
-        let mut guards = Arc::new(vec![RetainedExit::new(Exit::failed(
+        let mut guards = Arc::new(vec![Retained::new(Exit::failed(
             ExitError::from(ThreadProbe(dropped)),
             Cancellation::NotObserved,
         ))]);
         let original = Arc::downgrade(&guards);
 
-        let mut surrendered = Vec::new();
-        RetainedExit::install(
+        let mut txn = ObservationTxn::detached();
+        Retained::install(
             &mut guards,
-            vec![RetainedExit::new(Exit::completed(
-                Cancellation::NotObserved,
-            ))],
-            &mut surrendered,
+            vec![Retained::new(Exit::completed(Cancellation::NotObserved))],
+            &mut txn,
         );
-        assert!(surrendered.is_empty());
+        assert!(matches!(guards[0].get().kind(), ExitKind::Completed));
+        // P3 #14: the displaced set may own the last copy of a user error the
+        // record no longer holds, so it leaves with the transaction's
+        // post-unlock effects rather than inside the critical section.
+        assert!(
+            original.upgrade().is_some(),
+            "the displaced guard set survives until the transaction commits"
+        );
+        drop(txn);
 
         assert!(
             original.upgrade().is_none(),
             "a changed guard set replaces the shared allocation"
         );
-        assert!(matches!(guards[0].as_exit().kind(), ExitKind::Completed));
         assert_ne!(
             observed
                 .recv_timeout(TEST_WAIT)
@@ -405,7 +388,7 @@ mod tests {
     fn retained_failed_exit_disposes_off_the_retiring_thread() {
         let retiring_thread = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
-        let retained = RetainedExit::new(Exit::failed(
+        let retained = Retained::new(Exit::failed(
             ExitError::from(ThreadProbe(dropped)),
             Cancellation::NotObserved,
         ));
@@ -425,7 +408,7 @@ mod tests {
     fn retained_exit_user_handoff_preserves_the_callers_drop_thread() {
         let caller = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
-        let retained = RetainedExit::new(Exit::failed(
+        let retained = Retained::new(Exit::failed(
             ExitError::from(ThreadProbe(dropped)),
             Cancellation::NotObserved,
         ));
@@ -445,9 +428,9 @@ mod tests {
     fn retained_failed_recorded_outcome_disposes_off_the_retiring_thread() {
         let retiring_thread = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
-        let retained = RetainedRecordedOutcome::new(RecordedOutcome::returned(Err(
-            ExitError::from(ThreadProbe(dropped)),
-        )));
+        let retained = Retained::new(RecordedOutcome::returned(Err(ExitError::from(
+            ThreadProbe(dropped),
+        ))));
 
         drop(retained);
 
@@ -463,7 +446,7 @@ mod tests {
     fn retained_failed_exit_result_disposes_off_the_retiring_thread() {
         let retiring_thread = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
-        let retained = RetainedExitResult::new(Err(ExitError::from(ThreadProbe(dropped))));
+        let retained = Retained::new(Err(ExitError::from(ThreadProbe(dropped))));
 
         drop(retained);
 
@@ -480,7 +463,7 @@ mod tests {
     fn taken_exit_result_preserves_the_callers_drop_thread() {
         let caller = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
-        let retained = RetainedExitResult::new(Err(ExitError::from(ThreadProbe(dropped))));
+        let retained = Retained::new(Err(ExitError::from(ThreadProbe(dropped))));
 
         drop(retained.into_result());
 
@@ -497,9 +480,9 @@ mod tests {
     fn selected_recorded_outcome_preserves_the_callers_drop_thread() {
         let caller = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
-        let retained = RetainedRecordedOutcome::new(RecordedOutcome::returned(Err(
-            ExitError::from(ThreadProbe(dropped)),
-        )));
+        let retained = Retained::new(RecordedOutcome::returned(Err(ExitError::from(
+            ThreadProbe(dropped),
+        ))));
 
         drop(retained.into_outcome());
 

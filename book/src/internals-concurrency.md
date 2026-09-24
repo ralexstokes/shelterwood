@@ -80,8 +80,8 @@ after unlock — it is handed to a lane in
   admissions. Falls back from the blocking pool to a shared fallback
   thread to, ultimately, inline destruction on the submitting thread.
 - **`dispose_critical`** — for values whose *last owner may be inside a
-  framework critical section*: the `RetainedExit` and
-  `RetainedRecordedOutcome` wrappers around failed exits. No path ever
+  framework critical section*: the `Retained<T>` carrier around failed
+  exits, recorded outcomes and incarnation results. No path ever
   destroys the value on the submitting thread; under exhausted thread
   creation the accepted fail-safe is a queued job held for the life of
   the process, which is the trade against destroying user state under a

@@ -15,7 +15,7 @@ use shelterwood_core::{
     policy::ScopeFlavor,
 };
 
-use super::{ObservationTxn, RetainedExit};
+use super::{ObservationTxn, Retained};
 
 /// Number of lifecycle events retained independently for each subscriber.
 pub(crate) const LIFECYCLE_EVENT_CAPACITY: usize = 128;
@@ -86,7 +86,7 @@ pub(crate) struct RetainedLifecycleEvent {
     // disposal. This is the same field-order argument as
     // `RetainedScopeSnapshot` and `RetainedStopReason`.
     event: LifecycleEvent,
-    guards: Arc<Vec<RetainedExit>>,
+    guards: Arc<Vec<Retained<Exit>>>,
 }
 
 impl RetainedLifecycleEvent {
@@ -96,7 +96,7 @@ impl RetainedLifecycleEvent {
     /// Split out of [`Self::new`] so a producer can mint the guards *before*
     /// the fallible framework bookkeeping that decides whether the edge is
     /// ever assembled. The single exhaustive `match` stays here either way.
-    pub(crate) fn retain_guards(kind: &LifecycleEventKind) -> Vec<RetainedExit> {
+    pub(crate) fn retain_guards(kind: &LifecycleEventKind) -> Vec<Retained<Exit>> {
         // Exhaustive with no wildcard arm on purpose: `LifecycleEventKind` is
         // non-exhaustive for downstream crates but not here, so a new variant
         // fails to compile until its retention is declared. A variant that
@@ -105,10 +105,10 @@ impl RetainedLifecycleEvent {
         let mut guards = Vec::new();
         match kind {
             LifecycleEventKind::Exited { exit, .. } => {
-                RetainedExit::retain_exit(&mut guards, exit);
+                Retained::retain_exit(&mut guards, exit);
             }
             LifecycleEventKind::ScopeState { state } => {
-                RetainedExit::retain_scope_state(&mut guards, state);
+                Retained::retain_scope_state(&mut guards, state);
             }
             LifecycleEventKind::Added { .. }
             | LifecycleEventKind::Started { .. }
@@ -133,7 +133,7 @@ impl RetainedLifecycleEvent {
         scope: Membership,
         seq: LifecycleSeq,
         kind: LifecycleEventKind,
-        guards: Vec<RetainedExit>,
+        guards: Vec<Retained<Exit>>,
     ) -> Self {
         Self {
             event: LifecycleEvent {
@@ -381,11 +381,11 @@ impl ScopeSnapshot {
 #[derive(Clone, Debug)]
 pub(crate) struct RetainedScopeSnapshot {
     snapshot: Arc<ScopeSnapshot>,
-    exits: Arc<Vec<RetainedExit>>,
+    exits: Arc<Vec<Retained<Exit>>>,
 }
 
 impl RetainedScopeSnapshot {
-    pub(crate) fn new(snapshot: Arc<ScopeSnapshot>, exits: Vec<RetainedExit>) -> Self {
+    pub(crate) fn new(snapshot: Arc<ScopeSnapshot>, exits: Vec<Retained<Exit>>) -> Self {
         Self {
             snapshot,
             exits: Arc::new(exits),
@@ -406,7 +406,7 @@ impl RetainedScopeSnapshot {
         snapshot
     }
 
-    pub(crate) fn into_parts(self) -> (Arc<ScopeSnapshot>, Vec<RetainedExit>) {
+    pub(crate) fn into_parts(self) -> (Arc<ScopeSnapshot>, Vec<Retained<Exit>>) {
         let exits = Arc::unwrap_or_clone(self.exits);
         (self.snapshot, exits)
     }
@@ -577,19 +577,21 @@ fn install_snapshot(
 /// surrender by the installing transaction. The transaction hands the whole
 /// spent publication to its effect list after each attempted install,
 /// including one that trips an invariant.
-type SnapshotProducer = dyn FnMut(&mut Vec<RetainedExit>) -> Option<RetainedScopeSnapshot>;
+type SnapshotProducer = dyn FnMut(&mut Vec<Retained<Exit>>) -> Option<RetainedScopeSnapshot>;
 
 pub(crate) struct SnapshotProjection(Box<SnapshotProducer>);
 
 impl SnapshotProjection {
-    fn new(build: impl FnOnce(&mut Vec<RetainedExit>) -> RetainedScopeSnapshot + 'static) -> Self {
+    fn new(
+        build: impl FnOnce(&mut Vec<Retained<Exit>>) -> RetainedScopeSnapshot + 'static,
+    ) -> Self {
         let mut build = Some(build);
         Self(Box::new(move |surrendered| {
             build.take().map(|build| build(surrendered))
         }))
     }
 
-    fn build(&mut self, surrendered: &mut Vec<RetainedExit>) -> RetainedScopeSnapshot {
+    fn build(&mut self, surrendered: &mut Vec<Retained<Exit>>) -> RetainedScopeSnapshot {
         (self.0)(surrendered).expect("a staged projection is built exactly once")
     }
 }
@@ -742,7 +744,7 @@ impl SnapshotHub {
     pub(crate) fn publish(
         &self,
         txn: &mut ObservationTxn<'_>,
-        snapshot: impl FnOnce(&mut Vec<RetainedExit>) -> RetainedScopeSnapshot + 'static,
+        snapshot: impl FnOnce(&mut Vec<Retained<Exit>>) -> RetainedScopeSnapshot + 'static,
     ) {
         let Some(sender) = self.sender.get() else {
             return;
@@ -768,7 +770,7 @@ impl SnapshotHub {
     pub(crate) fn close(
         &self,
         txn: &mut ObservationTxn<'_>,
-        final_snapshot: impl FnOnce(&mut Vec<RetainedExit>) -> RetainedScopeSnapshot + 'static,
+        final_snapshot: impl FnOnce(&mut Vec<Retained<Exit>>) -> RetainedScopeSnapshot + 'static,
     ) {
         let mut final_snapshot = Some(final_snapshot);
         let mut initialized = false;

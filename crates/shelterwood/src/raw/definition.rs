@@ -6,7 +6,7 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc};
 use crate::{
     ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown, PolicyError, Readiness,
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
-    cells::{MemberCell, RetainedExitResult},
+    cells::{MemberCell, Retained},
     definition::DefinitionSource,
     mailbox::{MailboxCell, MailboxControl, MailboxEffectQueue, actor_ref_from_parts},
     policy::CommonOptions,
@@ -266,7 +266,7 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
                 CatchUnwindFuture::new(actor.run(raw)).await
             };
             let result = match outcome {
-                Ok(result) => Some(RetainedExitResult::new(result)),
+                Ok(result) => Some(Retained::new(result)),
                 Err(payload) => {
                     owner.primary_panic = Some(payload);
                     None

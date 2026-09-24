@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) struct RecordedReport {
-    pub(super) outcome: Option<RetainedRecordedOutcome>,
+    pub(super) outcome: Option<Retained<RecordedOutcome>>,
     pub(super) cancellation: Cancellation,
     pub(super) readiness_signal_seen: bool,
 }
@@ -59,7 +59,7 @@ impl ReportCompletion {
         // joiner's `receive`, the joiner's claim is the cell's sole owner; a
         // joiner dropped un-polled at runtime teardown would otherwise run the
         // application error's destructor inline on the teardown thread.
-        let outcome = outcome.map(RetainedRecordedOutcome::new);
+        let outcome = outcome.map(Retained::new);
         let cancellation =
             if self.shutdown.is_fired() || self.local_stop.as_ref().is_some_and(Latch::is_fired) {
                 Cancellation::Observed
@@ -219,7 +219,7 @@ impl ChildRuntime {
     pub(super) fn terminalize(
         &mut self,
         root: &ScopeCell,
-        exit: RetainedExit,
+        exit: Retained<Exit>,
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
@@ -637,7 +637,7 @@ impl ScopeRuntime {
     pub(super) fn terminalize_child(
         &mut self,
         key: ChildKey,
-        exit: impl Into<RetainedExit>,
+        exit: impl Into<Retained<Exit>>,
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
@@ -664,7 +664,7 @@ impl ScopeRuntime {
     fn publish_terminal(
         &mut self,
         key: ChildKey,
-        exit: RetainedExit,
+        exit: Retained<Exit>,
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
@@ -950,7 +950,7 @@ impl ScopeRuntime {
         }
         let record = child.slot.member.record();
         let exit = record.last_exit.unwrap_or_else(Exit::never_started);
-        self.begin_terminal_disposal(key, RetainedExit::new(exit), None, startup);
+        self.begin_terminal_disposal(key, Retained::new(exit), None, startup);
     }
 
     pub(super) fn advance_ladder(&mut self, key: ChildKey, now: Instant) {
@@ -1046,7 +1046,7 @@ impl ScopeRuntime {
         &mut self,
         key: ChildKey,
         incarnation: Incarnation,
-        recorded: Option<RetainedRecordedOutcome>,
+        recorded: Option<Retained<RecordedOutcome>>,
         join: runtime::JoinOutcome<()>,
         cancellation: Cancellation,
         readiness_signal_seen: bool,
@@ -1098,7 +1098,7 @@ impl ScopeRuntime {
             }
         }
         let recorded = reconcile_recorded_outcomes_retaining(recorded, active.forced_outcome);
-        let exit = RetainedExit::new(classify_exit_retaining(
+        let exit = Retained::new(classify_exit_retaining(
             recorded,
             join,
             active.hard_abort_phase,
@@ -1136,12 +1136,7 @@ impl ScopeRuntime {
         } else {
             ScopeMode::Running
         };
-        match dispatch_exit(
-            exit.as_exit(),
-            child.options.restart,
-            mode,
-            membership_status,
-        ) {
+        match dispatch_exit(exit.get(), child.options.restart, mode, membership_status) {
             ExitDispatch::Terminal => {
                 self.begin_terminal_disposal(key, exit, Some(incarnation), startup);
             }
@@ -1164,7 +1159,7 @@ impl ScopeRuntime {
                 // would restart the child with neither `Exited` nor
                 // `RestartScheduled` published — see the partial-effect note
                 // on issue #392.
-                let raw_exit = exit.as_exit().clone();
+                let raw_exit = exit.get().clone();
                 let published = self.root.publish_child_restart(
                     &child.slot.member,
                     decision.total_restarts(),
@@ -1257,7 +1252,7 @@ impl ScopeRuntime {
     pub(super) fn begin_terminal_disposal(
         &mut self,
         key: ChildKey,
-        exit: RetainedExit,
+        exit: Retained<Exit>,
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) {
@@ -1323,7 +1318,7 @@ impl ScopeRuntime {
         // falling out of scope whichever route ran. Issue #455 removed the
         // escape hatch that let a driver-layer caller surrender a guard on a
         // conventional co-owner proof, and the driver owns no observation
-        // transaction to surrender into, so `RetainedExit::drop` is the venue:
+        // transaction to surrender into, so `Retained::drop` is the venue:
         // it retires a failed user error through critical disposal at the cost
         // of one blocking-pool job.
         drop(exit);

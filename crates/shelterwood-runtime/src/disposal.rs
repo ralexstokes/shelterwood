@@ -382,6 +382,16 @@ pub fn dispose_detached<T: Send + 'static>(value: T) {
     dispose_then(value, || {});
 }
 
+/// Retires a caller-owned waker on the detached disposal lane.
+///
+/// This is the disposer the runtime-neutral core's proxy types take as a
+/// plain `fn(Waker)` (`WakerAction::Run`, `ProxiedSleep::new`,
+/// `ProxiedPoll::retire_with`): a waker whose destructor may block or panic
+/// leaves drop glue without running that destructor on the dropping thread.
+pub fn dispose_waker(waker: std::task::Waker) {
+    dispose_detached(waker);
+}
+
 /// Detaches user destruction from a framework critical section.
 ///
 /// Unlike [`dispose_detached`], no path destroys the value on the submitting

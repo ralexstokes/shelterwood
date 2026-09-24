@@ -544,6 +544,9 @@ impl<M: Send + 'static> fmt::Debug for SendTimeout<M> {
 /// user message, so any waker-destructor panic is contained before the result
 /// is returned. Allowing it to unwind would destroy that message during
 /// cleanup and could turn a second hostile destructor into a process abort.
+/// An isolated release only submits the waker to `dispose_waker`, whose
+/// detached-disposal submission contains its own failures, so the same
+/// containment is its cheapest safe fallback rather than a reachable path.
 fn withdraw_send_with<M: Send + 'static>(
     send: &mut SendFuture<M>,
     disposition: WithdrawalDisposition,
@@ -565,23 +568,8 @@ fn withdraw_send_with<M: Send + 'static>(
             kind: SendErrorKind::Terminated,
         }),
     };
-    match disposition {
-        WithdrawalDisposition::Inline => {
-            let finish_panic = crate::runtime::catch_panic(|| withdrawal.finish()).err();
-            crate::runtime::discard_panic(finish_panic);
-        }
-        WithdrawalDisposition::Isolated => {
-            // Isolation submits the waker to runtime disposal. If that
-            // submission panics, the recovered message must not unwind with
-            // it on this stack: submit it as well, then resume the first
-            // panic.
-            if let Err(panic) = crate::runtime::catch_panic(|| withdrawal.finish()) {
-                let disposal = crate::runtime::catch_panic(|| send.mailbox.dispose(result)).err();
-                crate::runtime::discard_panic(disposal);
-                crate::runtime::resume_panic(panic);
-            }
-        }
-    }
+    let finish_panic = crate::runtime::catch_panic(|| withdrawal.finish()).err();
+    crate::runtime::discard_panic(finish_panic);
     result
 }
 
@@ -852,7 +840,7 @@ mod tests {
 
     use super::{
         super::cell::{
-            OperationOutcome, WithdrawalDisposition,
+            OperationOutcome,
             tests::{
                 actor, actor_for, actor_for_with_runtime, bind, close, configure,
                 prepare_termination,
@@ -1359,49 +1347,6 @@ mod tests {
         }
     }
 
-    /// Runtime whose first `panics` disposal submissions panic.
-    struct PanickingDisposeRuntime {
-        inner: Arc<dyn crate::mailbox::MailboxRuntime>,
-        panics: AtomicUsize,
-    }
-
-    impl crate::mailbox::MailboxRuntime for PanickingDisposeRuntime {
-        fn oneshot(
-            &self,
-        ) -> (
-            Box<dyn shelterwood_core::ErasedOneShotSender>,
-            Pin<Box<dyn shelterwood_core::ErasedOneShotReceiver>>,
-        ) {
-            self.inner.oneshot()
-        }
-
-        fn signal(&self) -> Arc<dyn crate::mailbox::MailboxSignal> {
-            self.inner.signal()
-        }
-
-        fn dispose(&self, value: Box<dyn Send + 'static>) {
-            if self
-                .panics
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
-                panic!("injected isolated disposal submission panic");
-            }
-            self.inner.dispose(value);
-        }
-
-        fn now(&self) -> std::time::Instant {
-            self.inner.now()
-        }
-
-        fn sleep_until(
-            &self,
-            deadline: Option<std::time::Instant>,
-        ) -> shelterwood_core::BoxedSleep {
-            self.inner.sleep_until(deadline)
-        }
-    }
-
     struct CallMessage {
         _reply: crate::Reply<u8>,
         _payload: ThreadRecordingDrop,
@@ -1543,65 +1488,6 @@ mod tests {
         );
         mailbox.dispose(error);
         assert_ne!(await_disposal(&message_thread), polling_thread);
-    }
-
-    #[test]
-    fn isolated_withdrawal_preserves_a_disposal_submission_diagnostic() {
-        let runtime = Arc::new(PanickingDisposeRuntime {
-            inner: crate::mailbox::capability::tests::runtime(),
-            panics: AtomicUsize::new(usize::MAX),
-        });
-        let (_mailbox, actor): (Arc<MailboxCell<u8>>, ActorRef<u8>) =
-            actor_for_with_runtime(runtime);
-        let mut send = Box::pin(actor.send(7));
-        assert!(
-            send.as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::withdraw_send_with(send.as_mut().get_mut(), WithdrawalDisposition::Isolated)
-        }))
-        .expect_err("isolated disposal submission retains its diagnostic");
-        assert_eq!(
-            panic.downcast_ref::<&'static str>().copied(),
-            Some("injected isolated disposal submission panic")
-        );
-    }
-
-    #[test]
-    fn a_panicking_waker_disposal_submission_still_isolates_the_recovered_message() {
-        let runtime = Arc::new(PanickingDisposeRuntime {
-            inner: crate::mailbox::capability::tests::runtime(),
-            panics: AtomicUsize::new(1),
-        });
-        let (_mailbox, actor): (
-            Arc<MailboxCell<ThreadRecordingDrop>>,
-            ActorRef<ThreadRecordingDrop>,
-        ) = actor_for_with_runtime(runtime);
-        let message_thread = disposal_thread();
-        let mut send = Box::pin(actor.send(ThreadRecordingDrop(message_thread.clone())));
-        assert!(
-            send.as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ =
-                super::withdraw_send_with(send.as_mut().get_mut(), WithdrawalDisposition::Isolated);
-        }))
-        .expect_err("the waker's disposal submission panic reaches the caller");
-        assert_eq!(
-            panic.downcast_ref::<&'static str>().copied(),
-            Some("injected isolated disposal submission panic")
-        );
-        assert_ne!(
-            await_disposal(&message_thread),
-            std::thread::current().id(),
-            "the recovered message is submitted rather than unwound on the caller"
-        );
     }
 
     #[test]

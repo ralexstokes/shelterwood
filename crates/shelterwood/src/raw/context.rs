@@ -1398,7 +1398,7 @@ mod tests {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("raw-actor");
         let member = MemberCell::new(identity.mint_membership(&id));
-        let mailbox = MailboxCell::new(id.clone(), crate::runtime::mailbox_runtime());
+        let mailbox = MailboxCell::new(id.clone());
         member.attach_mailbox(mailbox.clone());
         let mut effects = MailboxEffectQueue::default();
         let token = MailboxControl::configure(

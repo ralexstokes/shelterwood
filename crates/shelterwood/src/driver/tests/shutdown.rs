@@ -569,7 +569,28 @@ async fn acknowledged_framework_abort_is_joined_not_task_aborted_at_the_backstop
         "the scheduled nested driver acknowledges the framework abort"
     );
 
+    // Observe the abort action directly: the real driver may already have
+    // finished by the time this task sees its acknowledgement. Route its
+    // abort handle to a task that cannot finish until after the backstop,
+    // so even an abort of an otherwise completed driver stays observable.
+    let (release, held) = crate::runtime::oneshot::<()>();
+    let probe = crate::runtime::spawn(async move { held.receive().await });
+    let active = scope.children[key].active.as_mut().expect("still active");
+    let driver_abort = std::mem::replace(&mut active.abort_handle, probe.abort_handle());
     scope.advance_ladder(key, backstop);
+    scope.children[key]
+        .active
+        .as_mut()
+        .expect("still active")
+        .abort_handle = driver_abort;
+    let _ = release.send(());
+    assert!(
+        matches!(
+            crate::runtime::join(probe).await,
+            crate::runtime::JoinOutcome::Ok { value: Some(()) }
+        ),
+        "the acknowledged backstop must not issue a task abort"
+    );
     let join = nested_join_outcome(&mut events).await;
     assert!(
         matches!(join, crate::runtime::JoinOutcome::Ok { .. }),

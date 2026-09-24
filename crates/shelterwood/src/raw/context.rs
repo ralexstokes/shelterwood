@@ -85,8 +85,8 @@ struct EventQueue<M> {
     // Insertion and the snapshot share this lock, so FIFO order itself is the
     // sequence and there is no integer counter whose saturation could blur a
     // boundary.
-    queue: Mutex<VecDeque<QueuedEvent<M>>>,
-    disposal: RawDisposal,
+    queue: Mutex<DisposingQueue<QueuedEvent<M>>>,
+    signal: Signal,
 }
 
 #[cfg(test)]
@@ -99,8 +99,8 @@ impl<M> Default for EventQueue<M> {
 impl<M> EventQueue<M> {
     fn new(disposal: RawDisposal) -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
-            disposal,
+            signal: disposal.signal.clone(),
+            queue: Mutex::new(DisposingQueue::new(disposal)),
         }
     }
 
@@ -109,7 +109,7 @@ impl<M> EventQueue<M> {
             .lock()
             .expect("actor event queue mutex poisoned")
             .push_back(event);
-        self.disposal.signal.pulse();
+        self.signal.pulse();
     }
 
     #[cfg(test)]
@@ -128,7 +128,7 @@ impl<M> EventQueue<M> {
     ) {
         self.insert_with(event, before_insert);
         after_insert();
-        self.disposal.signal.pulse();
+        self.signal.pulse();
     }
 
     fn watermark(&self) -> usize {
@@ -156,8 +156,7 @@ impl<M> EventQueue<M> {
                 .expect("actor event queue mutex poisoned")
                 .pop_front();
             // The guard is a temporary, so this is raised with the queue mutex
-            // already released. It replaces the release-profile clamp that
-            // used to zero the budget on a missing event.
+            // already released.
             assert!(event.is_some(), "a timer watermark covers queued events");
             *remaining -= 1;
             event
@@ -165,41 +164,31 @@ impl<M> EventQueue<M> {
     }
 
     fn clear(&self) {
-        let mut queue = {
-            let mut queue = self.queue.lock().expect("actor event queue mutex poisoned");
-            std::mem::take(&mut *queue)
-        };
-        while let Some(event) = queue.pop_front() {
-            self.disposal.dispose(event);
-        }
-    }
-}
-
-impl<M> Drop for EventQueue<M> {
-    fn drop(&mut self) {
-        let queue = self
+        // The guard is a temporary: the drained events are disposed after
+        // the queue mutex is released.
+        let drained = self
             .queue
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while let Some(event) = queue.pop_front() {
-            self.disposal.dispose(event);
-        }
+            .lock()
+            .expect("actor event queue mutex poisoned")
+            .take();
+        drop(drained);
     }
 }
 
-/// Incarnation-owned storage for `continue_with` messages.
+/// Incarnation-owned FIFO of user payloads: `continue_with` messages, and
+/// behind [`EventQueue`]'s lock, queued offload completions.
 ///
 /// Elements are stored raw — the queue owns one disposal handle instead of one
-/// per element — so every drain must route its payloads through that funnel.
-/// `Drop` re-drains unconditionally: a `freeze` that never ran, or that failed
+/// per element — so every drain routes its payloads through that funnel.
+/// `Drop` drains unconditionally: a `freeze` that never ran, or that failed
 /// partway through an earlier cleanup step, must not leave queued user
-/// messages to be destroyed outside the disposal boundary.
-struct ContinuationQueue<M> {
-    queue: VecDeque<M>,
+/// payloads to be destroyed outside the disposal boundary.
+struct DisposingQueue<T> {
+    queue: VecDeque<T>,
     disposal: RawDisposal,
 }
 
-impl<M> ContinuationQueue<M> {
+impl<T> DisposingQueue<T> {
     fn new(disposal: RawDisposal) -> Self {
         Self {
             queue: VecDeque::new(),
@@ -215,22 +204,30 @@ impl<M> ContinuationQueue<M> {
         self.queue.is_empty()
     }
 
-    fn push_back(&mut self, message: M) {
-        self.queue.push_back(message);
+    fn push_back(&mut self, value: T) {
+        self.queue.push_back(value);
     }
 
-    fn pop_front(&mut self) -> Option<M> {
+    fn pop_front(&mut self) -> Option<T> {
         self.queue.pop_front()
     }
 
+    /// Moves every element into a new queue that disposes them on drop.
+    fn take(&mut self) -> Self {
+        Self {
+            queue: std::mem::take(&mut self.queue),
+            disposal: self.disposal.clone(),
+        }
+    }
+
     fn clear(&mut self) {
-        while let Some(message) = self.queue.pop_front() {
-            self.disposal.dispose(message);
+        while let Some(value) = self.queue.pop_front() {
+            self.disposal.dispose(value);
         }
     }
 }
 
-impl<M> Drop for ContinuationQueue<M> {
+impl<T> Drop for DisposingQueue<T> {
     fn drop(&mut self) {
         self.clear();
     }
@@ -345,7 +342,7 @@ impl ReadyBatch {
 
 struct RawResources<M> {
     accepting: bool,
-    continuations: ContinuationQueue<M>,
+    continuations: DisposingQueue<M>,
     // Set after returning a continuation and cleared after an external
     // mailbox/offload/timer item. `next_ready` uses it to prohibit two local
     // continuations from leading while an external source remains eligible.
@@ -367,7 +364,7 @@ impl<M> Default for RawResources<M> {
         let events = Arc::new(EventQueue::new(disposal.clone()));
         Self {
             accepting: true,
-            continuations: ContinuationQueue::new(disposal.clone()),
+            continuations: DisposingQueue::new(disposal.clone()),
             last_delivery_was_continuation: false,
             timers: TimerStore::new(disposal.clone()),
             ready_batch: None,
@@ -1730,7 +1727,7 @@ mod tests {
     #[crate::runtime::test]
     async fn event_visibility_precedes_signal_without_losing_the_wakeup() {
         let queue = Arc::new(EventQueue::default());
-        let mut watcher = queue.disposal.signal.watcher();
+        let mut watcher = queue.signal.watcher();
         let inserted = Arc::new(Barrier::new(2));
         let release_signal = Arc::new(Barrier::new(2));
         let producer = {

@@ -431,7 +431,7 @@ struct ScopeRuntime {
     epoch: Epoch,
     ancestor_shutdown_seen: bool,
     ancestor_abort_seen: bool,
-    completion: Option<ScopeCompletion>,
+    completion: Option<Guarded<StopReason>>,
     finished: Option<StopReason>,
     // Last by design: the supervisor, queued effects, completion, and
     // finished result can all retain a structured startup reason containing
@@ -528,10 +528,6 @@ impl<T> IndexMut<ChildKey> for ChildResources<T> {
     }
 }
 
-struct ScopeCompletion {
-    reason: Guarded<StopReason>,
-}
-
 /// Runs the synchronous fail-closed scope epilogue.
 ///
 /// `pending_startup_removals` can reach this path only when a resumed
@@ -610,7 +606,7 @@ impl Drop for ScopeRuntime {
         let completion = self.completion.take();
         let reason = completion
             .as_ref()
-            .map(|completion| completion.reason.get().clone())
+            .map(|completion| completion.get().clone())
             .or_else(|| self.supervisor.lifecycle().draining_reason().cloned())
             .unwrap_or(StopReason::ShutdownRequested);
         // Root membership terminality is join-gated: the monitor owns it on
@@ -726,9 +722,7 @@ impl ScopeRuntime {
     /// membership-terminal fence.
     fn take_completion(&mut self) -> Option<StopReason> {
         let reason = self.finished.take()?;
-        self.completion = Some(ScopeCompletion {
-            reason: Guarded::new(reason.clone()),
-        });
+        self.completion = Some(Guarded::new(reason.clone()));
         Some(reason)
     }
 
@@ -1213,9 +1207,7 @@ async fn wait_for_scope_wake(
             // receiver and any queued admission response wakers outside
             // ScopeRuntime's contained epilogue.
             let reason = StopReason::ShutdownRequested;
-            scope.completion = Some(ScopeCompletion {
-                reason: Guarded::new(reason.clone()),
-            });
+            scope.completion = Some(Guarded::new(reason.clone()));
             return Some(reason);
         }
         runtime::ScopeWake::Deadline => {

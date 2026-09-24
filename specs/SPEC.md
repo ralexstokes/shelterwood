@@ -1551,7 +1551,9 @@ API-shape rules:
   autocomplete), plus the raw-actor pair `add_raw` / `add_raw_once`
   (§4.3) — **eight entry points** — each taking `(id, definition)`: the
   id as `impl Into<ChildId>` (`ChildId` is a concrete library-owned type,
-  so the string conversions are ordinary, coherent `From` impls) and the
+  so the string conversions are ordinary, coherent `From` impls, `&ChildId`
+  included; every public id parameter — reservation, id-based `remove`,
+  and snapshot lookup — takes the same bound) and the
   kind's definition value; there are no parallel `*_spec` twins. A spec
   is that (id, definition) pair, where the definition is the construction
   source (§4.2's bounds, pinned in the slot surface below) plus options:

@@ -385,7 +385,9 @@ fn descendant<'a>(
     snapshot: &'a shelterwood::ScopeSnapshot,
     path: &[&str],
 ) -> &'a shelterwood::ChildSnapshot {
-    snapshot.descendant(path).expect("descendant is present")
+    snapshot
+        .descendant(path.iter().copied())
+        .expect("descendant is present")
 }
 
 fn event_is_restart_for(event: &LifecycleEvent, membership: Membership) -> bool {

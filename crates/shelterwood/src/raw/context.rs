@@ -16,8 +16,8 @@ use crate::{
     cells::{CancellationToken, ParentCancellationToken},
     mailbox::{AcceptedSequence, MailboxCell, MailboxReceiver},
     runtime::{
-        self, CompletionGatedLatch, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher,
-        UnwindPanics, catch_panic, resume_preferred_panic,
+        self, CompletionGatedLatch, Latch, Signal, SignalWatcher, UnwindPanics, catch_panic,
+        resume_preferred_panic,
     },
     scope::ScopeRef,
 };
@@ -85,8 +85,8 @@ struct EventQueue<M> {
     // Insertion and the snapshot share this lock, so FIFO order itself is the
     // sequence and there is no integer counter whose saturation could blur a
     // boundary.
-    queue: Mutex<VecDeque<QueuedEvent<M>>>,
-    disposal: RawDisposal,
+    queue: Mutex<DisposingQueue<QueuedEvent<M>>>,
+    signal: Signal,
 }
 
 #[cfg(test)]
@@ -99,8 +99,8 @@ impl<M> Default for EventQueue<M> {
 impl<M> EventQueue<M> {
     fn new(disposal: RawDisposal) -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
-            disposal,
+            signal: disposal.signal.clone(),
+            queue: Mutex::new(DisposingQueue::new(disposal)),
         }
     }
 
@@ -109,7 +109,7 @@ impl<M> EventQueue<M> {
             .lock()
             .expect("actor event queue mutex poisoned")
             .push_back(event);
-        self.disposal.signal.pulse();
+        self.signal.pulse();
     }
 
     #[cfg(test)]
@@ -128,7 +128,7 @@ impl<M> EventQueue<M> {
     ) {
         self.insert_with(event, before_insert);
         after_insert();
-        self.disposal.signal.pulse();
+        self.signal.pulse();
     }
 
     fn watermark(&self) -> usize {
@@ -156,8 +156,7 @@ impl<M> EventQueue<M> {
                 .expect("actor event queue mutex poisoned")
                 .pop_front();
             // The guard is a temporary, so this is raised with the queue mutex
-            // already released. It replaces the release-profile clamp that
-            // used to zero the budget on a missing event.
+            // already released.
             assert!(event.is_some(), "a timer watermark covers queued events");
             *remaining -= 1;
             event
@@ -165,41 +164,31 @@ impl<M> EventQueue<M> {
     }
 
     fn clear(&self) {
-        let mut queue = {
-            let mut queue = self.queue.lock().expect("actor event queue mutex poisoned");
-            std::mem::take(&mut *queue)
-        };
-        while let Some(event) = queue.pop_front() {
-            self.disposal.dispose(event);
-        }
-    }
-}
-
-impl<M> Drop for EventQueue<M> {
-    fn drop(&mut self) {
-        let queue = self
+        // The guard is a temporary: the drained events are disposed after
+        // the queue mutex is released.
+        let drained = self
             .queue
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while let Some(event) = queue.pop_front() {
-            self.disposal.dispose(event);
-        }
+            .lock()
+            .expect("actor event queue mutex poisoned")
+            .take();
+        drop(drained);
     }
 }
 
-/// Incarnation-owned storage for `continue_with` messages.
+/// Incarnation-owned FIFO of user payloads: `continue_with` messages, and
+/// behind [`EventQueue`]'s lock, queued offload completions.
 ///
 /// Elements are stored raw — the queue owns one disposal handle instead of one
-/// per element — so every drain must route its payloads through that funnel.
-/// `Drop` re-drains unconditionally: a `freeze` that never ran, or that failed
+/// per element — so every drain routes its payloads through that funnel.
+/// `Drop` drains unconditionally: a `freeze` that never ran, or that failed
 /// partway through an earlier cleanup step, must not leave queued user
-/// messages to be destroyed outside the disposal boundary.
-struct ContinuationQueue<M> {
-    queue: VecDeque<M>,
+/// payloads to be destroyed outside the disposal boundary.
+struct DisposingQueue<T> {
+    queue: VecDeque<T>,
     disposal: RawDisposal,
 }
 
-impl<M> ContinuationQueue<M> {
+impl<T> DisposingQueue<T> {
     fn new(disposal: RawDisposal) -> Self {
         Self {
             queue: VecDeque::new(),
@@ -215,22 +204,30 @@ impl<M> ContinuationQueue<M> {
         self.queue.is_empty()
     }
 
-    fn push_back(&mut self, message: M) {
-        self.queue.push_back(message);
+    fn push_back(&mut self, value: T) {
+        self.queue.push_back(value);
     }
 
-    fn pop_front(&mut self) -> Option<M> {
+    fn pop_front(&mut self) -> Option<T> {
         self.queue.pop_front()
     }
 
+    /// Moves every element into a new queue that disposes them on drop.
+    fn take(&mut self) -> Self {
+        Self {
+            queue: std::mem::take(&mut self.queue),
+            disposal: self.disposal.clone(),
+        }
+    }
+
     fn clear(&mut self) {
-        while let Some(message) = self.queue.pop_front() {
-            self.disposal.dispose(message);
+        while let Some(value) = self.queue.pop_front() {
+            self.disposal.dispose(value);
         }
     }
 }
 
-impl<M> Drop for ContinuationQueue<M> {
+impl<T> Drop for DisposingQueue<T> {
     fn drop(&mut self) {
         self.clear();
     }
@@ -345,7 +342,7 @@ impl ReadyBatch {
 
 struct RawResources<M> {
     accepting: bool,
-    continuations: ContinuationQueue<M>,
+    continuations: DisposingQueue<M>,
     // Set after returning a continuation and cleared after an external
     // mailbox/offload/timer item. `next_ready` uses it to prohibit two local
     // continuations from leading while an external source remains eligible.
@@ -367,7 +364,7 @@ impl<M> Default for RawResources<M> {
         let events = Arc::new(EventQueue::new(disposal.clone()));
         Self {
             accepting: true,
-            continuations: ContinuationQueue::new(disposal.clone()),
+            continuations: DisposingQueue::new(disposal.clone()),
             last_delivery_was_continuation: false,
             timers: TimerStore::new(disposal.clone()),
             ready_batch: None,
@@ -385,32 +382,17 @@ impl<M> RawResources<M> {
             return;
         }
         self.accepting = false;
-        // Treat the whole freeze as one cleanup transaction. Cancellation
-        // contains each latch wake, future disposal and task abort
-        // independently, while this outer accumulator keeps one failure from
-        // skipping later offloads or any of the collection drains.
-        let mut panics = PanicAccumulator::default();
-        // An already-retained offload failure happened before this freeze and
-        // therefore precedes every synchronous cleanup failure below.
-        panics.record(self.disposal.panic.take());
-        for offload in &mut self.offloads {
-            panics.record(offload.cancel(&self.disposal.panic));
-            panics.record(self.disposal.panic.take());
+        // Each step records its own failure in the first-wins slot, so one
+        // failure cannot skip a later step and whatever was retained before
+        // the freeze keeps precedence over what the freeze releases.
+        let slot = &self.disposal.panic;
+        for offload in &self.offloads {
+            offload.cancel(slot);
         }
-        panics.run(|| self.continuations.clear());
-        panics.record(self.disposal.panic.take());
-        panics.run(|| self.timers.clear());
-        panics.record(self.disposal.panic.take());
-        panics.run(|| self.ready_batch = None);
-        panics.record(self.disposal.panic.take());
-        panics.run(|| self.events.clear());
-        panics.record(self.disposal.panic.take());
-        if let Some(payload) = panics.take() {
-            // The owned raw-incarnation epilogue drains this slot after the
-            // freeze and before joining, so publication is delayed until all
-            // synchronous cleanup has completed without losing the diagnostic.
-            self.disposal.panic.restore_first(payload);
-        }
+        slot.run(|| self.continuations.clear());
+        slot.run(|| self.timers.clear());
+        slot.run(|| self.ready_batch = None);
+        slot.run(|| self.events.clear());
     }
 
     /// Drops ledger entries for offloads that already finished, keeping a
@@ -441,6 +423,43 @@ impl<M> RawResources<M> {
                 !offload.finished.is_fired()
             }
         });
+    }
+
+    fn batch(&self) -> &ReadyBatch {
+        self.ready_batch
+            .as_ref()
+            .expect("ready selection always owns an arbitration batch")
+    }
+
+    fn batch_mut(&mut self) -> &mut ReadyBatch {
+        self.ready_batch
+            .as_mut()
+            .expect("ready selection always owns an arbitration batch")
+    }
+
+    fn pop_continuation(&mut self, is_lead_slot: bool) -> Option<M> {
+        let batch = self
+            .ready_batch
+            .as_mut()
+            .expect("ready selection always owns an arbitration batch");
+        if (!is_lead_slot || !self.last_delivery_was_continuation)
+            && batch.continuation_is_eligible()
+            && let Some(message) = self.continuations.pop_front()
+        {
+            batch.record_continuation_delivery();
+            self.last_delivery_was_continuation = true;
+            return Some(message);
+        }
+        None
+    }
+
+    /// Pops the next offload completion inside the batch's captured prefix.
+    fn pop_batched_event(&mut self) -> Option<QueuedEvent<M>> {
+        let batch = self
+            .ready_batch
+            .as_mut()
+            .expect("ready selection always owns an arbitration batch");
+        self.events.pop_through(&mut batch.offloads_remaining)
     }
 
     fn resume_pending_panic(&self) {
@@ -483,13 +502,9 @@ impl<M> RawResources<M> {
 
 impl<M> Drop for RawResources<M> {
     fn drop(&mut self) {
-        let freeze_panic = catch_panic(|| self.freeze()).err();
-        let mut panics = PanicAccumulator::default();
-        // `freeze` can transfer a destructor panic into the shared slot. Take
-        // that retained application diagnostic after cleanup and preserve it
-        // ahead of a direct framework-cleanup panic.
-        panics.record(self.disposal.panic.take());
-        panics.record(freeze_panic);
+        // Evidence stays in the slot for the incarnation owner to report.
+        let slot = Arc::clone(&self.disposal.panic);
+        slot.run(|| self.freeze());
     }
 }
 
@@ -1058,18 +1073,6 @@ impl<M: Send + 'static> RawContext<M> {
             || self.resources.events.watermark() > 0
     }
 
-    fn pop_continuation(&mut self, batch: &mut ReadyBatch, is_lead_slot: bool) -> Option<M> {
-        if (!is_lead_slot || !self.resources.last_delivery_was_continuation)
-            && batch.continuation_is_eligible()
-            && let Some(message) = self.resources.continuations.pop_front()
-        {
-            batch.record_continuation_delivery();
-            self.resources.last_delivery_was_continuation = true;
-            return Some(message);
-        }
-        None
-    }
-
     /// Selects one live-incarnation input without awaiting.
     ///
     /// Every selection runs through one bounded arbitration batch. Steady
@@ -1114,6 +1117,9 @@ impl<M: Send + 'static> RawContext<M> {
         message
     }
 
+    /// The batch stays installed in `resources` for the whole selection, so
+    /// when user code unwinds out of a step, the next caught receive sees the
+    /// same cutoffs and any not-yet-committed timer armings.
     fn select_ready(&mut self) -> Option<M> {
         // A permanently busy actor never reaches `wait_for_event`; reclaim at
         // its other guaranteed re-entry point so completed task handles do not
@@ -1123,58 +1129,34 @@ impl<M: Send + 'static> RawContext<M> {
         loop {
             self.resources.resume_pending_panic();
             self.begin_ready_batch();
-            let mut batch = self
-                .resources
-                .ready_batch
-                .take()
-                .expect("ready selection always owns an arbitration batch");
-            if let Some(message) = self.pop_continuation(&mut batch, true) {
-                self.resources.ready_batch = Some(batch);
+            if let Some(message) = self.resources.pop_continuation(true) {
                 return Some(message);
             }
 
+            let batch = self.resources.batch();
             if batch.mailbox_is_eligible() {
                 let cutoff = batch.mailbox_through;
-                let (restored, message) = self.with_ready_batch_installed(batch, |this| {
-                    let result = catch_panic(|| this.receiver.try_recv_live_through(cutoff));
-                    // Receive runs caller code only in its post-consumption
-                    // effects: a sender wake can panic after the selected
-                    // message has left the queue and been sent to disposal.
-                    // Spend that mailbox turn before resuming the panic, so
-                    // a caught wake cannot bypass offload fairness. Failures
-                    // before consumption are internal invariant/poison paths,
-                    // not recoverable user callbacks.
-                    if !matches!(result, Ok(None)) {
-                        this.resources
-                            .ready_batch
-                            .as_mut()
-                            .expect("mailbox selection keeps its ready batch installed")
-                            .record_mailbox_delivery();
-                        this.resources.last_delivery_was_continuation = false;
-                    }
-                    result.unwrap_or_else(|panic| runtime::resume_panic(panic))
-                });
-                batch = restored;
-                if let Some(message) = message {
-                    self.resources.ready_batch = Some(batch);
+                let result = catch_panic(|| self.receiver.try_recv_live_through(cutoff));
+                // Receive runs caller code only in its post-consumption
+                // effects: a sender wake can panic after the selected message
+                // has left the queue and been sent to disposal. Spend that
+                // mailbox turn before resuming the panic, so a caught wake
+                // cannot bypass offload fairness. Failures before consumption
+                // are internal invariant/poison paths, not recoverable user
+                // callbacks.
+                if !matches!(result, Ok(None)) {
+                    self.resources.batch_mut().record_mailbox_delivery();
+                    self.resources.last_delivery_was_continuation = false;
+                }
+                if let Some(message) = result.unwrap_or_else(|panic| runtime::resume_panic(panic)) {
                     return Some(message);
                 }
             }
 
-            if batch.offloads_remaining > 0 {
-                while let Some(event) = self
-                    .resources
-                    .events
-                    .pop_through(&mut batch.offloads_remaining)
-                {
-                    let (restored, message) = self
-                        .with_ready_batch_installed(batch, |this| this.materialize_event(event));
-                    batch = restored;
-                    if let Some(message) = message {
-                        self.resources.last_delivery_was_continuation = false;
-                        self.resources.ready_batch = Some(batch);
-                        return Some(message);
-                    }
+            while let Some(event) = self.resources.pop_batched_event() {
+                if let Some(message) = self.materialize_event(event) {
+                    self.resources.last_delivery_was_continuation = false;
+                    return Some(message);
                 }
             }
 
@@ -1184,6 +1166,7 @@ impl<M: Send + 'static> RawContext<M> {
             // so that work receives §6.1's mandatory fairness opportunity.
             // Fired batches deliberately retain their immutable cutoffs:
             // post-fire arrivals must not jump the already-fired timers.
+            let batch = self.resources.batch();
             if !batch.is_fired()
                 && self.resources.last_delivery_was_continuation
                 && self
@@ -1193,23 +1176,20 @@ impl<M: Send + 'static> RawContext<M> {
                 continue;
             }
 
-            if let Some(message) = self.pop_continuation(&mut batch, false) {
-                self.resources.ready_batch = Some(batch);
+            if let Some(message) = self.resources.pop_continuation(false) {
                 return Some(message);
             }
 
-            while let Some(arming) = batch.next_arming() {
-                let (restored, message) =
-                    self.with_ready_batch_installed(batch, |this| this.deliver_timer(arming));
-                batch = restored;
-                batch.commit_arming(arming);
+            while let Some(arming) = self.resources.batch().next_arming() {
+                let message = self.deliver_timer(arming);
+                self.resources.batch_mut().commit_arming(arming);
                 if let Some(message) = message {
                     self.resources.last_delivery_was_continuation = false;
-                    self.resources.ready_batch = Some(batch);
                     return Some(message);
                 }
             }
 
+            let batch = self.resources.batch();
             let mailbox_may_remain = batch.mailbox_budget_exhausted();
             let mailbox_cutoff = batch.mailbox_through;
             self.resources.ready_batch = None;
@@ -1224,25 +1204,6 @@ impl<M: Send + 'static> RawContext<M> {
             }
             return None;
         }
-    }
-
-    /// Runs a callback-capable selection step while the authoritative batch
-    /// remains installed. If user code unwinds, the next caught receive sees
-    /// the same cutoffs and any not-yet-committed timer armings.
-    fn with_ready_batch_installed<R>(
-        &mut self,
-        batch: ReadyBatch,
-        operation: impl FnOnce(&mut Self) -> R,
-    ) -> (ReadyBatch, R) {
-        assert!(self.resources.ready_batch.is_none());
-        self.resources.ready_batch = Some(batch);
-        let result = operation(self);
-        let batch = self
-            .resources
-            .ready_batch
-            .take()
-            .expect("callback-capable selection keeps its ready batch installed");
-        (batch, result)
     }
 
     fn materialize_event(&self, event: QueuedEvent<M>) -> Option<M> {
@@ -1343,8 +1304,9 @@ impl<M: Send + 'static> RawContext<M> {
         self.resources.join_offloads().await;
     }
 
-    pub(super) fn take_resource_panic(&self) -> Option<PanicPayload> {
-        self.resources.disposal.panic.take()
+    /// The incarnation's cleanup-panic slot, shared with every resource.
+    pub(super) fn panic_slot(&self) -> Arc<PanicSlot> {
+        Arc::clone(&self.resources.disposal.panic)
     }
 }
 
@@ -1748,7 +1710,7 @@ mod tests {
     #[crate::runtime::test]
     async fn event_visibility_precedes_signal_without_losing_the_wakeup() {
         let queue = Arc::new(EventQueue::default());
-        let mut watcher = queue.disposal.signal.watcher();
+        let mut watcher = queue.signal.watcher();
         let inserted = Arc::new(Barrier::new(2));
         let release_signal = Arc::new(Barrier::new(2));
         let producer = {
@@ -1971,8 +1933,8 @@ mod tests {
     /// The chain the fix exists to protect, with a real task handle: the
     /// ledger keeps the entry while the completion wake is in flight, so
     /// teardown still owns the `ActorWork` it must join, and the caller's own
-    /// payload — not the task join's stringified panic — reaches the
-    /// post-join resource take.
+    /// payload — not the task join's stringified panic — is what the
+    /// cleanup slot holds after the join.
     ///
     /// Multi-threaded on purpose: the test thread blocks on the handshake
     /// while the offload task runs the hostile wake on a worker.
@@ -2029,7 +1991,7 @@ mod tests {
             .disposal
             .panic
             .take()
-            .expect("the caller wake panic reaches the post-join resource take");
+            .expect("the caller wake panic is in the cleanup slot after the join");
         assert_eq!(
             payload.downcast_ref::<OpaqueWakePanic>(),
             Some(&OpaqueWakePanic("joined finished wake panic")),
@@ -2497,8 +2459,10 @@ mod tests {
             finished.push(completion);
         }
 
-        let payload = catch_unwind(AssertUnwindSafe(|| drop(resources)))
-            .expect_err("the first destructor panic is surfaced");
+        let slot = Arc::clone(&resources.disposal.panic);
+        catch_unwind(AssertUnwindSafe(|| drop(resources)))
+            .expect("drop leaves cleanup evidence in the slot");
+        let payload = slot.take().expect("the first destructor panic is retained");
         assert_eq!(
             panic_message(&payload),
             Some("unit offload destructor panic")
@@ -2609,8 +2573,12 @@ mod tests {
             "the freeze transition is one-shot"
         );
 
-        let payload = catch_unwind(AssertUnwindSafe(|| drop(resources)))
-            .expect_err("drop resumes the failure retained by the first freeze");
+        let slot = Arc::clone(&resources.disposal.panic);
+        catch_unwind(AssertUnwindSafe(|| drop(resources)))
+            .expect("drop leaves cleanup evidence in the slot");
+        let payload = slot
+            .take()
+            .expect("the failure retained by the first freeze survives drop");
         assert_eq!(
             panic_message(&payload),
             Some("contained raw payload destructor panic")

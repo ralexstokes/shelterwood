@@ -302,6 +302,10 @@ impl<'a, A: Actor> Context<'a, A> {
         }
     }
 
+    /// Drain begins only after `recv` returned `None`, which requires a
+    /// fired local stop or shutdown latch, so the raw context's stopping
+    /// gate already rejects new work here. The stage adds only the
+    /// `clear_timer` rejection and the `stop` no-op.
     fn new_draining(raw: &'a mut RawContext<A::Msg>) -> Self {
         Self {
             raw,
@@ -333,9 +337,7 @@ impl<'a, A: Actor> Context<'a, A> {
     /// readiness can no longer change the startup outcome and this call is a
     /// deliberate no-op.
     pub fn mark_ready(&self) {
-        if self.stage != DeliveryStage::DrainingFrozenPrefix {
-            self.raw.mark_ready();
-        }
+        self.raw.mark_ready();
     }
 
     /// Requests a clean local stop.
@@ -376,11 +378,7 @@ impl<'a, A: Actor> Context<'a, A> {
     /// is stopping: after [`Context::stop`], once cooperative shutdown is
     /// requested, or during frozen-prefix drain.
     pub fn continue_with(&mut self, message: A::Msg) -> Result<(), Rejected<A::Msg>> {
-        if self.stage == DeliveryStage::DrainingFrozenPrefix {
-            Err(Rejected::new(message))
-        } else {
-            self.raw.continue_with(message)
-        }
+        self.raw.continue_with(message)
     }
 
     /// Arms or replaces a one-shot keyed timer.
@@ -397,11 +395,7 @@ impl<'a, A: Actor> Context<'a, A> {
     where
         K: Hash + Eq + Send + 'static,
     {
-        if self.stage == DeliveryStage::DrainingFrozenPrefix {
-            Err(Rejected::new((key, message)))
-        } else {
-            self.raw.set_timeout(key, message, after)
-        }
+        self.raw.set_timeout(key, message, after)
     }
 
     /// Arms or replaces a keyed interval; a zero period clears the key.
@@ -419,11 +413,7 @@ impl<'a, A: Actor> Context<'a, A> {
         K: Hash + Eq + Send + 'static,
         A::Msg: Clone,
     {
-        if self.stage == DeliveryStage::DrainingFrozenPrefix {
-            Err(Rejected::new((key, message)))
-        } else {
-            self.raw.set_interval(key, message, period)
-        }
+        self.raw.set_interval(key, message, period)
     }
 
     /// Retracts a keyed timer or rejects the operation while draining.
@@ -461,11 +451,7 @@ impl<'a, A: Actor> Context<'a, A> {
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> A::Msg + Send + 'static,
     {
-        if self.stage == DeliveryStage::DrainingFrozenPrefix {
-            Err(Rejected::new((work, continuation)))
-        } else {
-            self.raw.offload(work, continuation, deadline)
-        }
+        self.raw.offload(work, continuation, deadline)
     }
 
     /// Starts guarded incarnation-owned async work with one deadline budget.
@@ -486,11 +472,7 @@ impl<'a, A: Actor> Context<'a, A> {
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> A::Msg + Send + 'static,
     {
-        if self.stage == DeliveryStage::DrainingFrozenPrefix {
-            Err(Rejected::new((work, continuation)))
-        } else {
-            self.raw.offload_scoped(work, continuation, deadline)
-        }
+        self.raw.offload_scoped(work, continuation, deadline)
     }
 
     /// Re-enters a same-message actor with this exact context and stage.

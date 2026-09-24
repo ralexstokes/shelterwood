@@ -855,7 +855,7 @@ impl ScopeRuntime {
         });
         self.reduce(SupervisorEvent::Spawned { child: key });
         if let Some(effect) = readiness_effect {
-            // `progress_startup` already owns this ordered-startup loop. Do
+            // `settle_supervisor` already owns this ordered-startup loop. Do
             // not re-enter it synchronously for an immediate child.
             let _ = self.apply_readiness_effect(key, incarnation, effect);
         }
@@ -1065,7 +1065,7 @@ impl ScopeRuntime {
             // Match the natural signal-before-exit order: ordered startup may
             // advance, and a sole ready child completes aggregate startup
             // before its post-ready exit is classified.
-            self.progress_startup();
+            self.settle_supervisor();
         }
 
         let Some(child) = self.children.get_mut(key) else {

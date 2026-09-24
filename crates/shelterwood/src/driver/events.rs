@@ -319,7 +319,7 @@ impl ScopeRuntime {
                     .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
                     .unwrap_or(false)
                 {
-                    self.progress_startup();
+                    self.settle_supervisor();
                 }
             }
             DeadlineKind::Restart { child } => {
@@ -333,10 +333,10 @@ impl ScopeRuntime {
                     }
                 } else {
                     self.spawn_child(child);
-                    // A restart-deadline caller is outside `progress_startup`'s
+                    // A restart-deadline caller is outside `settle_supervisor`'s
                     // ordered loop. Revisit the aggregate in case this spawn's
                     // immediate-readiness effect released its last gate.
-                    self.progress_startup();
+                    self.settle_supervisor();
                 }
             }
             DeadlineKind::Stop { child, incarnation } => {

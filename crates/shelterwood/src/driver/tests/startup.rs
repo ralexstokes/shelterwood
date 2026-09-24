@@ -562,7 +562,7 @@ async fn pre_spawn_stop_on_an_ordered_child_resolves_at_its_turn_without_constru
     let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(first)).build();
 
     // Ordered startup spawns "a" and parks on its never-fired readiness.
-    scope.progress_startup();
+    scope.settle_supervisor();
     let a_incarnation = scope.children[first]
         .active
         .as_ref()
@@ -841,7 +841,7 @@ async fn stale_incarnation_readiness_effect_does_not_credit_startup() {
 }
 
 /// `next_ordered_start` is held across `spawn_child` and is never cleared by
-/// `reclaim_child`, so `progress_startup` must treat a reclaimed key the way
+/// `reclaim_child`, so `settle_supervisor` must treat a reclaimed key the way
 /// `stop_next_ordered` treats its own cursor: already gone, advance past it.
 /// Ordered scopes carry no dynamic control today and so never reclaim, which
 /// is exactly why this is pinned here — the arena is a monotonic key domain,
@@ -885,7 +885,7 @@ async fn ordered_startup_advances_past_a_reclaimed_cursor() {
         .expect("the cursor's child is live before the reclaim");
     scope.reduce(SupervisorEvent::Reclaim { child: gone });
 
-    scope.progress_startup();
+    scope.settle_supervisor();
 
     assert_eq!(
         scope.supervisor.next_ordered_start(),
@@ -953,7 +953,7 @@ async fn startup_removal_response_follows_recomputation_and_drop_discharges_it()
     );
     assert!(!scope.supervisor.lifecycle().startup_complete());
 
-    scope.progress_startup();
+    scope.settle_supervisor();
     assert!(scope.supervisor.lifecycle().startup_complete());
     assert_eq!(root.record().startup, Some(Ok(())));
     assert_eq!(
@@ -1067,7 +1067,7 @@ async fn queued_removal_suppresses_replayed_self_stop_readiness() {
         "a leaving membership is not credited to the startup aggregate"
     );
     assert!(!scope.supervisor.lifecycle().startup_complete());
-    scope.progress_startup();
+    scope.settle_supervisor();
     assert!(
         !scope.supervisor.lifecycle().startup_complete(),
         "startup waits for the removal to shrink the declared set"
@@ -1141,7 +1141,7 @@ async fn removal_before_pre_ready_exit_does_not_publish_startup_abort() {
         "removal is not a startup abort"
     );
     scope.handle_removal(RemovalRequest { key });
-    scope.progress_startup();
+    scope.settle_supervisor();
     scope.publish_startup_removals();
     assert_eq!(removal.try_receive(), Some(RemoveOutcome::Removed));
     assert!(scope.supervisor.lifecycle().startup_complete());

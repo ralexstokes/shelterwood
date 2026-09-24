@@ -94,10 +94,6 @@ impl ScopeRuntime {
         }
     }
 
-    pub(super) fn progress_startup(&mut self) {
-        self.settle_supervisor();
-    }
-
     pub(super) fn publish_startup_complete(&mut self, state: ScopeState) {
         self.root.set_state_and_startup(state, Ok(()));
         if let Some(parent_ready) = self.role.parent_ready() {
@@ -116,7 +112,7 @@ impl ScopeRuntime {
             .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
             .unwrap_or(false);
         if became_ready {
-            self.progress_startup();
+            self.settle_supervisor();
         }
         #[cfg(test)]
         self.record_storage();

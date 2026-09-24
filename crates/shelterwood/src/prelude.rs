@@ -77,9 +77,9 @@
 
 #[doc(no_inline)]
 pub use crate::{
-    Actor, ActorDef, ActorOnceDef, ActorRef, Context, DynamicScopeRef, DynamicTree, ExitError,
-    ExitResult, Replied, Reply, ScopeRef, StopContext, SubtreeDef, System, TaskContext, TaskDef,
-    TaskOnceDef, TaskRef, Tree,
+    Actor, ActorDef, ActorOnceDef, ActorRef, CancellationToken, Context, DynamicScopeRef,
+    DynamicTree, ExitError, ExitResult, OneShotTaskRef, Replied, Reply, ReplyReceiver, ScopeRef,
+    StopContext, SubtreeDef, System, TaskContext, TaskDef, TaskOnceDef, TaskRef, Tree,
 };
 
 /// Supervision policy: restart, backoff, readiness, shutdown, mailboxes.
@@ -140,8 +140,9 @@ pub mod errors {
 /// dispatcher. The offload machinery in this bundle is shared with
 /// callback actors, so a file that leases work out without writing a raw
 /// loop still wants it. [`crate::CancellationToken`] is the argument every
-/// `run_blocking` closure receives and what the contexts' shutdown and abort
-/// token accessors return.
+/// `run_blocking` closure receives. It is also in ring 0, because task
+/// contexts hand it out too, and it stays here so this bundle is complete
+/// on its own.
 pub mod raw {
     #[doc(no_inline)]
     pub use crate::{

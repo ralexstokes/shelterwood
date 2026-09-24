@@ -43,7 +43,8 @@ thiserror = "2.0.19"
 #     synchronously during pool shutdown, so sole ownership means rejection.
 #   - `join_user_polled`: the join trailer keeps the caller's raw waker past
 #     completion until the `JoinHandle` drops, hence the parked proxy.
-#   - `is_available`: no non-panicking probe for an enabled time driver.
+#   - `is_available`: no non-panicking probe for an enabled time driver. If
+#     the new Tokio has one, detect a timer-less runtime as `NoRuntime` (#525).
 # shelterwood-runtime/src/sync.rs
 #   - `OneShotReceiver::completed`: `poll`/`try_recv` clear `Inner` on a
 #     terminal edge and a later `poll` panics; `close` alone does not.

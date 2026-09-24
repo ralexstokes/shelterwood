@@ -1,5 +1,4 @@
 use std::{
-    fmt,
     sync::{
         Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -9,7 +8,7 @@ use std::{
 
 use crate::{mailbox::MailboxControl, runtime};
 use shelterwood_core::{
-    ChildId, Exit, ExitKind, Incarnation, Membership, RestartCount,
+    ChildId, Exit, Incarnation, Membership, RestartCount,
     engine::MembershipStatus,
     identity::{IncarnationCounter, MintedMembership, ProvisionalMembership},
     policy::ResolvedCommonOptions,
@@ -179,14 +178,13 @@ pub(crate) struct MemberCell {
     options: OnceLock<ResolvedCommonOptions>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 enum MemberMailbox {
     #[default]
     Unattached,
     Attached(Arc<dyn MailboxControl>),
     Terminal {
         control: Option<Arc<dyn MailboxControl>>,
-        exit: Retained<Exit>,
     },
 }
 
@@ -201,34 +199,6 @@ impl Drop for TerminalRecordPulse<'_, '_> {
     fn drop(&mut self) {
         if let Some(record) = self.record {
             self.txn.pulse(record);
-        }
-    }
-}
-
-impl fmt::Debug for MemberMailbox {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unattached => formatter.write_str("Unattached"),
-            Self::Attached(control) => formatter.debug_tuple("Attached").field(control).finish(),
-            Self::Terminal { control, exit } => {
-                // Formatting `ExitKind::Failed` would invoke the user's error
-                // formatter while `MemberCell::mailbox` is held by the
-                // derived `MemberCell` Debug implementation. A static tag is
-                // the only mailbox diagnostic needed here.
-                let exit = match exit.get().kind() {
-                    ExitKind::Completed => "Completed",
-                    ExitKind::Failed(_) => "Failed",
-                    ExitKind::Panicked { .. } => "Panicked",
-                    ExitKind::ReadinessTimedOut { .. } => "ReadinessTimedOut",
-                    ExitKind::Aborted { .. } => "Aborted",
-                    ExitKind::NeverStarted => "NeverStarted",
-                };
-                formatter
-                    .debug_struct("Terminal")
-                    .field("control", control)
-                    .field("exit", &exit)
-                    .finish()
-            }
         }
     }
 }
@@ -337,7 +307,7 @@ impl MemberCell {
     /// `Acquire` pairs with the `Release` store in
     /// [`Self::set_terminal_disposal_pending`]. Two separate edges make a
     /// zero-budget straggler sample (the driver's `collect_stragglers`)
-    /// correct. [`ScopeCell::resident_projections`] now serializes the
+    /// correct. [`ScopeCell::resident_projections`] serializes the
     /// residency clone with `publish_drain` through the observation gate, but
     /// releases that gate before the caller samples this marker and the member
     /// record. Those following reads therefore still rest on the explicit
@@ -669,50 +639,48 @@ impl MemberCell {
     ) -> Exit {
         #[cfg(debug_assertions)]
         txn.debug_assert_gate(&self.current_observation_gate());
-        // A losing terminalizer's exit is destroyed here, and an
-        // `ExitKind::Failed` payload owns a type-erased user error whose
-        // destructor may block, panic, or re-enter observation. Hand it to the
-        // transaction rather than dropping it under the gate.
-        let mut losing_exit = None;
-        let (terminal_exit, attached) = {
+        let (lost, attached) = {
             let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
             match &mut *state {
-                MemberMailbox::Terminal {
-                    exit: terminal_exit,
-                    ..
-                } => {
-                    let terminal_exit = terminal_exit.get().clone();
-                    losing_exit = Some(exit);
-                    (terminal_exit, None)
-                }
+                MemberMailbox::Terminal { .. } => (true, None),
                 MemberMailbox::Unattached => {
-                    *state = MemberMailbox::Terminal {
-                        control: None,
-                        exit: Retained::new(exit.clone()),
-                    };
-                    (exit, None)
+                    *state = MemberMailbox::Terminal { control: None };
+                    (false, None)
                 }
                 MemberMailbox::Attached(control) => {
-                    // Record the winner here, but leave the mailbox itself
-                    // live: every writer of this state holds the observation
-                    // gate, so no other terminalizer or attach can observe
-                    // the window before `prepare_termination` below.
+                    // Mark the mailbox terminal here, but leave it live: every
+                    // writer of this state holds the observation gate, so no
+                    // other terminalizer or attach can observe the window
+                    // before `prepare_termination` below.
                     let control = Arc::clone(control);
                     *state = MemberMailbox::Terminal {
                         control: Some(Arc::clone(&control)),
-                        exit: Retained::new(exit.clone()),
                     };
-                    (exit, Some(control))
+                    (false, Some(control))
                 }
             }
         };
-        if let Some(losing_exit) = losing_exit {
-            // This is framework-retained ownership, not a value returned to a
-            // user. Route a failed exit's possibly-blocking user destructor
-            // through the critical-disposal lane after the gate is released.
-            let losing_exit = Retained::new(losing_exit);
-            txn.defer(move || drop(losing_exit));
+        if lost {
+            // The winner stored its exit in the record in the same gated
+            // section that made the mailbox terminal.
+            let winner = self.record.read_with(|record| match &record.stage {
+                MemberStage::Terminal(exit) => Some(exit.clone()),
+                _ => None,
+            });
+            debug_assert!(
+                winner.is_some(),
+                "a terminal mailbox implies a terminal record"
+            );
+            if let Some(winner) = winner {
+                // The losing exit owns a type-erased user error whose
+                // destructor may block, panic, or re-enter observation, so it
+                // retires through the critical-disposal lane after unlock.
+                let losing_exit = Retained::new(exit);
+                txn.defer(move || drop(losing_exit));
+                return winner;
+            }
         }
+        let terminal_exit = exit;
         let mut published = false;
         self.record.modify_silently(|record| {
             record.update(txn, |record| {
@@ -868,10 +836,8 @@ mod tests {
         );
     }
 
-    /// Pins the invariant the direct teardown drain has to keep, not the
-    /// rewrite itself: the losing `terminalize_locked` it replaced published
-    /// no record edge either, so no test can separate the two shapes. The
-    /// teardown half is pinned by
+    /// Attaching to a terminal member drains the mailbox without a record
+    /// edge. The teardown half is pinned by
     /// `attach_to_a_terminal_member_finishes_record_before_mailbox_wake`.
     #[test]
     fn attaching_to_a_terminal_member_does_not_republish_its_record() {

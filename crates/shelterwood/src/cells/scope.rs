@@ -1,18 +1,15 @@
 use std::{
     any::Any,
     collections::VecDeque,
-    sync::{
-        Arc, Mutex, MutexGuard, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, MutexGuard, Weak},
 };
 
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::runtime;
 use shelterwood_core::{
-    ChildId, Exit, Incarnation, Membership, TotalRestarts,
+    ChildId, Exit, Incarnation, Intensity, Membership, TotalRestarts,
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{StartupError, StopReason, stop_reason_precedence},
     identity::{
@@ -254,7 +251,7 @@ pub(crate) enum ScopeControlEvent {
 /// lifecycle sequence minting remain independent driver-only counters. The
 /// member-record watch is intentionally also the driver's wake bus.
 struct ScopeObservation {
-    config: Mutex<ObservationConfig>,
+    intensity: Mutex<Intensity>,
     record: runtime::WatchSender<Guarded<ScopeRecord>>,
     // Removal paths move residents into transaction effects before emitting
     // their `Removed` edges. A projection can be the last member/mailbox
@@ -264,7 +261,6 @@ struct ScopeObservation {
     lifecycle_seq: AtomicMonotonicCounter,
     lifecycle: LifecycleHub,
     snapshots: SnapshotHub,
-    closed: AtomicBool,
 }
 
 pub(crate) struct ScopeCell {
@@ -317,7 +313,6 @@ mod projection;
 #[cfg(test)]
 mod stress_tests;
 
-use projection::ObservationConfig;
 pub(crate) use projection::ScopeRecord;
 
 impl ScopeCell {
@@ -363,14 +358,13 @@ impl ScopeCell {
             control: Mutex::new(ScopeControl::default()),
             dynamic_route: Mutex::new(None),
             observation: ScopeObservation {
-                config: Mutex::new(ObservationConfig::default()),
+                intensity: Mutex::new(Intensity::default()),
                 record,
                 current_children: Mutex::new(Vec::new()),
                 parent: Mutex::new(None),
                 lifecycle_seq: AtomicMonotonicCounter::new(),
                 lifecycle: LifecycleHub::default(),
                 snapshots: SnapshotHub::default(),
-                closed: AtomicBool::new(false),
             },
             #[cfg(test)]
             ancestor_parent_reads: AtomicUsize::new(0),
@@ -773,8 +767,8 @@ impl ScopeCell {
             !matches!(state, ScopeState::Stopped { .. }),
             "terminal scope state is published through publish_stopped_locked"
         );
-        // The marker slice is part of the state-writer signature so the #270
-        // regression guard cannot be reordered at a caller. Every marker is
+        // The marker slice is part of the state-writer signature so a caller
+        // cannot reorder the markers after the record write. Every marker is
         // stored before the `Draining` record write whose release edge makes
         // it visible to zero-budget shutdown samplers on other workers.
         for member in terminal_disposals {
@@ -1684,7 +1678,7 @@ impl ScopeCell {
         // teardown may complete after this transaction returns -- and that a
         // resident's own destructor can never reach an `ObservationTxn`, so
         // SPEC §15.5 requires this removal site to emit the edge explicitly
-        // below instead (#389).
+        // below instead.
         wakes.defer(move || runtime::dispose_detached(residents));
         for removal in removals {
             self.emit_locked(wakes, removal);
@@ -1867,7 +1861,7 @@ impl ScopeCell {
     /// result.
     pub(crate) fn close_never_started_body(&self) {
         self.with_observation_gate(|txn| {
-            if self.observation.closed.load(Ordering::Acquire) {
+            if self.observation.lifecycle.is_closed() {
                 return;
             }
             if matches!(self.record().state, ScopeState::Unstarted) {
@@ -1885,7 +1879,7 @@ impl ScopeCell {
     }
 
     pub(crate) fn terminalize_never_started_locked(&self, txn: &mut ObservationTxn<'_>) {
-        if self.observation.closed.load(Ordering::Acquire) {
+        if self.observation.lifecycle.is_closed() {
             return;
         }
         self.member
@@ -2800,7 +2794,7 @@ mod tests {
 
     /// Coverage for the surviving live-route assertion.
     ///
-    /// `admit_observation_gate` no longer needs one: its legality probe
+    /// `admit_observation_gate` needs none: its legality probe
     /// refuses every stage a started driver can present, so a re-homed live
     /// route is unconstructible there. The reservation-time adoption path has
     /// no such probe, and this is its regression.

@@ -393,7 +393,7 @@ impl BuilderCore {
                 }
             }
         }
-        root.set_observation_config(self.config.intensity);
+        root.set_intensity(self.config.intensity);
         let mut children = Vec::with_capacity(self.slots.len());
         for (slot, resolved) in self
             .slots

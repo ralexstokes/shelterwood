@@ -77,9 +77,9 @@
 
 #[doc(no_inline)]
 pub use crate::{
-    Actor, ActorDef, ActorOnceDef, ActorRef, Context, DynamicScopeRef, DynamicTree, ExitError,
-    ExitResult, Replied, Reply, ScopeRef, StopContext, SubtreeDef, System, TaskContext, TaskDef,
-    TaskOnceDef, TaskRef, Tree,
+    Actor, ActorDef, ActorOnceDef, ActorRef, CancellationToken, Context, DynamicScopeRef,
+    DynamicTree, ExitError, ExitResult, OneShotTaskRef, Replied, Reply, ReplyReceiver, ScopeRef,
+    StopContext, SubtreeDef, System, TaskContext, TaskDef, TaskOnceDef, TaskRef, Tree,
 };
 
 /// Supervision policy: restart, backoff, readiness, shutdown, mailboxes.
@@ -139,14 +139,13 @@ pub mod errors {
 /// A [`crate::RawActor`] owns its receive loop instead of returning to a callback
 /// dispatcher. The offload machinery in this bundle is shared with
 /// callback actors, so a file that leases work out without writing a raw
-/// loop still wants it. [`crate::CancellationToken`] is the argument every
-/// `run_blocking` closure receives and what the contexts' shutdown and abort
-/// token accessors return.
+/// loop still wants it. [`crate::CancellationToken`], which every `run_blocking`
+/// closure receives, is in ring 0: task contexts hand it out too.
 pub mod raw {
     #[doc(no_inline)]
     pub use crate::{
-        Blocking, CancellationToken, DeadlineBudget, DeadlineElapsed, Guard, Handler, RawActor,
-        RawContext, RawDef, RawOnceDef, Rejected,
+        Blocking, DeadlineBudget, DeadlineElapsed, Guard, Handler, RawActor, RawContext, RawDef,
+        RawOnceDef, Rejected,
     };
 }
 

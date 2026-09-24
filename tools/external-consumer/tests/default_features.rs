@@ -22,3 +22,15 @@ fn default_feature_consumer_runs_a_supervised_task_to_completion() {
         assert_eq!(system.wait().await, StopReason::Finished);
     });
 }
+
+/// Ring 0 names every handle an ordinary program stores or passes: the
+/// one-shot task claim, the reply half of `reply_channel`, and the tokens
+/// task and raw contexts hand out. Compiling this signature under the glob
+/// alone is the check.
+#[allow(dead_code)]
+fn ring_zero_names_stored_handles(
+    _claim: OneShotTaskRef<u8>,
+    _reply: ReplyReceiver<u8>,
+    _token: CancellationToken,
+) {
+}

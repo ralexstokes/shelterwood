@@ -136,7 +136,7 @@ async fn blocking_primary_wake_recollects_control_removal_before_arbitration() {
     };
 
     let mut pending = Vec::new();
-    super::super::retain_woken_event(event, &mut pending);
+    pending.push(super::super::Pending::from(event).classified());
     assert!(!super::super::collect_event_lanes(
         super::super::EventLanes {
             primary: &mut primary_receiver,

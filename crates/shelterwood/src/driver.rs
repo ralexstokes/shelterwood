@@ -23,7 +23,7 @@ use child::{ChildRuntime, fire_shutdown_edges};
 use child::{ChildTerminality, discharge_child_terminality, report_slot};
 use events::{
     ChildEvent, DeadlineKind, DriverEvent, EventLanes, MIN_EVENT_BATCH_LIMIT, Pending,
-    collect_event_lanes, retain_woken_event,
+    collect_event_lanes,
 };
 use removal::RemovalRequest;
 pub(crate) use shutdown::shutdown_scope;
@@ -1232,7 +1232,16 @@ async fn wait_for_scope_wake(
         }
         runtime::ScopeWake::Message(Some(event))
         | runtime::ScopeWake::ControlMessage(Some(event)) => {
-            retain_woken_event(event, pending);
+            // Retain the head that ended the wait and return to the single
+            // collection site, so it is arbitrated with every input that
+            // became eligible before the wake was observed. It keeps its own
+            // lane's FIFO position but sits ahead of the whole re-entered
+            // collection, so a woken control head precedes the primary lane.
+            // `MembershipRemoval` is the only class both lanes produce
+            // (`Removal` and `SelfStop`), and neither order of that pair
+            // changes a verdict: readiness publication consults the removal
+            // sources at execution time.
+            pending.push(Pending::from(event).classified());
         }
     }
     None

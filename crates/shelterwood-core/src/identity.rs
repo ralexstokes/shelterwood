@@ -202,8 +202,8 @@ impl AtomicMonotonicCounter {
         self.0.load(ordering)
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn set(&self, value: u64, ordering: Ordering) {
+    #[cfg(test)]
+    fn set(&self, value: u64, ordering: Ordering) {
         self.0.store(value, ordering);
     }
 }

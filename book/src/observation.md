@@ -38,10 +38,8 @@ already reflected exactly when `event.seq <= watermark`:
 {{#include ../../crates/shelterwood/examples/observation.rs:watermark}}
 ```
 
-These values are `LifecycleSeq` tokens. `LifecycleSeq::EXHAUSTED` is the
-permanent watermark after the sequence space is exhausted and is never
-assigned to an event; `get()` exposes the underlying `u64` when a numeric
-integration requires one.
+These values are `LifecycleSeq` tokens; `get()` exposes the underlying `u64`
+when a numeric integration requires one.
 
 If an event's scope token is absent from the snapshot entirely, use causal
 introduction rather than guessing:

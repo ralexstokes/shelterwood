@@ -234,7 +234,8 @@ Classify a defensive check by what makes its state impossible.
   tests.
 
 A test that needs a hook to reach a state pins complexity rather than
-behaviour; delete it with its hook.
+behaviour; delete it with its hook. `u64` identity counters do not exhaust:
+`MonotonicCounter::mint` aborts at the limit, and no caller handles it.
 
 ## Runtime naming
 

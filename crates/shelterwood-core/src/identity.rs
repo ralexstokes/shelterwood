@@ -660,6 +660,50 @@ mod tests {
     }
 
     #[test]
+    fn evicting_an_adopted_lineage_releases_the_id_and_stale_eviction_keeps_it() {
+        let id = ChildId::from("worker");
+        let mut stable = ScopeIdentity::new();
+        let declare = || {
+            ScopeIdentity::new()
+                .mint_membership(&id)
+                .expect("provisional membership available")
+                .into_provisional_parts()
+        };
+
+        // Evicting exactly the adopted membership releases the id: the next
+        // declaration donates its own, incomparable lineage instead of
+        // minting a successor of the evicted one.
+        let (adopted, provisional, _) = declare();
+        assert!(matches!(
+            stable.adopt_or_mint_membership(provisional),
+            MembershipReconciliation::Adopted
+        ));
+        stable.evict(&id, adopted);
+        let (readopted, provisional, _) = declare();
+        assert!(matches!(
+            stable.adopt_or_mint_membership(provisional),
+            MembershipReconciliation::Adopted
+        ));
+        assert!(!readopted.supersedes(adopted));
+        assert!(!adopted.supersedes(readopted));
+
+        // Once a direct mint has succeeded the adopted membership, evicting
+        // with the adopted token is stale and leaves the lineage tracked.
+        let direct = stable
+            .mint_membership(&id)
+            .expect("a direct mint follows the adopted generation")
+            .membership();
+        stable.evict(&id, readopted);
+        let (_, provisional, _) = declare();
+        let MembershipReconciliation::Minted(successor) =
+            stable.adopt_or_mint_membership(provisional)
+        else {
+            panic!("a stale eviction keeps the adopted lineage tracked")
+        };
+        assert!(successor.membership().supersedes(direct));
+    }
+
+    #[test]
     fn stable_scope_adopts_the_first_declaration_then_orders_a_retained_lineage() {
         let id = ChildId::from("worker");
         let other_id = ChildId::from("other");

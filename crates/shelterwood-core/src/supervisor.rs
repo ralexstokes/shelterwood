@@ -136,8 +136,8 @@ struct ChildRecord {
 }
 
 impl ChildRecord {
-    /// Whether a [`Effect::StartChild`] can still produce a [`Event::Spawned`]
-    /// edge, deliberately spelled as this event's own acceptance set.
+    /// [`Event::Spawned`]'s acceptance set: whether a [`Effect::StartChild`]
+    /// can still produce a spawn edge.
     ///
     /// Settlement is level-triggered and its driver re-enters [`Event::Settle`]
     /// until a pass emits nothing, so an effect the shell would decline is not
@@ -552,11 +552,7 @@ impl SupervisorState {
         match event {
             Event::Spawned { child } => {
                 if let Some(record) = self.children.get_mut(&child)
-                    && matches!(record.state, ChildState::Resident(_))
-                    && matches!(
-                        record.state.incarnation(),
-                        IncarnationState::Unstarted | IncarnationState::RestartPending
-                    )
+                    && record.startable()
                 {
                     record.spawned_once = true;
                     record.state = record.state.with_incarnation(IncarnationState::Active);

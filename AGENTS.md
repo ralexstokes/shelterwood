@@ -34,8 +34,11 @@ Two types implement the rule and are the shapes to reach for:
   mailbox mutex held, unwind included. `WakerSlot` makes the waker half
   structural rather than conventional: its storage is private to
   `shelterwood-core`'s waker module, and no operation returns or replaces a
-  `Waker` without an effects sink. `Withdrawal`, `Termination` and `MailboxPayload` are its
-  single-purpose siblings.
+  `Waker` without an effects sink. The guarded state keeps a plain `Phase`
+  beside one waiter queue, so no phase change can displace a parked sender,
+  and send operations own their messages by value, so no mailbox transition
+  has an unreachable arm holding a user payload. `Withdrawal`, `Termination`,
+  `MailboxPayload` and `ReturnedMessage` are its single-purpose siblings.
 
 What the rule does *not* forbid — the exemptions every remaining lock site
 rests on:
@@ -45,10 +48,11 @@ rests on:
   need no ceremony.
 - **Moving a user value out.** `take`/`mem::replace`/returning by value is not
   a drop. What must be outside the critical section is the *destination*:
-  `MailboxTxn::finish`/`finish_returned` handing the value back only after
-  releasing the guard, `withdraw`'s `Withdrawal` carrying its outcome and
-  post-unlock effects together, and `MailboxTxn::take_payload`'s `#[must_use]`
-  carrier all encode that.
+  `MailboxTxn::finish` handing the value back only after releasing the
+  guard, `receive`'s `ReturnedMessage` declared before its transaction so any
+  unwind submits the message for disposal, `withdraw`'s `Withdrawal` carrying
+  its outcome and post-unlock effects together, and
+  `MailboxTxn::take_payload`'s `#[must_use]` carrier all encode that.
 - **`Arc` traffic that cannot reach zero.** Cloning an `Arc` under a lock is
   refcount work; dropping one is only refcount work while another owner is
   provable. Prefer restructuring over the proof — the usual violation is a
@@ -182,8 +186,8 @@ rests on:
 Two conventions that are not the rule itself but travel with it: panicking
 while holding a mutex the codebase `.expect()`s poisons it for every later
 caller, so compute the verdict, release, *then* panic (`MailboxCell::bind` is
-the pattern; where releasing is impossible, `debug_assert!` instead, as
-`MailboxState::take_waiters` does, and see "Impossible states" below). And a value that may block on destruction
+the pattern; where releasing is impossible, `debug_assert!` instead, and see
+"Impossible states" below). And a value that may block on destruction
 goes to `runtime::dispose_detached`, not merely past the unlock. That second
 convention is currently met for mailbox payloads, construction closures,
 blocking-offload captured state, displaced resident graphs, and rejected

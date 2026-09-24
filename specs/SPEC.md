@@ -2926,11 +2926,10 @@ guard is released before that sink can flush. On every path a transition
 can complete — acceptance, rejection, withdrawal, terminal teardown, and
 an unwind out of any of them — no waker vtable, message destructor,
 signal callback, or runtime-disposal capability runs under either mutex.
-The one carve-out is a framework invariant break (an unreachable binding
-state): it unwinds with the payload still under the guard and poisons the
-mutex regardless, so the transition is abandoned rather than completed.
-Identity exhaustion is not a carve-out: it aborts the process (§3.1) and
-never unwinds. The registered-waker
+There is no carve-out. A framework invariant that only protocol or lock
+order upholds is a debug assertion plus a release behaviour that is safe
+on its own and completes the transition. Identity exhaustion aborts the
+process (§3.1) and never unwinds. The registered-waker
 slot exposes no operation that returns or replaces a waker without an
 effects sink, making an under-lock caller-code drop structurally
 unrepresentable rather than a call-site convention; cancellation returns

@@ -416,7 +416,7 @@ impl BuilderCore {
             intensity: self.config.intensity,
             defaults,
             children,
-            terminality: Some(ScopePlanTerminality),
+            terminality_owed: true,
         })
     }
 
@@ -448,10 +448,10 @@ pub(crate) struct ScopePlan {
     intensity: Intensity,
     pub(crate) defaults: ResolvedDefaults,
     pub(crate) children: Vec<ChildPlan>,
-    terminality: Option<ScopePlanTerminality>,
+    /// Whether this plan still owes its children and root the never-started
+    /// fallback; cleared once the runtime owns every child's terminality.
+    terminality_owed: bool,
 }
-
-struct ScopePlanTerminality;
 
 impl ScopePlan {
     pub(crate) fn intensity_policy(&self) -> Intensity {
@@ -459,12 +459,8 @@ impl ScopePlan {
     }
 }
 
-fn terminalize_plan(
-    root: &ScopeCell,
-    children: &[ChildPlan],
-    terminality: &mut Option<ScopePlanTerminality>,
-) {
-    if terminality.take().is_some() {
+fn terminalize_plan(root: &ScopeCell, children: &[ChildPlan], terminality_owed: &mut bool) {
+    if std::mem::take(terminality_owed) {
         let mut panics = runtime::PanicAccumulator::default();
         for child in children {
             child
@@ -492,15 +488,13 @@ impl ScopePlan {
             self.children.is_empty(),
             "runtime transfer completes only after every child owns terminality"
         );
-        self.terminality
-            .take()
-            .expect("runtime plan transfer completes exactly once");
+        self.terminality_owed = false;
     }
 }
 
 impl Drop for ScopePlan {
     fn drop(&mut self) {
-        terminalize_plan(&self.root, &self.children, &mut self.terminality);
+        terminalize_plan(&self.root, &self.children, &mut self.terminality_owed);
     }
 }
 

@@ -4,11 +4,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use crate::{
-    panic::PanicAccumulator,
-    waker::{WakerAction, WakerEffects},
-    waker_proxy::ProxiedPoll,
-};
+use crate::{panic::PanicAccumulator, waker::WakerAction, waker_proxy::ProxiedPoll};
 
 /// A runtime adapter's raw timer, handed to [`ProxiedSleep::new`].
 pub type BoxedSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -80,14 +76,12 @@ impl ProxiedSleep {
     }
 
     fn retire(&mut self, action: WakerAction, panics: &mut PanicAccumulator) {
-        let mut effects = WakerEffects::default();
-        // Proxy retirement only moves framework-owned bookkeeping into the
-        // effects sink, and its leaf-lock acquisition recovers poison. The
-        // proxy's own drop then finds the slot already emptied, so no caller
-        // destructor runs here either; the caller-owned waker stays inside
-        // the accumulator-backed flush below.
-        self.timer_poll.retire(action, &mut effects);
-        effects.flush(panics);
+        // Proxy retirement only moves framework-owned bookkeeping into an
+        // effects sink under the leaf lock, whose acquisition recovers
+        // poison, and flushes it into `panics` after unlock. The proxy's own
+        // drop then finds the slot already emptied, so no caller destructor
+        // runs outside that accumulator-backed flush.
+        self.timer_poll.retire(action, panics);
 
         // Slot first, timer second: once the caller waker is gone, cancelling
         // the wheel entry can deliver no stale wake to a caller that already

@@ -24,9 +24,14 @@ use crate::{
 /// subordinate to returning that result intact (#398 ruling 3; the mailbox
 /// `DisposingReceiver::retire_reply_waker` documents the two costs riding on
 /// the discard). Only *pending* retirement — cancellation and drop glue —
-/// remains venue-specific: mailbox users call [`Self::retire`] with an
-/// effects sink; `shelterwood-runtime` calls [`Self::retire_with`] through
-/// its wrapper after selecting inline or detached destruction.
+/// remains venue-specific, so [`Self::retire`] takes the disposition: the
+/// mailbox reply receiver passes [`WakerAction::DropInline`], and
+/// `shelterwood-runtime`'s wrapper passes [`WakerAction::Run`] with its
+/// detached disposal lane.
+///
+/// This is the only waker-proxy item outside this module. The proxy itself
+/// is module-private, so no other code can register with, wake, or retire it
+/// except through this state machine.
 #[doc(hidden)]
 pub struct ProxiedPoll {
     proxy: Option<WakerProxy>,
@@ -86,10 +91,8 @@ impl ProxiedPoll {
     /// hostile destructor panic is discarded rather than raised over the
     /// result the caller is owed.
     fn retire_ready(&mut self) {
-        let mut effects = WakerEffects::default();
-        self.retire(WakerAction::DropInline, &mut effects);
         let mut panics = PanicAccumulator::default();
-        effects.flush(&mut panics);
+        self.retire(WakerAction::DropInline, &mut panics);
         crate::panic::discard_panic(panics.take());
     }
 
@@ -99,19 +102,18 @@ impl ProxiedPoll {
         self.proxy.is_some()
     }
 
-    /// Retires the current caller registration into a mailbox effects sink.
+    /// Retires the current caller registration through `action`.
+    ///
+    /// The caller waker is moved into an effects sink under the proxy's leaf
+    /// mutex and the chosen effect runs only after unlock; any panic it
+    /// raises lands in `panics`. The proxy is then dropped with its slot
+    /// already empty.
     #[doc(hidden)]
-    pub fn retire(&mut self, action: WakerAction, effects: &mut WakerEffects) {
+    pub fn retire(&mut self, action: WakerAction, panics: &mut PanicAccumulator) {
         if let Some(proxy) = self.proxy.take() {
-            proxy.retire(action, effects);
-        }
-    }
-
-    /// Retires the current caller registration through a cross-crate effect.
-    #[doc(hidden)]
-    pub fn retire_with(&mut self, effect: fn(Waker), panics: &mut PanicAccumulator) {
-        if let Some(proxy) = self.proxy.take() {
-            proxy.retire_with(effect, panics);
+            let mut effects = WakerEffects::default();
+            proxy.retire(action, &mut effects);
+            effects.flush(panics);
         }
     }
 }
@@ -129,8 +131,11 @@ impl ProxiedPoll {
 /// poison: nothing the leaf guards carries an invariant a panic could tear
 /// (see [`WakerProxyState::registration`]), and a poisoned leaf must not
 /// introduce a panic into unwind-reachable retirement.
-#[doc(hidden)]
-pub struct WakerProxy {
+///
+/// Private to this module: [`ProxiedPoll`] is its only owner, so every
+/// registration goes through the probe/re-poll protocol and every retirement
+/// through an effects flush.
+struct WakerProxy {
     proxy: Waker,
     state: Arc<WakerProxyState>,
 }
@@ -167,8 +172,7 @@ impl WakerProxyState {
 }
 
 impl WakerProxy {
-    #[doc(hidden)]
-    pub fn new() -> Self {
+    fn new() -> Self {
         let state = Arc::new(WakerProxyState::default());
         let proxy = Waker::from(Arc::clone(&state));
         Self { proxy, state }
@@ -183,8 +187,7 @@ impl WakerProxy {
     /// wake count and delivered to `current` after unlock. Wakes before this
     /// call are the caller's to observe: it must poll its level-readiness
     /// target after registering, as [`ProxiedPoll`]'s re-poll does.
-    #[doc(hidden)]
-    pub fn register(&self, current: &Waker) {
+    fn register(&self, current: &Waker) {
         let observed = {
             let registration = self.state.registration();
             if registration.caller.will_wake(current) {
@@ -205,27 +208,16 @@ impl WakerProxy {
         }
     }
 
-    #[doc(hidden)]
-    pub fn waker(&self) -> &Waker {
+    fn waker(&self) -> &Waker {
         &self.proxy
     }
 
-    /// Retires the caller registration through a framework-selected effect.
-    ///
-    /// The function pointer is queued while the proxy mutex is held and is
-    /// invoked only after unlock. This is the cross-crate adapter seam used by
-    /// `shelterwood-runtime`: the runtime owns the detached-disposal venue,
-    /// while this runtime-neutral crate owns the slot that makes it impossible
-    /// to remove a caller waker without first choosing that post-unlock venue.
-    #[doc(hidden)]
-    pub fn retire_with(&self, effect: fn(Waker), panics: &mut PanicAccumulator) {
-        let mut effects = WakerEffects::default();
-        self.retire(WakerAction::Run(effect), &mut effects);
-        effects.flush(panics);
-    }
-
     /// Moves the caller waker into an explicitly chosen post-unlock effect.
-    pub(crate) fn retire(&self, action: WakerAction, effects: &mut WakerEffects) {
+    ///
+    /// A [`WakerAction::Run`] disposer — the runtime adapter's detached
+    /// disposal lane — is queued here under the leaf mutex and invoked only
+    /// by the sink's flush, after unlock.
+    fn retire(&self, action: WakerAction, effects: &mut WakerEffects) {
         self.state.registration().caller.take(action, effects);
     }
 }
@@ -721,20 +713,23 @@ mod tests {
         proxy.retire(WakerAction::DropInline, &mut effects);
         drop(effects);
 
-        // Then the cross-crate seam `shelterwood-runtime`'s `ProxiedPoll::drop`
-        // uses, which both takes the caller and runs the chosen effect.
+        // Then the adapter's disposer seam `shelterwood-runtime`'s
+        // `ProxiedPoll::drop` reaches: a `Run` retirement that both takes the
+        // caller and runs the chosen function from the flush.
         let wakes = Arc::new(AtomicUsize::new(0));
         proxy.register(&Waker::from(Arc::new(ReentrantWake {
             proxy: Arc::downgrade(&proxy.state),
             wakes: Arc::clone(&wakes),
         })));
+        let mut effects = WakerEffects::default();
+        proxy.retire(WakerAction::Run(forward_wake), &mut effects);
         let mut panics = PanicAccumulator::default();
-        proxy.retire_with(forward_wake, &mut panics);
+        effects.flush(&mut panics);
         assert!(panics.take().is_none());
         assert_eq!(
             wakes.load(Ordering::SeqCst),
             1,
-            "retire_with still takes the caller and forwards it after unlock"
+            "a Run retirement still takes the caller and forwards it after unlock"
         );
 
         // Finally the fallback: leave a caller installed so drop glue both
@@ -748,20 +743,53 @@ mod tests {
     }
 
     #[test]
-    fn retire_with_runs_its_cross_crate_effect_after_unlock() {
-        let proxy = WakerProxy::new();
+    fn run_retirement_invokes_its_disposer_after_unlock() {
+        // Driven through `ProxiedPoll::retire`, the seam the runtime adapter
+        // and the mailbox reply receiver actually cross: a pending poll parks
+        // the proxy, then a reentrant caller is registered behind it.
+        let mut proxied = ProxiedPoll::new();
+        let mut target = AlwaysPending::default();
+        let mut probe = Context::from_waker(Waker::noop());
+        assert!(
+            proxied
+                .poll(
+                    &mut target,
+                    &mut probe,
+                    AlwaysPending::poll,
+                    Poll::is_pending
+                )
+                .is_pending()
+        );
+        let state = Arc::downgrade(
+            &proxied
+                .proxy
+                .as_ref()
+                .expect("a pending poll parks the proxy")
+                .state,
+        );
         let wakes = Arc::new(AtomicUsize::new(0));
         let caller = Waker::from(Arc::new(ReentrantWake {
-            proxy: Arc::downgrade(&proxy.state),
+            proxy: Weak::clone(&state),
             wakes: Arc::clone(&wakes),
         }));
-        proxy.register(&caller);
+        let mut context = Context::from_waker(&caller);
+        assert!(
+            proxied
+                .poll(
+                    &mut target,
+                    &mut context,
+                    AlwaysPending::poll,
+                    Poll::is_pending
+                )
+                .is_pending()
+        );
 
         let mut panics = PanicAccumulator::default();
-        proxy.retire_with(forward_wake, &mut panics);
+        proxied.retire(WakerAction::Run(forward_wake), &mut panics);
 
         assert!(panics.take().is_none());
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(!proxied.is_parked());
     }
 
     #[test]
@@ -1029,9 +1057,9 @@ mod tests {
             .expect("the pending target retains the first proxy")
             .clone();
 
-        let mut effects = WakerEffects::default();
-        proxied.retire(WakerAction::DropInline, &mut effects);
-        drop(effects);
+        let mut panics = PanicAccumulator::default();
+        proxied.retire(WakerAction::DropInline, &mut panics);
+        assert!(panics.take().is_none());
         assert!(!proxied.is_parked());
 
         assert!(

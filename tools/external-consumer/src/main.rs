@@ -19,7 +19,7 @@ fn retype_scope<T: shelterwood::Subtree>(scope: shelterwood::ScopeRef) -> T::Ref
 use shelterwood::{
     BoxedSleep, DynamicRoute, MailboxCell, MailboxControl, MailboxEffectQueue, MailboxEffectSink,
     MailboxTermination, MemberCell, ParentCancellationToken, ProxiedPoll, ProxiedSleep, ScopeCell,
-    WakerAction, WakerEffects, WakerProxy, WakerSlot, actor_ref_from_parts,
+    WakerAction, WakerEffects, WakerSlot, actor_ref_from_parts,
 };
 
 fn main() {

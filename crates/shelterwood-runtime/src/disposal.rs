@@ -386,7 +386,7 @@ pub fn dispose_detached<T: Send + 'static>(value: T) {
 ///
 /// This is the disposer the runtime-neutral core's proxy types take as a
 /// plain `fn(Waker)` (`WakerAction::Run`, `ProxiedSleep::new`,
-/// `ProxiedPoll::retire_with`): a waker whose destructor may block or panic
+/// `ProxiedPoll::retire`): a waker whose destructor may block or panic
 /// leaves drop glue without running that destructor on the dropping thread.
 pub fn dispose_waker(waker: std::task::Waker) {
     dispose_detached(waker);

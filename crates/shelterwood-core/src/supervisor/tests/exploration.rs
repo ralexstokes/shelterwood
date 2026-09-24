@@ -310,9 +310,8 @@ fn explore(
 /// **Two children, not three, and that is not a budget compromise.** Every
 /// property here is per-child, a fold over children, or cursor-versus-one-
 /// child; the reducer has no rule that couples three memberships, so a third
-/// adds combinations rather than cases. Measured, a third child cost 40x
-/// (1.4M states and 53M transitions against 49k and 1.3M, before splitting
-/// sampled from committed removal about doubled width two) and no mutation
+/// adds combinations rather than cases. Measured, a third child cost 40x in
+/// states and transitions, and no mutation
 /// covering R1–R6, E4 or S3–S5 survives width two but falls to width three.
 /// The one genuinely three-body distinction — `keys_after(child).next()`
 /// against `.last()`, which needs a middle element to differ at all — is a
@@ -838,11 +837,10 @@ fn check_s5_derived_level_triggered_completion(transition: &Transition<'_>) {
 /// Walks every reachable reducer state of every configuration, asserting the
 /// reducer-expressible half of SPEC §15.3's invariant list at every transition.
 ///
-/// This replaces an enumeration of event *schedules* (8!/9! permutations over
-/// a four-event alphabet). Exploring states rather than orderings visits each
-/// reachable state once instead of once per schedule that reaches it, which is
-/// what makes room for the wider alphabet the drain, force, restart and
-/// reclaim rules need to be reachable at all.
+/// Exploring states rather than event schedules visits each reachable state
+/// once instead of once per schedule that reaches it, which is what makes room
+/// for the wider alphabet the drain, force, restart and reclaim rules need to
+/// be reachable at all.
 #[test]
 fn exhaustive_reachable_states_preserve_the_reducer_invariants() {
     let run = explore_all(CONFIGURATIONS, check_every_invariant);

@@ -1364,9 +1364,8 @@ mod tests {
 
         for cancellation in [Cancellation::NotObserved, Cancellation::Observed] {
             for (kind, failure) in &cases {
-                // Built through the per-kind constructors rather than a generic
-                // `Exit::new`, which no longer exists. `NeverStarted` is a
-                // membership fact outside dispatch's incarnation-exit domain.
+                // `NeverStarted` is a membership fact outside dispatch's
+                // incarnation-exit domain.
                 let exit = match kind {
                     ExitKind::Completed => Exit::completed(cancellation),
                     ExitKind::Failed(error) => Exit::failed(error.clone(), cancellation),

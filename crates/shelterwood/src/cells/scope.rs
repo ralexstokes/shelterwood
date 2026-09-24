@@ -1808,8 +1808,9 @@ impl ScopeCell {
     /// so the stream never ends on an event that disagrees with the final
     /// record (SPEC B.4's non-final-`Stopped` rule admits exactly this step).
     ///
-    /// Member terminalization prepares mailbox teardown first; its deferred
-    /// discharge is therefore queued before either member or scope pulses.
+    /// Member terminalization stores its record, then prepares mailbox
+    /// teardown (SPEC §3.2); its deferred discharge is therefore queued
+    /// before either member or scope pulses.
     /// `epoch_owner` carries a live incarnation's control ownership through
     /// both retained record mutations and is released before snapshot and
     /// lifecycle publication, preserving the stop transition's ownership

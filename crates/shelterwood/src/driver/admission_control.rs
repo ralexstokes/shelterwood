@@ -2,7 +2,7 @@
 
 use std::{
     any::Any,
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 
@@ -151,10 +151,8 @@ impl DynamicEntry {
         key: ChildKey,
         fused_cancel: Option<Latch>,
         _txn: &mut ObservationTxn<'_>,
-    ) -> bool {
-        let was_reserved = self.is_reserved();
+    ) {
         self.state = DynamicMembershipState::Resident { key, fused_cancel };
-        was_reserved
     }
 
     pub(super) fn mark_removing(&mut self, _txn: &mut ObservationTxn<'_>) -> Option<ChildKey> {
@@ -202,21 +200,6 @@ impl DynamicState {
         _txn: &mut ObservationTxn<'_>,
     ) -> Option<DynamicEntry> {
         self.entries.insert(id, entry)
-    }
-
-    pub(super) fn insert_vacant(
-        &mut self,
-        id: ChildId,
-        entry: DynamicEntry,
-        _txn: &mut ObservationTxn<'_>,
-    ) -> Result<(), DynamicEntry> {
-        match self.entries.entry(id) {
-            Entry::Vacant(slot) => {
-                slot.insert(entry);
-                Ok(())
-            }
-            Entry::Occupied(_) => Err(entry),
-        }
     }
 
     pub(super) fn remove(

@@ -64,11 +64,7 @@ pub(crate) mod test_support {
     ) -> Arc<ScopeCell> {
         let id = ChildId::from(id);
         let mut identity = ScopeIdentity::new();
-        let member = MemberCell::new(
-            identity
-                .mint_membership(&id)
-                .expect("scope membership is available"),
-        );
+        let member = MemberCell::new(identity.mint_membership(&id));
         configure(&member);
         ScopeCell::new(member, flavor, ScopeIdentity::new())
     }
@@ -79,11 +75,7 @@ pub(crate) mod test_support {
 
     pub(super) fn child_member(parent: &ScopeCell, id: &str) -> Arc<MemberCell> {
         let id = ChildId::from(id);
-        let member = MemberCell::new(
-            parent
-                .mint_membership(&id)
-                .expect("child membership is available"),
-        );
+        let member = MemberCell::new(parent.mint_membership(&id));
         resolve_options(&member);
         member
     }

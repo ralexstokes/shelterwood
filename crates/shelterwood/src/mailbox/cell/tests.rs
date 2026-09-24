@@ -29,24 +29,6 @@ impl Wake for PanicWake {
 
 struct CountWake(Arc<AtomicUsize>);
 
-struct LockCheckingMessage {
-    mailbox: Weak<MailboxCell<LockCheckingMessage>>,
-    dropped: Option<mpsc::Sender<bool>>,
-}
-
-impl Drop for LockCheckingMessage {
-    fn drop(&mut self) {
-        let Some(dropped) = self.dropped.take() else {
-            return;
-        };
-        let unlocked = self
-            .mailbox
-            .upgrade()
-            .is_none_or(|mailbox| mailbox.state.try_lock().is_ok());
-        let _ = dropped.send(unlocked);
-    }
-}
-
 struct LatestDisplacementMessage {
     value: u8,
     mailbox: Weak<MailboxCell<LatestDisplacementMessage>>,
@@ -291,9 +273,7 @@ pub(crate) fn actor_for_with_runtime<M: Send + 'static>(
     runtime: Arc<dyn crate::mailbox::MailboxRuntime>,
 ) -> (Arc<MailboxCell<M>>, ActorRef<M>) {
     let id = ChildId::from("actor");
-    let identity = crate::identity::ScopeIdentity::new()
-        .mint_membership(&id)
-        .expect("test membership is available");
+    let identity = crate::identity::ScopeIdentity::new().mint_membership(&id);
     let member = crate::cells::MemberCell::new(identity);
     let mailbox = MailboxCell::new(id, runtime);
     (
@@ -356,10 +336,7 @@ pub(crate) fn close<M: Send + 'static>(
 
 fn two_incarnations() -> (Incarnation, Incarnation) {
     let (_, mut incarnations) = mint_actor_membership();
-    (
-        incarnations.mint().expect("first incarnation available"),
-        incarnations.mint().expect("second incarnation available"),
-    )
+    (incarnations.mint(), incarnations.mint())
 }
 
 struct TrackedMessage {
@@ -668,7 +645,7 @@ fn binding_replacement_invariant_panics_after_unlock() {
     );
     let operation = super::SendOperation::new(1_u8);
     let mut waiters = super::WaiterQueue::default();
-    assert!(waiters.park(&operation));
+    waiters.park(&operation);
     mailbox.state.lock().expect("mailbox mutex healthy").binding =
         super::MailboxBinding::Unbound(waiters);
 
@@ -845,28 +822,6 @@ fn withdrawal_registration_invariant_is_contained_during_an_unwind() {
             .expect("first operation mutex remains healthy"),
     );
     drop(mailbox.state.lock().expect("mailbox mutex remains healthy"));
-}
-
-#[test]
-fn waiter_identity_collision_preserves_the_resident_operation() {
-    let resident = super::SendOperation::new(1_u8);
-    let incoming = super::SendOperation::new(2_u8);
-    let mut waiters = super::WaiterQueue::default();
-    waiters
-        .entries
-        .insert(super::WaiterId(1), Arc::clone(&resident));
-
-    assert!(
-        !waiters.park(&incoming),
-        "a reused identity refuses the incoming operation"
-    );
-    assert!(Arc::ptr_eq(
-        waiters
-            .entries
-            .get(&super::WaiterId(1))
-            .expect("resident remains"),
-        &resident
-    ));
 }
 
 #[test]
@@ -1670,17 +1625,13 @@ async fn expired_timeout_can_race_detached_terminal_teardown() {
 fn stale_waiter_id_cannot_unlink_a_later_registration() {
     let mut waiters = super::WaiterQueue::default();
     let first = super::SendOperation::new(1_u8);
-    let first_id = waiters
-        .push_back(Arc::clone(&first))
-        .expect("first waiter id available");
+    let first_id = waiters.push_back(Arc::clone(&first));
     first.register(first_id);
     let removed = waiters.remove(first_id).expect("first waiter is live");
     removed.clear_registration(first_id);
 
     let second = super::SendOperation::new(2_u8);
-    let second_id = waiters
-        .push_back(Arc::clone(&second))
-        .expect("second waiter id available");
+    let second_id = waiters.push_back(Arc::clone(&second));
     second.register(second_id);
     assert_ne!(first_id, second_id, "waiter identities are never reused");
     assert!(
@@ -1701,9 +1652,9 @@ fn waiter_queue_preserves_fifo_across_removal() {
     let first = super::SendOperation::new(1_u8);
     let second = super::SendOperation::new(2_u8);
     let third = super::SendOperation::new(3_u8);
-    let first_id = waiters.push_back(Arc::clone(&first)).expect("first id");
-    let second_id = waiters.push_back(Arc::clone(&second)).expect("second id");
-    let third_id = waiters.push_back(Arc::clone(&third)).expect("third id");
+    let first_id = waiters.push_back(Arc::clone(&first));
+    let second_id = waiters.push_back(Arc::clone(&second));
+    let third_id = waiters.push_back(Arc::clone(&third));
 
     assert!(Arc::ptr_eq(
         &waiters.remove(second_id).expect("middle waiter is live"),
@@ -1716,159 +1667,6 @@ fn waiter_queue_preserves_fifo_across_removal() {
     assert_eq!(popped_third, third_id);
     assert!(Arc::ptr_eq(&operation, &third));
     assert!(waiters.is_empty());
-}
-
-#[test]
-fn waiter_identity_exhaustion_poison_is_never_minted() {
-    let mut waiters = super::WaiterQueue {
-        ids: crate::identity::PoisonedCounter::near_exhaustion(),
-        ..super::WaiterQueue::default()
-    };
-    let last = waiters.push_back(super::SendOperation::new(1_u8));
-    assert_eq!(last, Some(super::WaiterId(u64::MAX - 1)));
-
-    assert_eq!(waiters.push_back(super::SendOperation::new(2_u8)), None);
-    assert!(waiters.ids.is_poisoned());
-    assert!(!waiters.entries.contains_key(&super::WaiterId::POISON));
-    assert_eq!(waiters.push_back(super::SendOperation::new(3_u8)), None);
-}
-
-#[test]
-fn accepted_sequence_exhaustion_poison_is_never_minted() {
-    let accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
-    assert_eq!(
-        super::mint_accepted_sequence(&accepted),
-        Some(super::AcceptedSequence(u64::MAX - 1))
-    );
-    assert_eq!(super::mint_accepted_sequence(&accepted), None);
-    assert_eq!(super::mint_accepted_sequence(&accepted), None);
-}
-
-#[test]
-fn waiter_identity_exhaustion_disposes_the_message_on_the_detached_lane() {
-    let mailbox = MailboxCell::new(
-        ChildId::from("actor"),
-        crate::mailbox::capability::tests::runtime(),
-    );
-    mailbox.state.lock().expect("mailbox state").binding =
-        super::MailboxBinding::Unbound(super::WaiterQueue {
-            ids: crate::identity::PoisonedCounter::near_exhaustion(),
-            ..super::WaiterQueue::default()
-        });
-    assert!(matches!(
-        mailbox.submit(ThreadRecordingMessage(None)),
-        super::Submission::Parked(_)
-    ));
-    let (dropped, observed) = mpsc::channel();
-    let caller = std::thread::current().id();
-
-    let panic = catch_unwind(AssertUnwindSafe(|| {
-        let _ = mailbox.submit(ThreadRecordingMessage(Some(dropped)));
-    }));
-    assert!(panic.is_err(), "exhaustion is reported to the caller");
-    assert_ne!(
-        observed
-            .recv_timeout(Duration::from_secs(5))
-            .expect("isolated message destructor reports"),
-        caller,
-        "the exhausted message is destroyed on the detached disposal lane"
-    );
-}
-
-#[test]
-fn accepted_sequence_exhaustion_disposes_the_message_on_the_detached_lane() {
-    let mut mailbox = MailboxCell::new(
-        ChildId::from("actor"),
-        crate::mailbox::capability::tests::runtime(),
-    );
-    Arc::get_mut(&mut mailbox)
-        .expect("mailbox is uniquely owned")
-        .accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
-    let token = configure(&mailbox, ResolvedMailbox::Latest);
-    bind(&mailbox, token, mint_actor_incarnation());
-    assert!(matches!(
-        mailbox.submit(ThreadRecordingMessage(None)),
-        super::Submission::Accepted(_)
-    ));
-    let (dropped, observed) = mpsc::channel();
-    let caller = std::thread::current().id();
-
-    let panic = catch_unwind(AssertUnwindSafe(|| {
-        let _ = mailbox.submit(ThreadRecordingMessage(Some(dropped)));
-    }));
-    assert!(panic.is_err(), "exhaustion is reported to the caller");
-    assert_ne!(
-        observed
-            .recv_timeout(Duration::from_secs(5))
-            .expect("isolated message destructor reports"),
-        caller,
-        "the exhausted message is destroyed on the detached disposal lane"
-    );
-}
-
-#[test]
-fn promotion_sequence_exhaustion_isolates_the_received_message_before_panicking() {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let runtime = Arc::new(BindOrderingRuntime {
-        inner: crate::mailbox::capability::tests::runtime(),
-        events: Arc::clone(&events),
-    });
-    let mut mailbox = MailboxCell::new(ChildId::from("actor"), runtime);
-    Arc::get_mut(&mut mailbox)
-        .expect("mailbox is uniquely owned")
-        .accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
-    let token = configure(
-        &mailbox,
-        ResolvedMailbox::Queue(std::num::NonZeroUsize::new(1).expect("non-zero capacity")),
-    );
-    let incarnation = mint_actor_incarnation();
-    bind(&mailbox, token, incarnation);
-    let weak = Arc::downgrade(&mailbox);
-    let (dropped, observed) = mpsc::channel();
-    assert!(matches!(
-        mailbox.submit(LockCheckingMessage {
-            mailbox: Weak::clone(&weak),
-            dropped: Some(dropped),
-        }),
-        super::Submission::Accepted(_)
-    ));
-    let operation = match mailbox.submit(LockCheckingMessage {
-        mailbox: weak,
-        dropped: None,
-    }) {
-        super::Submission::Parked(operation) => operation,
-        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
-            panic!("the full queue parks the second message")
-        }
-    };
-    let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
-
-    assert!(catch_unwind(AssertUnwindSafe(|| receiver.try_recv())).is_err());
-    drop(
-        mailbox
-            .state
-            .lock()
-            .expect("the exhaustion panic occurs after mailbox unlock"),
-    );
-    assert!(
-        events
-            .lock()
-            .expect("effect recorder mutex")
-            .contains(&BindEffectEvent::DisposalSubmitted),
-        "the live return value is submitted for isolated disposal before unwind"
-    );
-    assert!(
-        observed
-            .recv_timeout(Duration::from_secs(5))
-            .expect("isolated returned-message destructor reports"),
-        "the returned message is destroyed outside the mailbox mutex"
-    );
-    let mut withdrawal = mailbox.withdraw(&operation, super::WithdrawalDisposition::Inline);
-    assert!(matches!(
-        withdrawal.take_outcome(),
-        super::WithdrawalOutcome::Withdrawn { .. }
-    ));
-    withdrawal.finish();
 }
 
 #[test]
@@ -1912,58 +1710,4 @@ fn a_panicking_close_flush_isolates_the_unread_payload() {
         std::thread::current().id(),
         "an unwinding close flush must not destroy unread user messages on the caller's thread"
     );
-}
-
-#[test]
-fn bind_sequence_exhaustion_retains_parked_senders_after_unlock() {
-    let mut mailbox = MailboxCell::new(
-        ChildId::from("actor"),
-        crate::mailbox::capability::tests::runtime(),
-    );
-    Arc::get_mut(&mut mailbox)
-        .expect("mailbox is uniquely owned")
-        .accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
-    let token = configure(&mailbox, ResolvedMailbox::Latest);
-    let first = match mailbox.submit(1_u8) {
-        super::Submission::Parked(operation) => operation,
-        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
-            panic!("an unbound mailbox parks its send")
-        }
-    };
-    let second = match mailbox.submit(2_u8) {
-        super::Submission::Parked(operation) => operation,
-        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
-            panic!("an unbound mailbox parks its send")
-        }
-    };
-    let incarnation = mint_actor_incarnation();
-
-    // Promotion mints one accepted sequence and then runs out, leaving a
-    // latest mailbox with a waiter still parked.
-    let panic = catch_unwind(AssertUnwindSafe(|| {
-        bind(&mailbox, token, incarnation);
-    }));
-    assert!(panic.is_err(), "exhaustion is reported to the caller");
-    drop(
-        mailbox
-            .state
-            .lock()
-            .expect("the exhaustion panic occurs after mailbox unlock"),
-    );
-
-    let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
-    assert!(
-        receiver.try_recv().is_some(),
-        "the promoted message survives the exhaustion verdict"
-    );
-    let mut withdrawal = mailbox.withdraw(&second, super::WithdrawalDisposition::Inline);
-    assert!(
-        matches!(
-            withdrawal.take_outcome(),
-            super::WithdrawalOutcome::Withdrawn { .. }
-        ),
-        "the unpromotable sender still owns its message"
-    );
-    withdrawal.finish();
-    drop(first);
 }

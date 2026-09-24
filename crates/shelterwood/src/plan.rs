@@ -32,21 +32,13 @@ pub(crate) fn mint_reserved_slot(
     parent: &ScopeCell,
     id: &ChildId,
     child_scope: Option<ScopeFlavor>,
-) -> Result<Arc<SlotCell>, ReserveError> {
-    mint_reserved_slot_inner(parent, id, child_scope).ok_or(ReserveError::IdentityExhausted)
-}
-
-fn mint_reserved_slot_inner(
-    parent: &ScopeCell,
-    id: &ChildId,
-    child_scope: Option<ScopeFlavor>,
-) -> Option<Arc<SlotCell>> {
-    let member = MemberCell::new(parent.mint_membership(id)?);
+) -> Arc<SlotCell> {
+    let member = MemberCell::new(parent.mint_membership(id));
     let scope = child_scope.map(|flavor| {
         let identity = ScopeIdentity::new();
         ScopeCell::new(Arc::clone(&member), flavor, identity)
     });
-    Some(SlotCell::new(member, scope))
+    SlotCell::new(member, scope)
 }
 
 /// Installs a valid option set for a manually constructed resident fixture,
@@ -327,11 +319,7 @@ impl BuilderCore {
     pub(crate) fn new(flavor: ScopeFlavor) -> Self {
         let root_id = ChildId::from("$root");
         let mut root_identity = ScopeIdentity::new();
-        let member = MemberCell::new(
-            root_identity
-                .mint_membership(&root_id)
-                .expect("fresh scope identity must mint its root membership"),
-        );
+        let member = MemberCell::new(root_identity.mint_membership(&root_id));
         let child_identity = ScopeIdentity::new();
         let root = ScopeCell::new(member, flavor, child_identity);
         Self {
@@ -353,8 +341,7 @@ impl BuilderCore {
         if self.ids.contains(&id) {
             return Err(StaticReserveError::DuplicateId(id));
         }
-        let slot = mint_reserved_slot_inner(&self.root, &id, scope)
-            .ok_or(StaticReserveError::IdentityExhausted)?;
+        let slot = mint_reserved_slot(&self.root, &id, scope);
         self.ids.insert(id);
         self.slots.push(Arc::clone(&slot));
         Ok(slot)
@@ -387,7 +374,7 @@ impl BuilderCore {
             .collect();
         if !undefined.is_empty() {
             let disposal = self.begin_failed_disposal();
-            return Err(LowerError::Undefined {
+            return Err(LowerError {
                 paths: undefined,
                 disposal,
             });
@@ -402,11 +389,6 @@ impl BuilderCore {
                     MembershipReconciliation::Adopted => {}
                     MembershipReconciliation::Minted(identity) => {
                         slot.member.rebase_membership(identity);
-                    }
-                    MembershipReconciliation::Exhausted => {
-                        let id = slot.member.id().clone();
-                        let disposal = self.begin_failed_disposal();
-                        return Err(LowerError::IdentityExhausted { id, disposal });
                     }
                 }
             }
@@ -548,16 +530,11 @@ impl ChildPlan {
     }
 }
 
+/// Lowering found reservations that were never defined.
 #[derive(Debug)]
-pub(crate) enum LowerError {
-    Undefined {
-        paths: Vec<ChildId>,
-        disposal: Latch,
-    },
-    IdentityExhausted {
-        id: ChildId,
-        disposal: Latch,
-    },
+pub(crate) struct LowerError {
+    pub(crate) paths: Vec<ChildId>,
+    pub(crate) disposal: Latch,
 }
 
 pub(crate) struct ScopeConstruction {
@@ -603,20 +580,17 @@ mod tests {
     };
 
     use crate::{
-        Backoff, ChildId, DefaultsInheritance, ExitError, Readiness, RestartCondition,
-        RestartPolicy, Retention, Shutdown, TaskOnceDef,
-        cells::{MemberCell, MemberStage, ResidentProjection, ScopeCell},
+        Backoff, DefaultsInheritance, ExitError, Readiness, RestartCondition, RestartPolicy,
+        Retention, Shutdown, TaskOnceDef,
+        cells::{MemberStage, ResidentProjection},
         definition::DefinitionSource,
-        identity::ScopeIdentity,
         policy::{CommonOptions, ResolvedDefaults, ScopeFlavor},
         raw::RawConstruction,
         runtime::{self, Timeout},
         task::{TaskConstruction, TaskDef},
     };
 
-    use super::{
-        BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeConstruction, SlotCell,
-    };
+    use super::{BuilderCore, ChildConstruction, ChildPlan, ScopeConstruction, SlotCell};
 
     fn configured_task() -> TaskConstruction {
         TaskDef::new(|_| async { Ok(()) })
@@ -905,70 +879,6 @@ mod tests {
             "removal cannot claim between policy resolution and admission"
         );
         drop(claim);
-    }
-
-    #[crate::runtime::test]
-    async fn failed_override_lowering_evicts_adopted_lineages_from_the_override() {
-        // A stable scope whose identity domain for "exhausted" has no
-        // generations left, so adoption of that id must fail after the
-        // preceding slot's lineage was already adopted.
-        let root_id = ChildId::from("$root");
-        let mut root_identity = ScopeIdentity::new();
-        let member = MemberCell::new(
-            root_identity
-                .mint_membership(&root_id)
-                .expect("fresh scope identity must mint its root membership"),
-        );
-        let exhausted_id = ChildId::from("exhausted");
-        let mut child_identity = ScopeIdentity::near_exhaustion(exhausted_id.clone(), 7);
-        let _ = child_identity
-            .mint_membership(&exhausted_id)
-            .expect("the final generation is mintable");
-        let stable = ScopeCell::new(member, ScopeFlavor::Ordered, child_identity);
-
-        let mut builder = BuilderCore::new(ScopeFlavor::Ordered);
-        let adopted = builder
-            .reserve("adopted", None)
-            .expect("reservation succeeds");
-        adopted.define(ChildConstruction::Task(configured_task()));
-        let adopted_membership = adopted.member.membership();
-        let failing = builder
-            .reserve("exhausted", None)
-            .expect("reservation succeeds");
-        failing.define(ChildConstruction::Task(configured_task()));
-
-        let Err(error) = builder.lower(ResolvedDefaults::default(), Some(Arc::clone(&stable)))
-        else {
-            panic!("the exhausted id fails adoption");
-        };
-        let LowerError::IdentityExhausted { id, disposal } = error else {
-            panic!("partial adoption fails with identity exhaustion");
-        };
-        assert_eq!(id.as_str(), "exhausted");
-        disposal.fired().await;
-
-        // A restart-style rebuild reconciles against the same stable scope.
-        // The terminalized slot's lineage must have been evicted from the
-        // override's identity map — not the failed builder's throwaway root —
-        // so the re-added id donates a fresh lineage that is incomparable in
-        // both directions instead of minting an ordered successor.
-        let mut rebuild = BuilderCore::new(ScopeFlavor::Ordered);
-        let readded = rebuild
-            .reserve("adopted", None)
-            .expect("re-added id is reservable");
-        readded.define(ChildConstruction::Task(configured_task()));
-        let replacement = rebuild
-            .lower(ResolvedDefaults::default(), Some(stable))
-            .expect("the rebuild lowers");
-        let readded_membership = replacement.children[0].slot.member.membership();
-        assert!(
-            !readded_membership.supersedes(adopted_membership),
-            "a rebuilt membership must not supersede its terminalized predecessor"
-        );
-        assert!(
-            !adopted_membership.supersedes(readded_membership),
-            "a terminalized predecessor must not order against its replacement"
-        );
     }
 
     struct DropFlag(Arc<AtomicBool>);

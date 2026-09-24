@@ -315,7 +315,7 @@ impl DynamicControl {
         // while `state` is held and remain unpublished until `state.insert`.
         // Adoption below therefore acquires only that fresh, uncontended gate
         // under the dynamic-state mutex. AGENTS.md records both edges.
-        let slot = mint_reserved_slot(scope, &id, child_scope)?;
+        let slot = mint_reserved_slot(scope, &id, child_scope);
         scope.adopt_child_observation_gate(&slot.member, slot.scope.as_deref(), _txn);
         state.insert(id, DynamicEntry::reserved(Arc::clone(&slot)), _txn);
         Ok(slot)

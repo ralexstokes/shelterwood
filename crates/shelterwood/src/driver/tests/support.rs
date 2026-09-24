@@ -135,8 +135,8 @@ pub(super) use super::super::{
     ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, ScopeRuntimeTestWiring,
     StartupDisposition, cancel_dynamic_reservation, child::dispatch_child_construction_for_test,
     discharge_child_terminality, monitor_root_driver, nested_scope_start, report_slot,
-    reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
-    run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation, wait_for_scope_wake,
+    reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory, run_scope,
+    run_scope_incarnation, storage::Obligation, wait_for_scope_wake,
 };
 
 pub(super) async fn begin_admission(
@@ -564,14 +564,11 @@ pub(super) fn gate_probe_exit(scope: &Arc<ScopeCell>) -> (Exit, Arc<Mutex<Option
 pub(super) fn restarting_member_fixture() -> (Arc<ScopeCell>, Arc<MemberCell>, IncarnationCounter) {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");
-    let member = MemberCell::new(
-        root.mint_membership(&child_id)
-            .expect("child membership available"),
-    );
+    let member = MemberCell::new(root.mint_membership(&child_id));
     resolve_fixture_options(&member);
     let mut incarnations = member.take_incarnation_counter();
     assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
-    let first = incarnations.mint().expect("incarnation available");
+    let first = incarnations.mint();
     assert!(member.transition(MemberTransition::Starting { incarnation: first }));
     (root, member, incarnations)
 }

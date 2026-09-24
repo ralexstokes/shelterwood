@@ -14,7 +14,7 @@ use std::{
 };
 
 use crate::{
-    identity::PoisonedCounter,
+    identity::MonotonicCounter,
     raw::disposal::{Contained, RawDisposal},
 };
 
@@ -61,7 +61,7 @@ struct TimerLocation {
 /// preserve `Eq` semantics in the unlikely event of a collision.
 pub(super) struct TimerStore<M> {
     key_hasher: RandomState,
-    arming_orders: PoisonedCounter,
+    arming_orders: MonotonicCounter,
     keyed: HashMap<KeyHash, Vec<TimerEntry<M>>>,
     armings: HashMap<ArmingOrder, KeyHash>,
     deadlines: BTreeSet<(Instant, ArmingOrder)>,
@@ -81,7 +81,7 @@ impl<M> TimerStore<M> {
     pub(super) fn new(disposal: RawDisposal) -> Self {
         Self {
             key_hasher: RandomState::new(),
-            arming_orders: PoisonedCounter::new(),
+            arming_orders: MonotonicCounter::new(),
             keyed: HashMap::new(),
             armings: HashMap::new(),
             deadlines: BTreeSet::new(),
@@ -121,20 +121,12 @@ impl<M> TimerStore<M> {
     where
         K: Hash + Eq + Send + 'static,
     {
-        // Every verdict below is framework-owned. Contain incoming ownership
-        // before even minting the arming id so exhaustion cannot unwind a
-        // hostile key or message destructor on the framework panic's stack.
-        // Hash and equality are user code and need the same boundary.
+        // Hash and equality below are user code. Contain incoming ownership
+        // first, so a panic there cannot unwind a hostile key or message
+        // destructor on its stack.
         let key = Contained::new(key, self.disposal.clone());
         let message = Contained::new(message, self.disposal.clone());
-        let Some(arming_order) = self.arming_orders.mint().map(ArmingOrder) else {
-            // Dispose both inputs before establishing the diagnostic. Their
-            // destructor panics are retained by RawDisposal and cannot replace
-            // the arming-space invariant.
-            drop(message);
-            drop(key);
-            panic!("timer arming-order space exhausted");
-        };
+        let arming_order = ArmingOrder(self.arming_orders.mint());
         let hash = self.hash_key(key.get());
         self.remove_hashed(hash, key.get());
         self.keyed.entry(hash).or_default().push(TimerEntry {
@@ -365,7 +357,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{PoisonedCounter, TimerMessage, TimerStore};
+    use super::{TimerMessage, TimerStore};
 
     #[derive(Eq, PartialEq)]
     struct CollidingKey(u8);
@@ -752,42 +744,6 @@ mod tests {
                 Some("timer message destructor panic" | "timer key destructor panic")
             ),
             "a hostile incoming destructor is recorded"
-        );
-        assert!(timers.is_empty());
-    }
-
-    #[test]
-    fn arming_exhaustion_disposes_inputs_before_the_framework_panic() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let mut timers = TimerStore::default();
-        timers.arming_orders = PoisonedCounter::near_exhaustion();
-        assert!(
-            timers.arming_orders.mint().is_some(),
-            "the fixture consumes the final arming id"
-        );
-
-        let panic = catch_unwind(AssertUnwindSafe(|| {
-            timers.replace(
-                PanickingDropKey(Arc::clone(&drops)),
-                None,
-                TimerMessage::Once(PanickingTimerMessage(Arc::clone(&drops))),
-            );
-        }))
-        .expect_err("the exhausted arming domain remains a framework panic");
-
-        assert_eq!(
-            panic.downcast_ref::<&'static str>().copied(),
-            Some("timer arming-order space exhausted"),
-            "hostile input destructors cannot replace the invariant"
-        );
-        assert_eq!(
-            drops.load(Ordering::SeqCst),
-            2,
-            "both inputs are disposed before the framework panic begins"
-        );
-        assert!(
-            timers.disposal.panic.take().is_some(),
-            "the first hostile destructor panic remains cleanup evidence"
         );
         assert!(timers.is_empty());
     }

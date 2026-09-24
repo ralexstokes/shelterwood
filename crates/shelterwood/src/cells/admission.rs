@@ -6,8 +6,8 @@ use shelterwood_core::ChildId;
 
 /// A pre-spawn child declaration or reservation error.
 ///
-/// Static builders cannot observe runtime admission state: only id validation,
-/// duplicate detection, and membership identity exhaustion are reachable.
+/// Static builders cannot observe runtime admission state: only id validation
+/// and duplicate detection are reachable.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum StaticReserveError {
     /// The child id was empty.
@@ -16,9 +16,6 @@ pub enum StaticReserveError {
     /// A declared membership already occupies the id.
     #[error("child id `{0}` is already declared")]
     DuplicateId(ChildId),
-    /// The scope can mint no further membership identities.
-    #[error("membership identity space is exhausted")]
-    IdentityExhausted,
 }
 
 /// A child reservation or dynamic admission error.
@@ -39,9 +36,6 @@ pub enum ReserveError {
     /// The target dynamic scope is not admitting.
     #[error("scope is not admitting: {0}")]
     NotAdmitting(NotAdmittingCause),
-    /// The scope can mint no further membership identities.
-    #[error("membership identity space is exhausted")]
-    IdentityExhausted,
 }
 
 /// Exact reason an admission operation could not proceed.

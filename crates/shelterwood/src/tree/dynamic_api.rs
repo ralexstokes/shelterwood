@@ -35,10 +35,8 @@ impl DynamicScopeRef {
     /// [`ReserveError::NoRuntime`] outside an ambient Tokio runtime,
     /// [`ReserveError::NotAdmitting`] when the scope is terminal, draining,
     /// parked after a startup failure, or has no live incarnation,
-    /// [`ReserveError::RemovalInProgress`] or [`ReserveError::DuplicateId`]
-    /// when a same-id member is being removed or is resident, and
-    /// [`ReserveError::IdentityExhausted`] when the scope can mint no further
-    /// membership.
+    /// and [`ReserveError::RemovalInProgress`] or [`ReserveError::DuplicateId`]
+    /// when a same-id member is being removed or is resident.
     pub fn reserve_actor<M: Send + 'static>(
         &self,
         id: impl Into<ChildId>,
@@ -91,10 +89,8 @@ impl DynamicScopeRef {
     /// [`ReserveError::NoRuntime`] outside an ambient Tokio runtime,
     /// [`ReserveError::NotAdmitting`] when the scope is terminal, draining,
     /// parked after a startup failure, or has no live incarnation,
-    /// [`ReserveError::RemovalInProgress`] or [`ReserveError::DuplicateId`]
-    /// when a same-id member is being removed or is resident, and
-    /// [`ReserveError::IdentityExhausted`] when the scope can mint no further
-    /// membership.
+    /// and [`ReserveError::RemovalInProgress`] or [`ReserveError::DuplicateId`]
+    /// when a same-id member is being removed or is resident.
     pub fn reserve_task(&self, id: impl Into<ChildId>) -> Result<DynamicTaskSlot, ReserveError> {
         reserve_dynamic::<TaskKind>(self, id, AdmissionOwnership::Split)
             .map(|core| DynamicTaskSlot { core })
@@ -122,10 +118,8 @@ impl DynamicScopeRef {
     /// [`ReserveError::NoRuntime`] outside an ambient Tokio runtime,
     /// [`ReserveError::NotAdmitting`] when the scope is terminal, draining,
     /// parked after a startup failure, or has no live incarnation,
-    /// [`ReserveError::RemovalInProgress`] or [`ReserveError::DuplicateId`]
-    /// when a same-id member is being removed or is resident, and
-    /// [`ReserveError::IdentityExhausted`] when the scope can mint no further
-    /// membership.
+    /// and [`ReserveError::RemovalInProgress`] or [`ReserveError::DuplicateId`]
+    /// when a same-id member is being removed or is resident.
     pub fn reserve_subtree<T: Subtree>(
         &self,
         id: impl Into<ChildId>,

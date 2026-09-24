@@ -14,7 +14,7 @@ fn handle_identity_is_stable_across_membership_rebase() {
 
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
+    let member = MemberCell::new(identity.mint_membership(&id));
     let mailbox: Arc<MailboxCell<u8>> =
         MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), mailbox);
@@ -26,11 +26,7 @@ fn handle_identity_is_stable_across_membership_rebase() {
     let actor_keys = std::collections::HashSet::from([actor.clone()]);
     let task_keys = std::collections::HashSet::from([task.clone()]);
 
-    member.rebase_membership(
-        identity
-            .mint_membership(&id)
-            .expect("successor membership available"),
-    );
+    member.rebase_membership(identity.mint_membership(&id));
 
     assert!(actor.membership().supersedes(declared));
     assert_eq!(actor, peer);
@@ -50,7 +46,7 @@ fn handle_identity_is_stable_across_membership_rebase() {
 async fn attaching_after_terminality_closes_the_mailbox() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
-    let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
+    let member = MemberCell::new(identity.mint_membership(&id));
     let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     let mut parked = Box::pin(actor.send(1));
@@ -630,10 +626,7 @@ async fn dispatching_a_spent_one_shot_task_construction_panics() {
     let defaults = plan.defaults.clone();
     let mut child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     plan.finish_transfer();
-    let incarnation = child
-        .incarnations
-        .mint()
-        .expect("the first incarnation mints");
+    let incarnation = child.incarnations.mint();
 
     dispatch_child_construction_for_test(&mut child, &root, &defaults, incarnation);
     // The child never started, so discharge terminality before the panic

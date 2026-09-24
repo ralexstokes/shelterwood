@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    identity::{AtomicPoisonedCounter, ChildId, Incarnation, PoisonedCounter},
+    identity::{AtomicMonotonicCounter, ChildId, Incarnation, MonotonicCounter},
     mailbox::{
         MailboxBindToken, MailboxClose, MailboxControl, MailboxDisposal, MailboxEffectQueue,
         MailboxEffectSink, MailboxRuntime, MailboxSignal, MailboxSignalWatcher, MailboxTermination,
@@ -347,12 +347,12 @@ impl<M> MailboxState<M> {
         Ok(())
     }
 
-    fn park(&mut self, operation: &Arc<SendOperation<M>>) -> bool {
+    fn park(&mut self, operation: &Arc<SendOperation<M>>) {
         match &mut self.binding {
             MailboxBinding::Unbound(waiters)
             | MailboxBinding::Frozen { waiters, .. }
             | MailboxBinding::Bound(BoundState::Full { waiters, .. }) => {
-                return waiters.park(operation);
+                waiters.park(operation);
             }
             MailboxBinding::Bound(BoundState::Available(incarnation)) => {
                 // Diagnostic-only under the mailbox mutex: `Available` parks
@@ -374,9 +374,7 @@ impl<M> MailboxState<M> {
                 );
                 let incarnation = *incarnation;
                 let mut waiters = WaiterQueue::default();
-                if !waiters.park(operation) {
-                    return false;
-                }
+                waiters.park(operation);
                 // This arm just matched `Available`, so no waiter identity
                 // domain can be displaced by the direct replacement.
                 self.binding = MailboxBinding::Bound(BoundState::Full {
@@ -388,7 +386,6 @@ impl<M> MailboxState<M> {
                 unreachable!("terminal submissions return their payload directly")
             }
         }
-        true
     }
 
     /// Detaches every waiter from a non-terminal binding before a transition.
@@ -479,30 +476,21 @@ pub(super) enum Submission<M> {
 enum SubmitTransition<M> {
     Complete(Submission<M>),
     IncarnationMismatch(M),
-    WaiterIdentityExhausted(Arc<SendOperation<M>>),
-    AcceptedSequenceExhausted(M),
 }
 
 enum AcceptTransition<M> {
     Accepted(Incarnation),
     Full(M),
     IncarnationMismatch(M),
-    Exhausted(M),
 }
 
 enum TrySendTransition<M> {
     Complete(Result<Incarnation, SendError<M>>),
     IncarnationMismatch(M),
-    AcceptedSequenceExhausted(M),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct WaiterId(u64);
-
-impl WaiterId {
-    #[cfg(test)]
-    const POISON: Self = Self(u64::MAX);
-}
 
 /// FIFO registrations with direct removal by a send operation.
 ///
@@ -512,11 +500,9 @@ impl WaiterId {
 /// empty, so no registration outlives its queue and stale cancellation ids
 /// remain harmless. Terminalization detaches the live queue before replacing
 /// the binding and discharges those registrations after unlocking.
-/// `u64::MAX` is a poison key and is never minted; exhaustion remains poisoned
-/// instead of wrapping back into the live id domain.
 pub(super) struct WaiterQueue<M> {
     entries: BTreeMap<WaiterId, Arc<SendOperation<M>>>,
-    ids: PoisonedCounter,
+    ids: MonotonicCounter,
     #[cfg(test)]
     direct_removals: usize,
 }
@@ -525,7 +511,7 @@ impl<M> Default for WaiterQueue<M> {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
-            ids: PoisonedCounter::new(),
+            ids: MonotonicCounter::new(),
             #[cfg(test)]
             direct_removals: 0,
         }
@@ -542,27 +528,16 @@ impl<M> WaiterQueue<M> {
         self.entries.len()
     }
 
-    fn push_back(&mut self, operation: Arc<SendOperation<M>>) -> Option<WaiterId> {
-        let next = WaiterId(self.ids.mint()?);
-        // Keep a counter regression total. `park` retains the caller's Arc,
-        // so declining this clone is refcount traffic and cannot destroy its
-        // user message under the mailbox mutex; the resident operation is not
-        // displaced at all.
-        match self.entries.entry(next) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(operation);
-                Some(next)
-            }
-            std::collections::btree_map::Entry::Occupied(_) => None,
-        }
+    fn push_back(&mut self, operation: Arc<SendOperation<M>>) -> WaiterId {
+        // A freshly minted id cannot displace a registration.
+        let next = WaiterId(self.ids.mint());
+        self.entries.insert(next, operation);
+        next
     }
 
-    fn park(&mut self, operation: &Arc<SendOperation<M>>) -> bool {
-        let Some(registration) = self.push_back(Arc::clone(operation)) else {
-            return false;
-        };
+    fn park(&mut self, operation: &Arc<SendOperation<M>>) {
+        let registration = self.push_back(Arc::clone(operation));
         operation.register(registration);
-        true
     }
 
     fn observe_all(&self, incarnation: Incarnation) {
@@ -600,7 +575,6 @@ struct MailboxEffectPayload<M> {
     isolate_displaced: bool,
     wakers: WakerEffects,
     returned: Option<M>,
-    accepted_sequence_exhausted: bool,
     rejected_bindings: Vec<MailboxBinding<M>>,
     invariant_panic: Option<&'static str>,
 }
@@ -613,7 +587,6 @@ impl<M> Default for MailboxEffectPayload<M> {
             isolate_displaced: false,
             wakers: WakerEffects::default(),
             returned: None,
-            accepted_sequence_exhausted: false,
             rejected_bindings: Vec::new(),
             invariant_panic: None,
         }
@@ -633,7 +606,6 @@ impl<M> MailboxEffectPayload<M> {
             isolate_displaced: _,
             wakers,
             returned,
-            accepted_sequence_exhausted,
             rejected_bindings,
             invariant_panic,
         } = self;
@@ -641,7 +613,6 @@ impl<M> MailboxEffectPayload<M> {
             && displaced.is_empty()
             && wakers.is_empty()
             && returned.is_none()
-            && !accepted_sequence_exhausted
             && rejected_bindings.is_empty()
             && invariant_panic.is_none()
     }
@@ -732,8 +703,8 @@ struct MailboxEffectBatch<M> {
 }
 
 /// A received message remains isolated until every post-unlock effect has
-/// flushed successfully. If a pulse, waker, displaced payload, or exhaustion
-/// verdict panics, unwinding submits the message for detached disposal instead
+/// flushed successfully. If a pulse, waker, or displaced payload panics,
+/// unwinding submits the message for detached disposal instead
 /// of destroying it on the mailbox caller's stack.
 struct ReturnedMessage<M: Send + 'static> {
     value: Option<M>,
@@ -804,9 +775,6 @@ impl<M: Send + 'static> MailboxEffectBatch<M> {
         if let Some(returned) = payload.returned.take() {
             panics.run(|| drop(returned));
         }
-        if payload.accepted_sequence_exhausted {
-            panics.run(|| panic!("mailbox accepted-sequence space exhausted"));
-        }
     }
 }
 
@@ -868,8 +836,8 @@ impl<'a, 's, M: Send + 'static> MailboxTxn<'a, 's, M> {
         }
     }
 
-    fn park(&mut self, operation: &Arc<SendOperation<M>>) -> bool {
-        self.state_mut().park(operation)
+    fn park(&mut self, operation: &Arc<SendOperation<M>>) {
+        self.state_mut().park(operation);
     }
 
     #[must_use]
@@ -919,15 +887,6 @@ impl<'a, 's, M: Send + 'static> MailboxTxn<'a, 's, M> {
             incarnation,
             waiters,
         });
-    }
-
-    fn freeze_after_exhaustion(&mut self, incarnation: Incarnation, waiters: WaiterQueue<M>) {
-        // This transition carries the waiter identity domain forward, so it
-        // deliberately bypasses `replace_binding`'s empty-domain check.
-        self.state_mut().binding = MailboxBinding::Frozen {
-            incarnation,
-            waiters,
-        };
     }
 
     fn unbind(&mut self, waiters: WaiterQueue<M>) {
@@ -1110,7 +1069,7 @@ impl<M: Send + 'static> Drop for MailboxTeardown<M> {
 pub(crate) struct MailboxCell<M> {
     pub(super) actor_id: ChildId,
     pub(super) state: Mutex<MailboxState<M>>,
-    accepted: AtomicPoisonedCounter,
+    accepted: AtomicMonotonicCounter,
     runtime: Arc<dyn MailboxRuntime>,
     changed: Arc<dyn MailboxSignal>,
 }
@@ -1139,7 +1098,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                 queue: VecDeque::new(),
                 latest: None,
             }),
-            accepted: AtomicPoisonedCounter::new(),
+            accepted: AtomicMonotonicCounter::new(),
             runtime,
             changed,
         })
@@ -1166,17 +1125,11 @@ impl<M: Send + 'static> MailboxCell<M> {
                     AcceptTransition::Full(message) => {
                         let operation = SendOperation::new(message);
                         operation.observe(incarnation);
-                        if transaction.park(&operation) {
-                            SubmitTransition::Complete(Submission::Parked(operation))
-                        } else {
-                            SubmitTransition::WaiterIdentityExhausted(operation)
-                        }
+                        transaction.park(&operation);
+                        SubmitTransition::Complete(Submission::Parked(operation))
                     }
                     AcceptTransition::IncarnationMismatch(message) => {
                         SubmitTransition::IncarnationMismatch(message)
-                    }
-                    AcceptTransition::Exhausted(message) => {
-                        SubmitTransition::AcceptedSequenceExhausted(message)
                     }
                 }
             }
@@ -1185,25 +1138,14 @@ impl<M: Send + 'static> MailboxCell<M> {
                 if let BindingStatus::Frozen(incarnation) = status {
                     operation.observe(incarnation);
                 }
-                if transaction.park(&operation) {
-                    SubmitTransition::Complete(Submission::Parked(operation))
-                } else {
-                    SubmitTransition::WaiterIdentityExhausted(operation)
-                }
+                transaction.park(&operation);
+                SubmitTransition::Complete(Submission::Parked(operation))
             }
         };
         match transaction.finish(transition) {
             SubmitTransition::Complete(submission) => submission,
             SubmitTransition::IncarnationMismatch(message) => {
                 reject_incarnation_mismatch(&self.runtime, message)
-            }
-            SubmitTransition::WaiterIdentityExhausted(operation) => {
-                dispose(&self.runtime, operation);
-                panic!("mailbox waiter identity space exhausted");
-            }
-            SubmitTransition::AcceptedSequenceExhausted(message) => {
-                dispose(&self.runtime, message);
-                panic!("mailbox accepted-sequence space exhausted");
             }
         }
     }
@@ -1251,9 +1193,6 @@ impl<M: Send + 'static> MailboxCell<M> {
                     AcceptTransition::IncarnationMismatch(message) => {
                         TrySendTransition::IncarnationMismatch(message)
                     }
-                    AcceptTransition::Exhausted(message) => {
-                        TrySendTransition::AcceptedSequenceExhausted(message)
-                    }
                 }
             }
         };
@@ -1261,10 +1200,6 @@ impl<M: Send + 'static> MailboxCell<M> {
             TrySendTransition::Complete(result) => result,
             TrySendTransition::IncarnationMismatch(message) => {
                 reject_incarnation_mismatch(&self.runtime, message)
-            }
-            TrySendTransition::AcceptedSequenceExhausted(message) => {
-                dispose(&self.runtime, message);
-                panic!("mailbox accepted-sequence space exhausted");
             }
         }
     }
@@ -1551,24 +1486,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
                 effects,
             );
         }
-        if transaction.effects.accepted_sequence_exhausted {
-            // Exhaustion is the one way promotion stops early, so neither
-            // derived verdict below holds: a latest mailbox can still owe
-            // waiters and a queue mailbox can still have free capacity.
-            // Freezing is the honest state — no further acceptance is
-            // possible on this counter — and it keeps the parked senders in
-            // mailbox-owned state. Destroying them here would run user
-            // message destructors under the mailbox mutex during the
-            // exhaustion panic's own unwind; the post-unlock effect raises
-            // that panic instead.
-            //
-            // Assigned directly rather than through `replace_binding`: this
-            // is the one transition whose replacement carries the waiter
-            // queue forward instead of discarding it, so a declined
-            // replacement would destroy exactly what the branch exists to
-            // preserve.
-            transaction.freeze_after_exhaustion(incarnation, waiters);
-        } else if waiters.is_empty() {
+        if waiters.is_empty() {
             transaction.bind_available(incarnation);
         } else {
             let ResolvedMailbox::Queue(_) = kind else {
@@ -1651,10 +1569,8 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
     }
 }
 
-fn mint_accepted_sequence(accepted: &AtomicPoisonedCounter) -> Option<AcceptedSequence> {
-    accepted
-        .mint(Ordering::Release, Ordering::Relaxed)
-        .map(AcceptedSequence)
+fn mint_accepted_sequence(accepted: &AtomicMonotonicCounter) -> AcceptedSequence {
+    AcceptedSequence(accepted.mint(Ordering::Release, Ordering::Relaxed))
 }
 
 fn reject_incarnation_mismatch<M: Send + 'static>(
@@ -1669,7 +1585,7 @@ fn accept_locked<M>(
     state: &mut MailboxState<M>,
     incarnation: Incarnation,
     message: M,
-    accepted: &AtomicPoisonedCounter,
+    accepted: &AtomicMonotonicCounter,
     effects: &mut MailboxEffects<'_, '_, M>,
 ) -> AcceptTransition<M>
 where
@@ -1705,9 +1621,7 @@ where
         Some(ResolvedMailbox::Queue(_)) => return AcceptTransition::Full(message),
         None => unreachable!("a bound mailbox is always configured"),
     };
-    let Some(accepted_sequence) = mint_accepted_sequence(accepted) else {
-        return AcceptTransition::Exhausted(message);
-    };
+    let accepted_sequence = mint_accepted_sequence(accepted);
     match kind {
         ResolvedMailbox::Queue(_) => {
             state.queue.push_back(Envelope {
@@ -1731,7 +1645,7 @@ where
 
 fn promote_waiters<M: Send + 'static>(
     state: &mut MailboxState<M>,
-    accepted_sequence: &AtomicPoisonedCounter,
+    accepted_sequence: &AtomicMonotonicCounter,
     effects: &mut MailboxEffects<'_, '_, M>,
 ) {
     let Some(kind) = state.kind else {
@@ -1754,13 +1668,6 @@ fn promote_waiters<M: Send + 'static>(
         accepted_sequence,
         effects,
     );
-    // Bind-time exhaustion freezes because no live incarnation has yet been
-    // published. A receive is different: it has already removed an accepted
-    // envelope from this live incarnation, and freezing here would make
-    // `LiveThrough` stop observing the remaining accepted envelopes. Leave a
-    // nonempty waiter queue Full instead. Exhaustion is a fatal diagnostic;
-    // if execution nevertheless continues, each later receive that opens
-    // capacity may re-observe and re-report the poisoned sequence counter.
     if waiters.is_empty() {
         state.binding = MailboxBinding::Bound(BoundState::Available(incarnation));
     }
@@ -1772,7 +1679,7 @@ fn promote_waiter_queue<M: Send + 'static>(
     waiters: &mut WaiterQueue<M>,
     queue: &mut VecDeque<Envelope<M>>,
     latest: &mut Option<Envelope<M>>,
-    accepted_sequence: &AtomicPoisonedCounter,
+    accepted_sequence: &AtomicMonotonicCounter,
     effects: &mut MailboxEffects<'_, '_, M>,
 ) {
     let available = match kind {
@@ -1784,10 +1691,7 @@ fn promote_waiter_queue<M: Send + 'static>(
         if waiters.is_empty() {
             break;
         }
-        let Some(accepted_sequence) = mint_accepted_sequence(accepted_sequence) else {
-            effects.accepted_sequence_exhausted = true;
-            break;
-        };
+        let accepted_sequence = mint_accepted_sequence(accepted_sequence);
         let Some((registration, operation)) = waiters.pop_front() else {
             break;
         };

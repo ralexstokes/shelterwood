@@ -234,7 +234,7 @@ async fn latched_shutdown_upgrades_an_intensity_drain() {
 
     // Model a shutdown request that latches after this pass sampled the
     // control plane but before the collected child exit is dispatched.
-    assert!(root.request_shutdown().is_some());
+    root.request_shutdown();
     scope.handle_exit(
         key,
         incarnation,

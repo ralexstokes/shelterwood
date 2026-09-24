@@ -5,10 +5,7 @@ use super::support::*;
 fn snapshot_rejects_a_resident_whose_options_were_never_resolved() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");
-    let member = MemberCell::new(
-        root.mint_membership(&child_id)
-            .expect("child membership available"),
-    );
+    let member = MemberCell::new(root.mint_membership(&child_id));
 
     assert!(root.admit_child(ResidentProjection::new(member, None)));
     let _ = root.snapshot();
@@ -237,7 +234,7 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
         .begin_incarnation(ScopeState::Starting)
         .expect("nested scope epoch is available");
     let mut incarnations = IncarnationCounter::fixture(nested.member.membership());
-    let incarnation = incarnations.mint().expect("child incarnation is available");
+    let incarnation = incarnations.mint();
     nested.member.update(|record| {
         record.stage = MemberStage::Running;
         record.incarnation = Some(incarnation);
@@ -323,7 +320,7 @@ async fn terminal_scope_in_drain_waits_for_its_live_incarnation_to_stop() {
         .begin_incarnation(ScopeState::Starting)
         .expect("nested scope epoch is available");
     let mut incarnations = IncarnationCounter::fixture(nested.member.membership());
-    let incarnation = incarnations.mint().expect("child incarnation is available");
+    let incarnation = incarnations.mint();
     nested.member.update(|record| {
         record.stage = MemberStage::Running;
         record.incarnation = Some(incarnation);
@@ -384,7 +381,7 @@ impl AbortedNestedDriverFixture {
 
         let epoch = ScopeEpochGuard::begin(&nested).expect("nested scope epoch is available");
         let mut incarnations = IncarnationCounter::fixture(nested.member.membership());
-        let incarnation = incarnations.mint().expect("child incarnation is available");
+        let incarnation = incarnations.mint();
         nested.member.update(|record| {
             record.stage = MemberStage::Running;
             record.incarnation = Some(incarnation);
@@ -551,9 +548,7 @@ async fn wait_for_child_reloads_after_its_predicate_closes_the_snapshot_stream()
         .expect("scope epoch is available");
     scope.set_state(ScopeState::Running);
     let child_id = ChildId::from("child");
-    let membership = scope
-        .mint_membership(&child_id)
-        .expect("child membership is available");
+    let membership = scope.mint_membership(&child_id);
     let child = MemberCell::new(membership);
     resolve_fixture_options(&child);
     let slot = SlotCell::new(Arc::clone(&child), None);
@@ -599,7 +594,7 @@ async fn terminality_fallback_preserves_restart_window_scope_reason() {
     assert!(parent.set_admitted_children(vec![resident_projection(&slot)]));
 
     let mut incarnations = IncarnationCounter::fixture(nested.member.membership());
-    let last_incarnation = incarnations.mint().expect("child incarnation is available");
+    let last_incarnation = incarnations.mint();
     nested.member.update(|record| {
         record.stage = MemberStage::Restarting;
         record.incarnation = None;
@@ -940,11 +935,7 @@ fn admitted_subtree_rehomes_existing_descendants_to_one_gate() {
     let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
     let leaf = isolated_scope("leaf", ScopeFlavor::Ordered);
     let raw_leaf_id = ChildId::from("raw-leaf");
-    let raw_leaf = MemberCell::new(
-        nested
-            .mint_membership(&raw_leaf_id)
-            .expect("raw leaf membership is available"),
-    );
+    let raw_leaf = MemberCell::new(nested.mint_membership(&raw_leaf_id));
     let leaf_slot = SlotCell::new(Arc::clone(&leaf.member), Some(Arc::clone(&leaf)));
     let raw_leaf_slot = SlotCell::new(Arc::clone(&raw_leaf), None);
     assert!(nested.set_admitted_children(vec![
@@ -1154,14 +1145,14 @@ fn plain_resident_state_is_released_before_recursive_removed_publication() {
 fn plain_parent_state_preserves_nested_snapshot_propagation() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
-    let mut incarnations = IncarnationCounter::near_exhaustion(nested.member.membership());
+    let mut incarnations = IncarnationCounter::fixture(nested.member.membership());
     resolve_fixture_options(&nested.member);
     let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
     assert!(root.set_admitted_children(vec![resident_projection(&nested_slot)]));
     // Start the nested member along the production admit-then-spawn order so
     // the transition-source assertions in `apply_transition` hold here too.
     assert!(nested.member.transition(MemberTransition::Starting {
-        incarnation: incarnations.mint().expect("incarnation available"),
+        incarnation: incarnations.mint(),
     }));
     let snapshots = root.subscribe_snapshots();
     let intensity = Intensity::new(7, Duration::from_secs(11)).expect("valid intensity");
@@ -1380,10 +1371,7 @@ fn a_losing_terminal_exit_payload_is_destroyed_outside_the_gate() {
 fn a_losing_supervised_terminal_exit_is_a_complete_noop_outside_the_gate() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let child_id = ChildId::from("worker");
-    let member = MemberCell::new(
-        root.mint_membership(&child_id)
-            .expect("child membership available"),
-    );
+    let member = MemberCell::new(root.mint_membership(&child_id));
     resolve_fixture_options(&member);
     assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     member.terminalize(
@@ -1419,10 +1407,7 @@ fn a_losing_supervised_terminal_exit_is_a_complete_noop_outside_the_gate() {
 fn a_retired_snapshot_payload_is_destroyed_outside_the_gate() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");
-    let member = MemberCell::new(
-        root.mint_membership(&child_id)
-            .expect("child membership available"),
-    );
+    let member = MemberCell::new(root.mint_membership(&child_id));
     resolve_fixture_options(&member);
     assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let subscription = root.subscribe_snapshots();
@@ -1468,7 +1453,7 @@ fn a_superseded_restart_exit_payload_is_destroyed_outside_the_gate() {
         "the record still owns the scheduled restart's exit"
     );
 
-    let second = incarnations.mint().expect("restart incarnation available");
+    let second = incarnations.mint();
     assert!(member.transition(MemberTransition::Starting {
         incarnation: second,
     }));
@@ -1517,10 +1502,7 @@ fn a_restart_exit_payload_superseded_by_terminalization_outlives_the_gate() {
 fn a_snapshot_retired_by_observation_closure_is_destroyed_outside_the_gate() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");
-    let member = MemberCell::new(
-        root.mint_membership(&child_id)
-            .expect("child membership available"),
-    );
+    let member = MemberCell::new(root.mint_membership(&child_id));
     resolve_fixture_options(&member);
     assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let subscription = root.subscribe_snapshots();
@@ -1653,10 +1635,7 @@ fn snapshot_retirement_isolates_an_exit_nested_in_scope_state() {
 fn residency_can_release_the_last_member_arc_with_a_failed_exit() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");
-    let member = MemberCell::new(
-        root.mint_membership(&child_id)
-            .expect("child membership available"),
-    );
+    let member = MemberCell::new(root.mint_membership(&child_id));
     resolve_fixture_options(&member);
     assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let weak = Arc::downgrade(&member);
@@ -1678,4 +1657,96 @@ fn residency_can_release_the_last_member_arc_with_a_failed_exit() {
         !wait_for_gate_probe(&held_at_drop),
         "retiring the member record must not run its payload under the observation gate"
     );
+}
+
+#[test]
+fn member_transitions_own_their_complete_record_projection() {
+    let mut identity = ScopeIdentity::new();
+    let id = ChildId::from("worker");
+    let membership = identity.mint_membership(&id);
+    let member = MemberCell::new(membership);
+    let mut incarnations = member.take_incarnation_counter();
+    let incarnation = incarnations.mint();
+
+    assert!(member.transition(MemberTransition::Admitted));
+    assert_eq!(member.record().stage, MemberStage::Admitted);
+
+    assert!(member.transition(MemberTransition::Starting { incarnation }));
+    let record = member.record();
+    assert_eq!(record.stage, MemberStage::Starting);
+    assert_eq!(record.incarnation, Some(incarnation));
+    assert_eq!(record.last_incarnation, Some(incarnation));
+    assert_eq!(record.restart_at, None);
+
+    assert!(member.transition(MemberTransition::Running));
+    assert_eq!(member.record().stage, MemberStage::Running);
+    assert!(member.transition(MemberTransition::Stopping));
+    assert_eq!(member.record().stage, MemberStage::Stopping);
+
+    let exit = Exit::completed(Cancellation::NotObserved);
+    let restart_count = RestartCount::ZERO.bump();
+    let restart_at = crate::runtime::now();
+    assert!(member.transition(MemberTransition::RestartScheduled {
+        exit: exit.clone(),
+        restart_count,
+        restart_at: Some(restart_at),
+    }));
+    let record = member.record();
+    assert_eq!(record.stage, MemberStage::Restarting);
+    assert_eq!(record.incarnation, None);
+    assert_eq!(record.last_incarnation, Some(incarnation));
+    assert_eq!(record.last_exit, Some(exit));
+    assert_eq!(record.restart_count, restart_count);
+    assert_eq!(record.restart_at, Some(restart_at));
+
+    let second = incarnations.mint();
+    assert!(member.transition(MemberTransition::Starting {
+        incarnation: second,
+    }));
+    let record = member.record();
+    assert_eq!(record.stage, MemberStage::Starting);
+    assert_eq!(record.incarnation, Some(second));
+    assert_eq!(record.last_incarnation, Some(second));
+    assert_eq!(record.restart_at, None);
+    assert_eq!(
+        record.last_exit,
+        Some(Exit::completed(Cancellation::NotObserved))
+    );
+    assert_eq!(record.restart_count, restart_count);
+}
+
+#[crate::runtime::test]
+async fn never_started_nested_terminal_publishes_one_final_parent_snapshot() {
+    let parent = isolated_scope("parent", ScopeFlavor::Ordered);
+    let nested = isolated_scope("nested", ScopeFlavor::Ordered);
+    resolve_fixture_options(&nested.member);
+    let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+    assert!(parent.set_admitted_children(vec![resident_projection(&slot)]));
+    let mut snapshots = parent.subscribe_snapshots();
+
+    assert!(parent.terminalize_child(
+        &nested.member,
+        Exit::never_started(),
+        None,
+        StartupDisposition::NotAborted,
+    ));
+    snapshots
+        .changed()
+        .await
+        .expect("no-incarnation terminal publishes the parent projection");
+
+    assert!(matches!(
+        snapshots
+            .borrow_latest()
+            .child("nested")
+            .expect("retained nested child remains resident")
+            .state,
+        ChildState::Stopped { ref exit } if matches!(exit.kind(), ExitKind::NeverStarted)
+    ));
+    assert!(matches!(
+        nested.record().state,
+        ScopeState::Stopped {
+            reason: StopReason::NeverStarted
+        }
+    ));
 }

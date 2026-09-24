@@ -16,7 +16,7 @@ use shelterwood_core::{
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{StartupError, StopReason, stop_reason_precedence},
     identity::{
-        AtomicPoisonedCounter, MembershipReconciliation, MintedMembership, ProvisionalMembership,
+        AtomicMonotonicCounter, MembershipReconciliation, MintedMembership, ProvisionalMembership,
         ScopeIdentity,
     },
     panic::{catch_panic, discard_panic},
@@ -258,7 +258,7 @@ struct ScopeObservation {
     // owner, so neither this mutex nor the observation gate may retire one.
     current_children: Mutex<Vec<ResidentChild>>,
     parent: Mutex<Option<Weak<ScopeCell>>>,
-    lifecycle_seq: AtomicPoisonedCounter,
+    lifecycle_seq: AtomicMonotonicCounter,
     lifecycle: LifecycleHub,
     snapshots: SnapshotHub,
     closed: AtomicBool,
@@ -318,7 +318,7 @@ use projection::ObservationConfig;
 pub(crate) use projection::ScopeRecord;
 
 impl ScopeCell {
-    pub(crate) fn mint_membership(&self, id: &ChildId) -> Option<MintedMembership> {
+    pub(crate) fn mint_membership(&self, id: &ChildId) -> MintedMembership {
         self.child_identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -365,7 +365,7 @@ impl ScopeCell {
                 record,
                 current_children: Mutex::new(Vec::new()),
                 parent: Mutex::new(None),
-                lifecycle_seq: AtomicPoisonedCounter::new(),
+                lifecycle_seq: AtomicMonotonicCounter::new(),
                 lifecycle: LifecycleHub::default(),
                 snapshots: SnapshotHub::default(),
                 closed: AtomicBool::new(false),
@@ -1290,7 +1290,7 @@ impl ScopeCell {
         }
     }
 
-    pub(crate) fn request_shutdown(&self) -> Option<Epoch> {
+    pub(crate) fn request_shutdown(&self) -> Epoch {
         self.with_observation_gate(|txn| {
             let control = self.lock_control(ControlPoison::Reject);
             self.request_shutdown_locked(control, txn, ControlPoison::Reject)
@@ -1302,7 +1302,7 @@ impl ScopeCell {
     /// thread that is already unwinding. The tolerance extends to the
     /// parent's control mutex, which a pending-incarnation request also
     /// writes.
-    pub(crate) fn request_shutdown_ignoring_poison(&self) -> Option<Epoch> {
+    pub(crate) fn request_shutdown_ignoring_poison(&self) -> Epoch {
         self.with_observation_gate(|txn| {
             let control = self.lock_control(ControlPoison::Ignore);
             self.request_shutdown_locked(control, txn, ControlPoison::Ignore)
@@ -1314,11 +1314,11 @@ impl ScopeCell {
         mut control: MutexGuard<'_, ScopeControl>,
         txn: &mut ObservationTxn<'_>,
         poison: ControlPoison,
-    ) -> Option<Epoch> {
+    ) -> Epoch {
         let RequestTarget {
             epoch: target,
             pending_incarnation,
-        } = control.epochs.request_target()?;
+        } = control.epochs.request_target();
         let published = control
             .shutdown
             .is_none_or(|request| request.epoch < target);
@@ -1343,7 +1343,7 @@ impl ScopeCell {
                 );
             }
         }
-        Some(target)
+        target
     }
 
     fn publish_control_event_locked(
@@ -1477,7 +1477,7 @@ impl ScopeCell {
     /// `begin_incarnation_into` is the only mint and it publishes `Starting`
     /// under the control guard,
     /// while [`Self::finish_incarnation`] always publishes `Stopped` under
-    /// that same guard, so `ScopeEpochs::Idle`/`Exhausted` can only pair with
+    /// that same guard, so `ScopeEpochs::Idle` can only pair with
     /// `Unstarted` (never begun) or `Stopped`. Together they mean the
     /// terminal-membership arm can never be the *only* reachable settlement
     /// for a scope that still owns work.
@@ -1841,9 +1841,8 @@ impl ScopeCell {
     /// therefore supplies a missing terminal projection and never replaces a
     /// published one; closure is the only effect it owns unconditionally.
     /// `total_restarts` and `startup` need no reset under this gate: an
-    /// `Unstarted` scope never charged a restart, and a startup result
-    /// installed without an incarnation (identity exhaustion) is the
-    /// structured cause `wait_started` must keep.
+    /// `Unstarted` scope never charged a restart or recorded a startup
+    /// result.
     pub(crate) fn close_never_started_body(&self) {
         self.with_observation_gate(|txn| {
             if self.observation.closed.load(Ordering::Acquire) {
@@ -1956,7 +1955,7 @@ mod tests {
                 Some(Arc::clone(&nested)),
             )));
             let mut incarnations = nested.member.take_incarnation_counter();
-            let first = incarnations.mint().expect("first incarnation available");
+            let first = incarnations.mint();
             assert!(
                 nested
                     .member
@@ -1975,7 +1974,7 @@ mod tests {
                         restart_at: None,
                     })
             );
-            let restarted = incarnations.mint().expect("restart incarnation available");
+            let restarted = incarnations.mint();
             assert!(nested.member.transition(MemberTransition::Starting {
                 incarnation: restarted,
             }));
@@ -2022,38 +2021,6 @@ mod tests {
                 "a restarted membership has spawned, so `ExitKind::NeverStarted` cannot describe its exit"
             );
         }
-    }
-
-    /// Identity exhaustion installs a structured startup failure and then
-    /// discharges the body obligation without an incarnation. The fallback
-    /// supplies the missing terminal projection without overwriting that
-    /// cause, so `wait_started` keeps reporting it.
-    #[test]
-    fn never_started_body_preserves_a_structured_startup_failure() {
-        let scope = isolated_scope("nested", ScopeFlavor::Ordered);
-        let failure = StartupFailure {
-            cause: StartupFailureCause::IdentityExhausted {
-                id: scope.member.id().clone(),
-            },
-        };
-        scope.set_startup(Err(StartupError::StartupFailed(failure)));
-
-        scope.close_never_started_body();
-
-        assert!(
-            matches!(
-                scope.record().startup,
-                Some(Err(StartupError::StartupFailed(_)))
-            ),
-            "a structured startup cause survives the never-started fallback: {:?}",
-            scope.record().startup
-        );
-        assert!(matches!(
-            scope.record().state,
-            ScopeState::Stopped {
-                reason: StopReason::NeverStarted
-            }
-        ));
     }
 
     impl Wake for GateCheckingWake {
@@ -2162,7 +2129,7 @@ mod tests {
         let mut lifecycle = root.subscribe_lifecycle();
         let member = child_member(&root, "invalid");
         let mut incarnations = member.take_incarnation_counter();
-        let incarnation = incarnations.mint().expect("incarnation available");
+        let incarnation = incarnations.mint();
         let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
         member.attach_mailbox(mailbox.clone());
         let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
@@ -2211,7 +2178,7 @@ mod tests {
         let mut lifecycle = root.subscribe_lifecycle();
         let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
         let mut incarnations = nested.member.take_incarnation_counter();
-        let incarnation = incarnations.mint().expect("incarnation available");
+        let incarnation = incarnations.mint();
         let mailbox = MailboxCell::new(
             nested.member.id().clone(),
             crate::runtime::mailbox_runtime(),
@@ -2733,10 +2700,7 @@ mod tests {
                 Some(LifecycleEventKind::Exited {
                     id: member.id().clone(),
                     membership: member.membership(),
-                    incarnation: member
-                        .take_incarnation_counter()
-                        .mint()
-                        .expect("incarnation available"),
+                    incarnation: member.take_incarnation_counter().mint(),
                     exit: Exit::failed(
                         ExitError::from(ThreadProbe(dropped)),
                         Cancellation::NotObserved,
@@ -2765,10 +2729,7 @@ mod tests {
         assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
         member.update(|record| record.stage = MemberStage::Reserved);
         let mut events = root.subscribe_lifecycle();
-        let incarnation = member
-            .take_incarnation_counter()
-            .mint()
-            .expect("incarnation available");
+        let incarnation = member.take_incarnation_counter().mint();
         let (dropped, observed) = mpsc::sync_channel(1);
         let retiring_thread = std::thread::current().id();
         let exit = Exit::failed(
@@ -3149,7 +3110,7 @@ mod tests {
         let first = scope
             .begin_incarnation(ScopeState::Starting)
             .expect("the first epoch is available");
-        assert_eq!(scope.request_shutdown(), Some(first));
+        assert_eq!(scope.request_shutdown(), first);
         assert!(scope.take_shutdown_request(first));
         assert!(!scope.take_shutdown_request(first));
         scope.force_shutdown(first);
@@ -3164,7 +3125,7 @@ mod tests {
         scope.force_shutdown(first);
         assert!(!scope.take_force_request(first));
         assert!(!scope.take_force_request(second));
-        assert_eq!(scope.request_shutdown(), Some(second));
+        assert_eq!(scope.request_shutdown(), second);
         assert!(!scope.take_shutdown_request(first));
         assert!(scope.take_shutdown_request(second));
         scope.force_shutdown(second);
@@ -3178,18 +3139,10 @@ mod tests {
         let finishing_thread = std::thread::current().id();
         let mut identity = ScopeIdentity::new();
         let root_id = ChildId::from("root");
-        let root = MemberCell::new(
-            identity
-                .mint_membership(&root_id)
-                .expect("root membership is available"),
-        );
+        let root = MemberCell::new(identity.mint_membership(&root_id));
         let scope = ScopeCell::new(root, ScopeFlavor::Ordered, ScopeIdentity::new());
         let child_id = ChildId::from("worker");
-        let child = MemberCell::new(
-            identity
-                .mint_membership(&child_id)
-                .expect("child membership is available"),
-        );
+        let child = MemberCell::new(identity.mint_membership(&child_id));
 
         let stale = scope
             .begin_incarnation(ScopeState::Starting)
@@ -3237,11 +3190,7 @@ mod tests {
     fn destructor_shutdown_tolerates_a_poisoned_control_mutex() {
         let id = ChildId::from("root");
         let mut identity = ScopeIdentity::new();
-        let member = MemberCell::new(
-            identity
-                .mint_membership(&id)
-                .expect("root membership is available"),
-        );
+        let member = MemberCell::new(identity.mint_membership(&id));
         let scope = ScopeCell::new(member, ScopeFlavor::Dynamic, ScopeIdentity::new());
 
         let poison = Arc::clone(&scope);
@@ -3253,7 +3202,7 @@ mod tests {
             .is_err()
         );
 
-        assert!(scope.request_shutdown_ignoring_poison().is_some());
+        scope.request_shutdown_ignoring_poison();
     }
 
     #[test]
@@ -3268,9 +3217,7 @@ mod tests {
 
         // No incarnation has begun, so the request targets a pending one and
         // publishes a restart-shutdown event into the parent's control.
-        let target = nested
-            .request_shutdown_ignoring_poison()
-            .expect("an idle scope targets its pending incarnation");
+        let target = nested.request_shutdown_ignoring_poison();
 
         root.control.clear_poison();
         assert_eq!(
@@ -3360,13 +3307,9 @@ mod tests {
     fn mailbox_control_wakes_are_deferred_past_the_observation_gate() {
         let id = ChildId::from("root");
         let mut identity = ScopeIdentity::new();
-        let member = MemberCell::new(
-            identity
-                .mint_membership(&id)
-                .expect("root membership is available"),
-        );
+        let member = MemberCell::new(identity.mint_membership(&id));
         let mut incarnations = member.take_incarnation_counter();
-        let incarnation = incarnations.mint().expect("incarnation available");
+        let incarnation = incarnations.mint();
         let scope = ScopeCell::new(member, ScopeFlavor::Dynamic, ScopeIdentity::new());
         let gate = scope.observation_gate();
         let mailbox = MailboxCell::<u8>::new(id, crate::runtime::mailbox_runtime());
@@ -3397,23 +3340,15 @@ mod tests {
     fn clearing_residents_detaches_the_last_mailbox_owner_after_unlock() {
         let root_id = ChildId::from("root");
         let mut root_identity = ScopeIdentity::new();
-        let root_member = MemberCell::new(
-            root_identity
-                .mint_membership(&root_id)
-                .expect("root membership is available"),
-        );
+        let root_member = MemberCell::new(root_identity.mint_membership(&root_id));
         let scope = ScopeCell::new(root_member, ScopeFlavor::Dynamic, ScopeIdentity::new());
         let gate = scope.observation_gate();
 
         let child_id = ChildId::from("child");
         let mut child_identity = ScopeIdentity::new();
-        let child = MemberCell::new(
-            child_identity
-                .mint_membership(&child_id)
-                .expect("child membership is available"),
-        );
+        let child = MemberCell::new(child_identity.mint_membership(&child_id));
         let mut incarnations = child.take_incarnation_counter();
-        let incarnation = incarnations.mint().expect("incarnation available");
+        let incarnation = incarnations.mint();
         let mailbox = MailboxCell::new(child_id, crate::runtime::mailbox_runtime());
         child.attach_mailbox(mailbox.clone());
         let actor = actor_ref_from_parts(Arc::clone(&child), Arc::clone(&mailbox));
@@ -3480,7 +3415,7 @@ mod tests {
         for id in ["first", "second"] {
             let child = child_member(&scope, id);
             let mut incarnations = child.take_incarnation_counter();
-            let incarnation = incarnations.mint().expect("incarnation available");
+            let incarnation = incarnations.mint();
             counters.push(incarnations);
             let mailbox = MailboxCell::new(child.id().clone(), crate::runtime::mailbox_runtime());
             child.attach_mailbox(mailbox.clone());

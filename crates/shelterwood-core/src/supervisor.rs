@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    Membership, MembershipStatus, PoisonedCounter, ScopeFlavor, ScopeState, StopReason,
+    Membership, MembershipStatus, MonotonicCounter, ScopeFlavor, ScopeState, StopReason,
     engine::{ChildCompletionState, ScopeLifecycle},
 };
 
@@ -237,7 +237,7 @@ pub struct SupervisorState {
     lifecycle: ScopeLifecycle,
     children: BTreeMap<ChildKey, ChildRecord>,
     child_keys: HashMap<Membership, ChildKey>,
-    keys: PoisonedCounter,
+    keys: MonotonicCounter,
     next_ordered_start: Option<ChildKey>,
     ordered_stop_cursor: Option<ChildKey>,
     ordered_stop_waiting: Option<ChildKey>,
@@ -254,7 +254,7 @@ impl SupervisorState {
             lifecycle,
             children: BTreeMap::new(),
             child_keys: HashMap::new(),
-            keys: PoisonedCounter::new(),
+            keys: MonotonicCounter::new(),
             next_ordered_start: None,
             ordered_stop_cursor: None,
             ordered_stop_waiting: None,
@@ -391,8 +391,7 @@ impl SupervisorState {
         if self.child_keys.contains_key(&membership) {
             return None;
         }
-        let raw = self.keys.mint()?;
-        let child = ChildKey(raw);
+        let child = ChildKey(self.keys.mint());
         let _ = self.children.insert(
             child,
             ChildRecord {
@@ -438,8 +437,7 @@ impl SupervisorState {
                     }
                     if !record.spawned_once {
                         // A never-spawned membership can still be terminalized
-                        // in place — incarnation exhaustion is the reachable
-                        // case. It gates ordered startup exactly as an
+                        // in place. It gates ordered startup exactly as an
                         // unstarted one does, but asking for construction that
                         // `Event::Spawned` would reject would spin settlement.
                         if record.startable() {
@@ -726,16 +724,6 @@ impl SupervisorState {
         self.hard_forced = forced;
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn exhaust_child_keys_for_test(&mut self) {
-        self.keys = PoisonedCounter::near_exhaustion();
-        assert!(self.keys.mint().is_some(), "the final child key is usable");
-        assert!(
-            self.keys.mint().is_none(),
-            "the child-key domain reaches its permanent poison state"
-        );
-    }
-
     #[cfg(test)]
     fn check_invariants(&self) {
         assert_eq!(self.children.len(), self.child_keys.len());
@@ -769,8 +757,7 @@ pub fn step(state: &mut SupervisorState, event: Event, effects: &mut Vec<Effect>
 /// exploration walk is blind to that boundary by design because admission
 /// mints an unbounded sequence of keys, so the facade test
 /// `draining_scopes_reject_admission_and_treat_removal_as_absent` pins it.
-/// This structural operation rejects only a duplicate live membership or an
-/// exhausted key domain.
+/// This structural operation rejects only a duplicate live membership.
 pub fn admit(
     state: &mut SupervisorState,
     membership: Membership,
@@ -821,7 +808,6 @@ mod tests {
             .map(|index| {
                 identity
                     .mint_membership(&ChildId::from(format!("child-{index}")))
-                    .expect("membership mints")
                     .into_pair()
                     .0
             })
@@ -1317,8 +1303,8 @@ mod tests {
     }
 
     #[test]
-    fn registration_keys_are_monotonic_and_exhaustion_is_fail_closed() {
-        let members = memberships(4);
+    fn registration_keys_are_monotonic_and_never_reused() {
+        let members = memberships(2);
         let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::running());
         let first = admit(&mut state, members[0], false);
         step(
@@ -1334,16 +1320,6 @@ mod tests {
         step(&mut state, Event::Reclaim { child: first }, &mut Vec::new());
         let successor = admit(&mut state, members[1], false);
         assert!(successor > first, "reclaim never makes a key reusable");
-
-        state.keys = PoisonedCounter::near_exhaustion();
-        let last = admit(&mut state, members[2], false);
-        assert_eq!(last, ChildKey(u64::MAX - 1));
-        assert_eq!(super::admit(&mut state, members[3], false), None);
-        assert_eq!(state.key_for(members[3]), None);
-        assert!(
-            super::admit(&mut state, members[3], false).is_none(),
-            "poisoned exhaustion remains fail closed"
-        );
         state.check_invariants();
     }
 

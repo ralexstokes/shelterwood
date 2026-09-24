@@ -24,7 +24,6 @@ fn memberships(count: usize) -> Vec<Membership> {
         .map(|index| {
             identity
                 .mint_membership(&ChildId::from(format!("child-{index}")))
-                .expect("the benchmark membership domain remains available")
                 .into_pair()
                 .0
         })

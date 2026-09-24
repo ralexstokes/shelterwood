@@ -93,8 +93,7 @@ macro_rules! impl_common_builder_surface {
         /// # Errors
         ///
         /// Fails with [`StaticReserveError::EmptyId`] or
-        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
-        /// with [`StaticReserveError::IdentityExhausted`].
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable.
         pub fn reserve_actor<M: Send + 'static>(
             &mut self,
             id: impl Into<ChildId>,
@@ -108,8 +107,7 @@ macro_rules! impl_common_builder_surface {
         /// # Errors
         ///
         /// Fails with [`StaticReserveError::EmptyId`] or
-        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
-        /// with [`StaticReserveError::IdentityExhausted`].
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable.
         pub fn add_actor<A: crate::Actor>(
             &mut self,
             id: impl Into<ChildId>,
@@ -124,8 +122,7 @@ macro_rules! impl_common_builder_surface {
         /// # Errors
         ///
         /// Fails with [`StaticReserveError::EmptyId`] or
-        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
-        /// with [`StaticReserveError::IdentityExhausted`].
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable.
         pub fn add_actor_once<A: crate::Actor>(
             &mut self,
             id: impl Into<ChildId>,
@@ -140,8 +137,7 @@ macro_rules! impl_common_builder_surface {
         /// # Errors
         ///
         /// Fails with [`StaticReserveError::EmptyId`] or
-        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
-        /// with [`StaticReserveError::IdentityExhausted`].
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable.
         pub fn add_raw<R: crate::RawActor>(
             &mut self,
             id: impl Into<ChildId>,
@@ -156,8 +152,7 @@ macro_rules! impl_common_builder_surface {
         /// # Errors
         ///
         /// Fails with [`StaticReserveError::EmptyId`] or
-        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
-        /// with [`StaticReserveError::IdentityExhausted`].
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable.
         pub fn add_raw_once<R: crate::RawActor>(
             &mut self,
             id: impl Into<ChildId>,
@@ -172,8 +167,7 @@ macro_rules! impl_common_builder_surface {
         /// # Errors
         ///
         /// Fails with [`StaticReserveError::EmptyId`] or
-        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
-        /// with [`StaticReserveError::IdentityExhausted`].
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable.
         pub fn reserve_task(
             &mut self,
             id: impl Into<ChildId>,
@@ -187,8 +181,7 @@ macro_rules! impl_common_builder_surface {
         /// # Errors
         ///
         /// Fails with [`StaticReserveError::EmptyId`] or
-        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
-        /// with [`StaticReserveError::IdentityExhausted`].
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable.
         pub fn add_task(
             &mut self,
             id: impl Into<ChildId>,
@@ -203,8 +196,7 @@ macro_rules! impl_common_builder_surface {
         /// # Errors
         ///
         /// Fails with [`StaticReserveError::EmptyId`] or
-        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
-        /// with [`StaticReserveError::IdentityExhausted`].
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable.
         pub fn add_task_once<T: Send + 'static>(
             &mut self,
             id: impl Into<ChildId>,
@@ -219,8 +211,7 @@ macro_rules! impl_common_builder_surface {
         /// # Errors
         ///
         /// Fails with [`StaticReserveError::EmptyId`] or
-        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
-        /// with [`StaticReserveError::IdentityExhausted`].
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable.
         pub fn reserve_subtree<T: Subtree>(
             &mut self,
             id: impl Into<ChildId>,
@@ -234,8 +225,7 @@ macro_rules! impl_common_builder_surface {
         /// # Errors
         ///
         /// Fails with [`StaticReserveError::EmptyId`] or
-        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
-        /// with [`StaticReserveError::IdentityExhausted`].
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable.
         pub fn add_subtree<T: Subtree>(
             &mut self,
             id: impl Into<ChildId>,
@@ -250,8 +240,7 @@ macro_rules! impl_common_builder_surface {
         /// # Errors
         ///
         /// Fails with [`StaticReserveError::EmptyId`] or
-        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
-        /// with [`StaticReserveError::IdentityExhausted`].
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable.
         pub fn add_subtree_once<T: Subtree>(
             &mut self,
             id: impl Into<ChildId>,
@@ -451,12 +440,7 @@ fn spawn_builder<R>(
     let root = Arc::clone(&core.root);
     let plan = core
         .lower(ResolvedDefaults::default(), None)
-        .map_err(|error| match error {
-            LowerError::Undefined { paths, .. } => BuildError::UnfilledReservations { paths },
-            LowerError::IdentityExhausted { .. } => {
-                unreachable!("root lowering does not mint memberships")
-            }
-        })?;
+        .map_err(|LowerError { paths, .. }| BuildError::UnfilledReservations { paths })?;
     let scope_ref = ScopeRef { cell: root };
     let run = crate::driver::spawn_system(plan);
     Ok(System {

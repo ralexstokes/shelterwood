@@ -11,7 +11,7 @@ use shelterwood_core::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartAttempt, RestartCount, RestartPolicy,
     Retention, Strategy, TotalRestarts,
     engine::{MembershipStatus, ScopeState},
-    identity::PoisonedCounter,
+    identity::MonotonicCounter,
     policy::ScopeFlavor,
 };
 
@@ -34,10 +34,6 @@ const _: () = assert!(LIFECYCLE_EVENT_CAPACITY.is_power_of_two());
 pub struct LifecycleSeq(u64);
 
 impl LifecycleSeq {
-    /// Permanent watermark used after the lifecycle sequence space is
-    /// exhausted. This value is never assigned to an event.
-    pub const EXHAUSTED: Self = Self(u64::MAX);
-
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
@@ -495,7 +491,7 @@ pub(crate) struct SnapshotHub {
 #[derive(Clone, Debug)]
 struct SnapshotHubState {
     snapshot: RetainedScopeSnapshot,
-    generation: PoisonedCounter,
+    generation: MonotonicCounter,
     closed: bool,
 }
 
@@ -503,7 +499,7 @@ impl SnapshotHubState {
     fn new(snapshot: RetainedScopeSnapshot, closed: bool) -> Self {
         Self {
             snapshot,
-            generation: PoisonedCounter::new(),
+            generation: MonotonicCounter::new(),
             closed,
         }
     }
@@ -530,7 +526,6 @@ fn install_snapshot(
 ) -> Vec<Box<dyn FnOnce()>> {
     let mut retired = None;
     let mut modified = false;
-    let mut generation_exhausted = false;
     if snapshot.is_some() {
         sender.modify_silently(|state| {
             if state.closed {
@@ -542,8 +537,8 @@ fn install_snapshot(
                     .take()
                     .expect("a snapshot is installed at most once"),
             ));
-            if policy.mint_generation && state.generation.mint().is_none() {
-                generation_exhausted = true;
+            if policy.mint_generation {
+                state.generation.mint();
             }
             state.closed = closed;
             modified = true;
@@ -556,9 +551,6 @@ fn install_snapshot(
     }
     if let Some(retired) = retired {
         effects.push(Box::new(move || drop(retired)));
-    }
-    if generation_exhausted {
-        effects.push(Box::new(|| panic!("snapshot generation space exhausted")));
     }
     if modified && policy.pulse {
         let sender = sender.clone();
@@ -660,8 +652,8 @@ impl SnapshotPublication {
     /// Builds and installs this hub's final cut while the gate is still held.
     ///
     /// Every user-bearing value leaves through `effects`: the spent producer
-    /// with its capture of the publishing scope, the projection this one
-    /// displaces, and the generation-exhaustion panic. The producer runs
+    /// with its capture of the publishing scope and the projection this one
+    /// displaces. The producer runs
     /// before the watch's own lock is taken, so building a cut — which walks
     /// the resident tree — never nests that tree's locks inside the watch.
     pub(crate) fn install(&mut self, txn: &mut ObservationTxn<'_>) {
@@ -691,10 +683,9 @@ impl SnapshotHub {
     /// No wake is owed for the receiverless refresh below: the gate is what
     /// makes it safe, and the only receiver that could observe the refresh is
     /// the one minted here — which captures the refreshed generation as
-    /// already seen. The displaced projection, the caller's own projection
-    /// wherever it goes uninstalled, and a generation-exhaustion panic are
-    /// still deferred through the transaction so retirement and panic
-    /// resumption happen after that gate is unlocked.
+    /// already seen. The displaced projection and the caller's own projection
+    /// wherever it goes uninstalled are still deferred through the
+    /// transaction so their retirement happens after that gate is unlocked.
     ///
     /// Requiring the transaction also makes "hub initialization and the
     /// receiverless refresh are serialized against publication" a static
@@ -858,12 +849,6 @@ pub enum LifecycleTryRecvError {
 pub struct LifecycleEvents {
     events: runtime::BroadcastReceiver<RetainedLifecycleEvent>,
     signal: runtime::WatchReceiver<LifecycleSignal>,
-    seen_explicit_lag: u64,
-    // Total fallback for a broadcast implementation that returns an item
-    // despite reporting a length beyond its effective capacity. The explicit
-    // marker remains first and the retained event is not destroyed on an
-    // invariant-panic stack.
-    pending: Option<RetainedLifecycleEvent>,
 }
 
 impl LifecycleEvents {
@@ -881,35 +866,7 @@ impl LifecycleEvents {
 
     /// Attempts to receive without waiting.
     pub fn try_recv(&mut self) -> Result<LifecycleItem, LifecycleTryRecvError> {
-        // The marker leads the overflow episode deliberately. A consumer
-        // snapshots here, then discards retained events at or below that
-        // watermark before applying the newer suffix.
         let signal = self.signal.borrow_cloned();
-        let current_explicit_lag = signal.explicit_lag;
-        if current_explicit_lag != self.seen_explicit_lag {
-            let mut dropped = current_explicit_lag.saturating_sub(self.seen_explicit_lag);
-            self.seen_explicit_lag = current_explicit_lag;
-            // Do not pull a retained event forward across this marker. It
-            // must remain in the bounded ring so a later overflow can still
-            // evict the oldest unread event. Tokio guarantees the next read
-            // reports lag when `len` exceeds the effective capacity; 128 is
-            // already a power of two, so the effective capacity is exact.
-            if self.pending.is_none() && self.events.len() > LIFECYCLE_EVENT_CAPACITY {
-                match self.events.try_receive() {
-                    runtime::BroadcastReceive::Lagged(overflow) => {
-                        dropped = dropped.saturating_add(overflow);
-                    }
-                    runtime::BroadcastReceive::Item(event) => {
-                        self.pending = Some(event);
-                    }
-                    runtime::BroadcastReceive::Empty | runtime::BroadcastReceive::Closed => {}
-                }
-            }
-            return Ok(LifecycleItem::Lagged { dropped });
-        }
-        if let Some(event) = self.pending.take() {
-            return Ok(LifecycleItem::Event(event.into_public()));
-        }
         match self.events.try_receive() {
             runtime::BroadcastReceive::Item(event) => Ok(LifecycleItem::Event(event.into_public())),
             runtime::BroadcastReceive::Lagged(dropped) => Ok(LifecycleItem::Lagged { dropped }),
@@ -924,10 +881,7 @@ impl fmt::Debug for LifecycleEvents {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LifecycleEvents")
-            .field(
-                "queued",
-                &(self.events.len() + usize::from(self.pending.is_some())),
-            )
+            .field("queued", &self.events.len())
             .finish_non_exhaustive()
     }
 }
@@ -939,10 +893,6 @@ pub(crate) struct LifecycleHub {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct LifecycleSignal {
-    // A diagnostic-only loss total. Saturation deliberately preserves the
-    // strongest possible "at least this many" report; it never routes an
-    // event or identifies storage.
-    explicit_lag: u64,
     closed: bool,
 }
 
@@ -960,13 +910,9 @@ impl LifecycleHub {
     /// Requiring the transaction makes the signal snapshot and broadcast
     /// subscription atomic with publication by construction.
     pub(crate) fn subscribe(&self, _txn: &mut ObservationTxn<'_>) -> LifecycleEvents {
-        let signal = self.signal.watcher();
-        let seen_explicit_lag = signal.borrow_cloned().explicit_lag;
         LifecycleEvents {
             events: self.events.subscribe(),
-            signal,
-            seen_explicit_lag,
-            pending: None,
+            signal: self.signal.watcher(),
         }
     }
 
@@ -1022,27 +968,6 @@ impl LifecycleHub {
         if let Some(undelivered) = undelivered {
             txn.defer(move || drop(undelivered));
         }
-        if published {
-            txn.pulse(&self.signal);
-        }
-    }
-
-    /// Publishes an explicit lag marker under the observation gate.
-    pub(crate) fn publish_lagged(&self, txn: &mut ObservationTxn<'_>, dropped: u64) {
-        // A later subscriber baselines `seen_explicit_lag`, so loss accrued
-        // before that subscription cannot be observed and need not mutate the
-        // retained signal state.
-        if !self.has_receivers() {
-            return;
-        }
-        let mut published = false;
-        self.signal.modify_silently(|signal| {
-            if signal.closed {
-                return;
-            }
-            signal.explicit_lag = signal.explicit_lag.saturating_add(dropped);
-            published = true;
-        });
         if published {
             txn.pulse(&self.signal);
         }
@@ -1110,8 +1035,7 @@ mod tests {
 
     use crate::runtime;
     use shelterwood_core::{
-        Cancellation, ChildId, Exit, ExitError, Intensity, TotalRestarts,
-        identity::{PoisonedCounter, ScopeIdentity},
+        Cancellation, ChildId, Exit, ExitError, Intensity, TotalRestarts, identity::ScopeIdentity,
         policy::ScopeFlavor,
     };
 
@@ -1121,10 +1045,7 @@ mod tests {
     };
     use shelterwood_core::{ScopeState, StopReason};
 
-    use super::{
-        LIFECYCLE_EVENT_CAPACITY, LifecycleHub, LifecycleSeq, ObservationTxn,
-        RetainedScopeSnapshot, SnapshotHub,
-    };
+    use super::{LifecycleHub, LifecycleSeq, ObservationTxn, RetainedScopeSnapshot, SnapshotHub};
 
     fn snapshot(state: ScopeState) -> RetainedScopeSnapshot {
         RetainedScopeSnapshot::new(
@@ -1186,34 +1107,6 @@ mod tests {
             .read_with(|state| state.generation.current());
         assert_eq!(generation, 0);
         drop(receiver);
-    }
-
-    #[test]
-    fn receiverless_generation_exhaustion_is_deferred_until_commit() {
-        let hub = SnapshotHub::default();
-        let mut txn = ObservationTxn::detached();
-        let receiver = hub.subscribe(snapshot(ScopeState::Unstarted), &mut txn);
-        drop(txn);
-        drop(receiver);
-
-        let sender = hub.sender.get().expect("subscription initializes the hub");
-        sender.modify_silently(|state| {
-            state.generation = PoisonedCounter::near_exhaustion();
-        });
-
-        let mut txn = ObservationTxn::detached();
-        let receiver = hub.subscribe(snapshot(ScopeState::Starting), &mut txn);
-        drop(txn);
-        drop(receiver);
-
-        let mut txn = ObservationTxn::detached();
-        let receiver = hub.subscribe(snapshot(ScopeState::Running), &mut txn);
-        assert_eq!(receiver.borrow_latest().state, ScopeState::Running);
-        drop(receiver);
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| drop(txn))).is_err(),
-            "generation exhaustion must resume only when the transaction commits"
-        );
     }
 
     #[test]
@@ -1536,7 +1429,6 @@ mod tests {
         let mut identity = ScopeIdentity::new();
         let (membership, mut incarnations) = identity
             .mint_membership(&ChildId::from("scope"))
-            .expect("membership available")
             .into_pair();
         let (dropped, observed) = mpsc::sync_channel(1);
         let event = LifecycleEvent {
@@ -1546,7 +1438,7 @@ mod tests {
             kind: LifecycleEventKind::Exited {
                 id: ChildId::from("worker"),
                 membership,
-                incarnation: incarnations.mint().expect("incarnation available"),
+                incarnation: incarnations.mint(),
                 exit: Exit::failed(
                     ExitError::from(DropSignal(dropped)),
                     Cancellation::NotObserved,
@@ -1579,26 +1471,10 @@ mod tests {
     }
 
     #[test]
-    fn receiverless_lifecycle_lag_is_not_retained() {
-        let hub = LifecycleHub::default();
-        let mut txn = ObservationTxn::detached();
-
-        hub.publish_lagged(&mut txn, 5);
-        drop(txn);
-
-        assert_eq!(
-            hub.signal.read_with(|signal| signal.explicit_lag),
-            0,
-            "lag before any subscription is outside every subscriber's history"
-        );
-    }
-
-    #[test]
     fn lifecycle_publication_after_close_appends_nothing() {
         let mut identity = ScopeIdentity::new();
         let membership = identity
             .mint_membership(&ChildId::from("scope"))
-            .expect("membership available")
             .membership();
         let hub = LifecycleHub::default();
         let mut txn = ObservationTxn::detached();
@@ -1625,88 +1501,10 @@ mod tests {
     }
 
     #[test]
-    fn a_retained_event_after_explicit_lag_remains_subject_to_later_overflow() {
-        let mut identity = ScopeIdentity::new();
-        let membership = identity
-            .mint_membership(&ChildId::from("scope"))
-            .expect("membership available")
-            .membership();
-        let event = |seq| LifecycleEvent {
-            scope_path: Vec::new(),
-            scope: membership,
-            seq: LifecycleSeq::new(seq),
-            kind: LifecycleEventKind::ScopeState {
-                state: ScopeState::Running,
-            },
-        };
-        let hub = LifecycleHub::default();
-        let mut txn = ObservationTxn::detached();
-        let mut events = hub.subscribe(&mut txn);
-        hub.publish_lagged(&mut txn, 1);
-        hub.publish(&mut txn, event(1));
-        drop(txn);
-        assert_eq!(events.try_recv(), Ok(LifecycleItem::Lagged { dropped: 1 }));
-
-        let mut txn = ObservationTxn::detached();
-        for seq in 2..=(LIFECYCLE_EVENT_CAPACITY as u64 + 2) {
-            hub.publish(&mut txn, event(seq));
-        }
-        drop(txn);
-        assert_eq!(
-            events.try_recv(),
-            Ok(LifecycleItem::Lagged { dropped: 2 }),
-            "the prior retained event and the next oldest event are both evicted"
-        );
-        let LifecycleItem::Event(first_retained) =
-            events.try_recv().expect("the retained suffix follows lag")
-        else {
-            panic!("expected the retained suffix");
-        };
-        assert_eq!(first_retained.seq.get(), 3);
-    }
-
-    #[test]
-    fn explicit_lag_and_ring_overflow_fold_into_one_leading_marker() {
-        let mut identity = ScopeIdentity::new();
-        let membership = identity
-            .mint_membership(&ChildId::from("scope"))
-            .expect("membership available")
-            .membership();
-        let event = |seq| LifecycleEvent {
-            scope_path: Vec::new(),
-            scope: membership,
-            seq: LifecycleSeq::new(seq),
-            kind: LifecycleEventKind::ScopeState {
-                state: ScopeState::Running,
-            },
-        };
-        let hub = LifecycleHub::default();
-        let mut txn = ObservationTxn::detached();
-        let mut events = hub.subscribe(&mut txn);
-        hub.publish_lagged(&mut txn, 5);
-        for seq in 1..=(LIFECYCLE_EVENT_CAPACITY as u64 + 3) {
-            hub.publish(&mut txn, event(seq));
-        }
-        drop(txn);
-
-        assert_eq!(
-            events.try_recv(),
-            Ok(LifecycleItem::Lagged { dropped: 8 }),
-            "the explicit loss and three ring evictions form one leading marker"
-        );
-        assert_eq!(
-            events.try_recv(),
-            Ok(LifecycleItem::Event(event(4))),
-            "folding lag does not consume the retained suffix"
-        );
-    }
-
-    #[test]
     fn lifecycle_close_drains_the_queued_prefix_and_rejects_late_publication() {
         let mut identity = ScopeIdentity::new();
         let membership = identity
             .mint_membership(&ChildId::from("scope"))
-            .expect("membership available")
             .membership();
         let event = |seq| LifecycleEvent {
             scope_path: Vec::new(),
@@ -1719,14 +1517,11 @@ mod tests {
         let hub = LifecycleHub::default();
         let mut txn = ObservationTxn::detached();
         let mut events = hub.subscribe(&mut txn);
-        hub.publish_lagged(&mut txn, 2);
         hub.publish(&mut txn, event(1));
         hub.close(&mut txn);
-        hub.publish_lagged(&mut txn, 3);
         hub.publish(&mut txn, event(2));
         drop(txn);
 
-        assert_eq!(events.try_recv(), Ok(LifecycleItem::Lagged { dropped: 2 }));
         assert_eq!(events.try_recv(), Ok(LifecycleItem::Event(event(1))));
         assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
         let mut txn = ObservationTxn::detached();

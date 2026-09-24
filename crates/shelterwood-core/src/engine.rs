@@ -11,7 +11,7 @@ use crate::{
     RestartCount, RestartPolicy, Shutdown, TotalRestarts,
     deadline::Deadline,
     exit::{StopReason, stop_reason_precedence},
-    identity::PoisonedCounter,
+    identity::MonotonicCounter,
     policy::{ScopeFlavor, tidy_abort_beat},
 };
 
@@ -599,11 +599,8 @@ impl Default for ReadinessGate {
 /// targets the next incarnation before any driver has begun it.
 ///
 /// Epochs are minted per scope in strictly increasing order starting at
-/// `Epoch::FIRST`, and `u64::MAX` is never minted (`Epoch::successor`
-/// reserves it to poison [`ScopeEpochs`] exhaustion). Plain ordering is
-/// therefore total over every minted epoch, so `Epoch` derives `Ord` where
-/// identity generations instead guard their in-band poison with `supersedes`.
-/// Unlike an incarnation identity, an epoch carries no scope tag, so ordering
+/// `Epoch::FIRST`, so plain ordering is total over every minted epoch and
+/// `Epoch` derives `Ord`. Unlike an incarnation identity, an epoch carries no scope tag, so ordering
 /// is meaningful only between epochs of one scope; every comparison site
 /// draws both operands from that scope's own control plane.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -614,14 +611,12 @@ impl Epoch {
     const FIRST: Self = Self(1);
 
     /// The epoch minted after `previous`, or the first with no predecessor.
-    fn after(previous: Option<Self>) -> Option<Self> {
-        previous.map_or(Some(Self::FIRST), Self::successor)
+    fn after(previous: Option<Self>) -> Self {
+        previous.map_or(Self::FIRST, Self::successor)
     }
 
-    /// The next mintable epoch. `None` reserves `u64::MAX` as the poison so
-    /// no observable epoch can alias permanent exhaustion.
-    fn successor(self) -> Option<Self> {
-        PoisonedCounter::minted_after(self.0).map(Self)
+    fn successor(self) -> Self {
+        Self(MonotonicCounter::successor(self.0))
     }
 }
 
@@ -645,9 +640,6 @@ pub enum ScopeEpochs {
         current: Epoch,
         last_stopped: Option<Epoch>,
     },
-    Exhausted {
-        last_stopped: Option<Epoch>,
-    },
 }
 
 impl Default for ScopeEpochs {
@@ -663,12 +655,9 @@ impl ScopeEpochs {
             // One scope cell cannot own two simultaneous drivers. Rejecting
             // a second begin also prevents it from invalidating the live
             // driver's epoch while trying to advance the counter.
-            Self::Live { .. } | Self::Exhausted { .. } => return None,
+            Self::Live { .. } => return None,
         };
-        let Some(current) = Epoch::after(last_stopped) else {
-            *self = Self::Exhausted { last_stopped };
-            return None;
-        };
+        let current = Epoch::after(last_stopped);
         *self = Self::Live {
             current,
             last_stopped,
@@ -689,22 +678,21 @@ impl ScopeEpochs {
 
     pub fn live_epoch(self) -> Option<Epoch> {
         match self {
-            Self::Idle { .. } | Self::Exhausted { .. } => None,
+            Self::Idle { .. } => None,
             Self::Live { current, .. } => Some(current),
         }
     }
 
-    pub fn request_target(self) -> Option<RequestTarget> {
+    pub fn request_target(self) -> RequestTarget {
         match self {
-            Self::Live { current, .. } => Some(RequestTarget {
+            Self::Live { current, .. } => RequestTarget {
                 epoch: current,
                 pending_incarnation: false,
-            }),
-            Self::Idle { last_stopped } => Epoch::after(last_stopped).map(|epoch| RequestTarget {
-                epoch,
+            },
+            Self::Idle { last_stopped } => RequestTarget {
+                epoch: Epoch::after(last_stopped),
                 pending_incarnation: true,
-            }),
-            Self::Exhausted { .. } => None,
+            },
         }
     }
 
@@ -727,7 +715,7 @@ impl ScopeEpochs {
                 );
                 true
             }
-            Self::Idle { .. } | Self::Live { .. } | Self::Exhausted { .. } => false,
+            Self::Idle { .. } | Self::Live { .. } => false,
         }
     }
 
@@ -741,9 +729,7 @@ impl ScopeEpochs {
 
     pub fn finished(self, epoch: Epoch) -> bool {
         match self {
-            Self::Idle { last_stopped }
-            | Self::Live { last_stopped, .. }
-            | Self::Exhausted { last_stopped } => {
+            Self::Idle { last_stopped } | Self::Live { last_stopped, .. } => {
                 last_stopped.is_some_and(|last_stopped| last_stopped >= epoch)
             }
         }
@@ -973,7 +959,7 @@ impl Ord for DeadlineEntry {
 pub struct DeadlineQueue<K> {
     // Keys are both registration identity and equal-deadline arming order.
     // They are never reused, so a stale handle can only miss.
-    registration_ids: PoisonedCounter,
+    registration_ids: MonotonicCounter,
     entries: BinaryHeap<DeadlineEntry>,
     registrations: BTreeMap<DeadlineHandle, K>,
 }
@@ -991,7 +977,7 @@ struct DeadlineEntry {
 impl<K> Default for DeadlineQueue<K> {
     fn default() -> Self {
         Self {
-            registration_ids: PoisonedCounter::new(),
+            registration_ids: MonotonicCounter::new(),
             entries: BinaryHeap::new(),
             registrations: BTreeMap::new(),
         }
@@ -1030,11 +1016,7 @@ impl<K> DeadlineQueue<K> {
     }
 
     fn next_handle(&mut self) -> DeadlineHandle {
-        let next = self
-            .registration_ids
-            .mint()
-            .expect("deadline key space exhausted");
-        DeadlineHandle(next)
+        DeadlineHandle(self.registration_ids.mint())
     }
 
     fn take(&mut self, handle: DeadlineHandle) -> Option<K> {
@@ -1082,7 +1064,6 @@ impl<K> DeadlineQueue<K> {
 #[cfg(test)]
 mod tests {
     use std::{
-        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1093,16 +1074,14 @@ mod tests {
     use crate::{
         Cancellation, Exit, ExitKind, GracePhase, Intensity, JitterSample, RestartAttempt,
         RestartCondition, RestartCount, RestartPolicy, Shutdown, TotalRestarts,
-        identity::PoisonedCounter,
         policy::{Backoff, ScopeFlavor},
     };
 
     use super::{
-        ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
-        IncarnationRun, IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent,
-        ReadinessGate, RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode,
-        ScopeState, StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart,
-        tidy_abort_beat,
+        ArbitrationClass, ChildCompletionState, DeadlineQueue, Epoch, ExitDispatch, IncarnationRun,
+        IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent, ReadinessGate,
+        RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode, ScopeState,
+        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
     };
 
     #[test]
@@ -1843,8 +1822,8 @@ mod tests {
             within: Duration::from_secs(10),
         };
         let startup_failure = crate::StartupFailure {
-            cause: crate::StartupFailureCause::IdentityExhausted {
-                id: crate::ChildId::from("worker"),
+            cause: crate::StartupFailureCause::Lowering {
+                undefined: vec![crate::ChildId::from("worker")],
             },
         };
         let mut lifecycle = ScopeLifecycle::running();
@@ -1909,7 +1888,7 @@ mod tests {
             "an idle scope has no current epoch"
         );
         let first = epochs.begin().expect("first epoch is available");
-        let unminted = first.successor().expect("a successor epoch is available");
+        let unminted = first.successor();
         assert!(epochs.is_current(first));
         assert!(
             !epochs.is_current(unminted),
@@ -1928,36 +1907,29 @@ mod tests {
             !epochs.is_current(first),
             "a stale epoch is not current under a later live incarnation"
         );
-
-        let mut exhausted = ScopeEpochs::Exhausted {
-            last_stopped: Some(first),
-        };
-        assert_eq!(exhausted.begin(), None);
-        assert!(!exhausted.is_current(first));
-        assert!(!exhausted.is_current(second));
     }
 
     #[test]
-    fn scope_epoch_exhaustion_is_poisoned_without_minting_or_reuse() {
+    fn scope_epochs_mint_in_order_and_settle_monotonically() {
         let mut epochs = ScopeEpochs::default();
         assert_eq!(
             epochs.request_target(),
-            Some(RequestTarget {
+            RequestTarget {
                 epoch: Epoch(1),
                 pending_incarnation: true,
-            })
+            }
         );
         let first = epochs.begin().expect("first epoch is available");
         assert_eq!(epochs.live_epoch(), Some(first));
         assert_eq!(
             epochs.request_target(),
-            Some(RequestTarget {
+            RequestTarget {
                 epoch: first,
                 pending_incarnation: false,
-            })
+            }
         );
         assert_eq!(epochs.begin(), None, "a live epoch cannot be replaced");
-        let unminted = first.successor().expect("a successor epoch is available");
+        let unminted = first.successor();
         assert!(!epochs.request_is_pending(first));
         assert!(!epochs.request_is_pending(unminted));
         assert!(!epochs.finished(first));
@@ -1969,27 +1941,6 @@ mod tests {
         assert_eq!(epochs.live_epoch(), None);
         assert!(epochs.finished(first));
         assert!(epochs.request_is_pending(unminted));
-
-        let mut exhausted = ScopeEpochs::Idle {
-            last_stopped: Some(Epoch(u64::MAX - 2)),
-        };
-        let last = exhausted.begin().expect("last non-poison epoch");
-        assert_eq!(last, Epoch(u64::MAX - 1));
-        assert!(exhausted.finish(last));
-        assert_eq!(
-            exhausted.request_target(),
-            None,
-            "an idle request cannot address the reserved poison epoch"
-        );
-        assert_eq!(exhausted.begin(), None, "MAX is reserved as poison");
-        assert_eq!(exhausted.live_epoch(), None);
-        assert_eq!(exhausted.request_target(), None);
-        assert_eq!(exhausted.begin(), None, "poisoning is permanent");
-        assert!(!exhausted.request_is_pending(last));
-        assert!(!exhausted.request_is_pending(Epoch(u64::MAX)));
-        assert!(exhausted.finished(last));
-        assert!(!exhausted.finished(Epoch(u64::MAX)));
-        assert!(!exhausted.finish(Epoch(u64::MAX)));
     }
 
     #[test]
@@ -2069,35 +2020,6 @@ mod tests {
         );
         drop(deadlines);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn deadline_key_exhaustion_never_mints_poison_or_reuses_a_key() {
-        let now = Instant::now();
-        let mut deadlines = DeadlineQueue {
-            registration_ids: PoisonedCounter::near_exhaustion(),
-            ..DeadlineQueue::default()
-        };
-        let last = deadlines.push(now, "last usable");
-        assert_eq!(last, DeadlineHandle(u64::MAX - 1));
-        assert!(deadlines.cancel(last));
-
-        let first_exhausted = catch_unwind(AssertUnwindSafe(|| deadlines.push(now, "poison")));
-        assert!(first_exhausted.is_err(), "the poison key is never minted");
-        assert!(deadlines.registration_ids.is_poisoned());
-        assert!(
-            !deadlines
-                .registrations
-                .contains_key(&DeadlineHandle(u64::MAX))
-        );
-
-        let still_exhausted = catch_unwind(AssertUnwindSafe(|| deadlines.push(now, "wrapped")));
-        assert!(
-            still_exhausted.is_err(),
-            "the exhausted domain stays poisoned"
-        );
-        assert!(deadlines.registrations.is_empty());
-        assert!(deadlines.entries.is_empty());
     }
 
     #[test]

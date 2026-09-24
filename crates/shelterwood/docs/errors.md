@@ -59,7 +59,7 @@ response wait.
 ## The rest of the error surface, briefly
 
 - **Declaration and admission** — `StaticReserveError` (empty or duplicate
-  id, identity exhaustion) for pre-spawn tree declarations; `ReserveError`
+  id) for pre-spawn tree declarations; `ReserveError`
   (those common id failures plus in-removal ids, unavailable runtime, and a
   scope not admitting: `NotAdmittingCause`) for live dynamic admission;
   `BuildError` (root lowering); `PolicyError` (invalid policy data, rejected

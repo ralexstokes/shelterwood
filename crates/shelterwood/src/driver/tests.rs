@@ -1,7 +1,6 @@
 mod construction;
 mod dynamic;
 mod events;
-mod exhaustion;
 mod observation;
 mod payload;
 mod reports;

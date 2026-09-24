@@ -46,7 +46,7 @@ use crate::{
     },
     exit::{
         RecordedOutcome, StartupError, StopReason, stop_reason_into_nested_result,
-        stop_reason_root_exit, structured_startup_failure_error,
+        stop_reason_root_exit,
     },
     identity::IncarnationCounter,
     mailbox::{MailboxBindToken, MailboxControl, MailboxEffectQueue},
@@ -356,9 +356,9 @@ impl Drop for SystemRun {
         if self.driver_joined {
             return;
         }
-        // After a clean shutdown the root epochs are `Idle`, not `Exhausted`,
-        // so this writes a real `ScopeRequest` — targeting the pending next
-        // incarnation — into dead control state and pulses the member record.
+        // After a clean shutdown the root epochs are `Idle`, so this writes a
+        // real `ScopeRequest` — targeting the pending next incarnation — into
+        // dead control state and pulses the member record.
         // That stays harmless only while watchers tolerate spurious wakes and
         // the driver we already joined was the sole consumer of scope
         // requests; nothing may come to treat a post-shutdown request as
@@ -1032,9 +1032,12 @@ impl ScopeRuntime {
                     let slot = Arc::clone(install.slot());
                     drop(state);
                     slot.terminalize_never_started_locked(&root, txn);
+                    // The supervisor rejects only a membership it already
+                    // holds, and a reservation mints a fresh one.
+                    let id = install.slot().member.id().clone();
                     return Err(AdmissionRejection {
                         child: install.take_child(),
-                        error: ReserveError::IdentityExhausted,
+                        error: ReserveError::DuplicateId(id),
                     });
                 }
             };
@@ -1075,8 +1078,7 @@ impl ScopeRuntime {
 ///
 /// Nested lowering can await isolated disposal before a driver exists. If
 /// that setup future is cancelled or unwinds, dropping this guard retires the
-/// epoch so a later restart cannot mistake the still-live reservation for
-/// identity exhaustion.
+/// epoch so a later restart finds an idle epoch plane to begin from.
 struct ScopeEpochGuard {
     scope: Arc<ScopeCell>,
     epoch: Option<Epoch>,
@@ -1179,14 +1181,13 @@ async fn run_nested_factory(
 }
 
 fn begin_nested_incarnation(scope: &Arc<ScopeCell>) -> Result<ScopeEpochGuard, crate::ExitError> {
+    // The previous incarnation's guard finishes its epoch before the parent
+    // can begin the next one, so the epoch plane is idle here unless the
+    // framework broke that protocol. Like the root, report that no
+    // incarnation began.
     ScopeEpochGuard::begin(scope).ok_or_else(|| {
-        let failure = StartupFailure {
-            cause: StartupFailureCause::IdentityExhausted {
-                id: scope.member.id().clone(),
-            },
-        };
-        scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
-        structured_startup_failure_error(failure)
+        debug_assert!(false, "a nested scope begins from an idle epoch plane");
+        crate::ExitError::message("nested scope never started")
     })
 }
 
@@ -1199,15 +1200,8 @@ async fn run_nested_tree_with_epoch(
 ) -> crate::ExitResult {
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
         Ok(plan) => plan,
-        Err(error) => {
-            let (cause, disposal) = match error {
-                LowerError::Undefined { paths, disposal } => {
-                    (StartupFailureCause::Lowering { undefined: paths }, disposal)
-                }
-                LowerError::IdentityExhausted { id, disposal } => {
-                    (StartupFailureCause::IdentityExhausted { id }, disposal)
-                }
-            };
+        Err(LowerError { paths, disposal }) => {
+            let cause = StartupFailureCause::Lowering { undefined: paths };
             // Lowering never created a nested driver to own teardown. Keep
             // its isolated definitions attached to this incarnation until
             // they finish; hard-aborting the incarnation still detaches the
@@ -1446,10 +1440,11 @@ async fn run_scope_incarnation(
         let _ = children.insert(key, child);
     }
     if let Some(child) = rejected_child {
-        // A fresh domain cannot exhaust for an in-memory plan, but the total
-        // fallback still owns real user constructions. Join their terminality
-        // obligations on the ordinary path, let ScopePlan retire the suffix,
-        // and finish this epoch without a framework unwind. The verdict is
+        // A plan's memberships are distinct, so the supervisor cannot reject
+        // one, but the total fallback still owns real user constructions.
+        // Join their terminality obligations on the ordinary path, let
+        // ScopePlan retire the suffix, and finish this epoch without a
+        // framework unwind. The verdict is
         // `ShutdownRequested`, not `NeverStarted`: `begin_incarnation` already
         // published `Starting`, and SPEC B.6's `NeverStarted` states that no
         // scope incarnation ever began.

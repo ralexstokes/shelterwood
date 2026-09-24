@@ -94,9 +94,7 @@ async fn blocking_primary_wake_recollects_control_removal_before_arbitration() {
     let identity = isolated_scope("identity", ScopeFlavor::Dynamic);
     let membership = identity.member.membership();
     let key = ChildKey::fixture(1);
-    let incarnation = IncarnationCounter::fixture(membership)
-        .mint()
-        .expect("fixture incarnation is available");
+    let incarnation = IncarnationCounter::fixture(membership).mint();
     let (primary, mut primary_receiver) = crate::runtime::unbounded_mpsc();
     let (control, mut control_receiver) = crate::runtime::unbounded_mpsc();
     let (_disposal, mut disposal_receiver) = crate::runtime::unbounded_mpsc();

@@ -176,31 +176,15 @@ publication, child-event handling, attachment and metadata publication.
   centrally-decided overflow policy. Bare integers MUST NOT be threaded
   positionally; `(lineage, generation)` is one value, never two adjacent
   `u64`s.
-- **The overflow policy is: fail closed.** Counters are `u64` and advance
-  by saturation; a saturated fence rejects all subsequent comparisons
-  rather than wrapping. Rationale: the two candidate policies have
-  *opposite* failure modes at the limit — wrapping makes a fence **accept
-  a stale value**, saturating makes it **reject everything forever** — and
-  for a staleness fence, rejecting is the safe failure. The limit is
-  unreachable at `u64` scale in practice; the point of deciding it here is
-  that exactly one shared primitive decides it once, instead of each
-  counter choosing independently.
-- Saturation alone would still break equality at the limit: repeated
-  minting from a saturated counter would issue the same value for distinct
-  identities, and token equality promises exact identity (§3.2). So the
-  primitive separates *advancing* from *minting*, and **the saturated
-  value is a poisoned terminal, never a minted token**: minting requires a
-  successful advance, and once the last usable value has been spent the
-  counter mints no successor. What that failure means is decided per
-  counter role, both structural and fail-closed: an unmintable
-  **incarnation** (a restart reaching exhaustion) is simply not
-  scheduled — the membership terminalizes exactly as under `Never`, its
-  last published exit standing as the terminal state; an unmintable
-  **membership** fails the reservation or admission with a distinct,
-  enumerated exhaustion rejection (the exhaustive reserve/admission errors
-  carry it, B.8). Unreachable at `u64` scale either way — the rule exists
-  so identity stays exact even in the theory, and so §16.4's fail-closed
-  property has no duplicate-token counterexample.
+- **The overflow policy is: abort.** Counters are `u64` and advance by
+  one per mint. The limit is unreachable in practice (one mint per
+  nanosecond reaches it in 584 years), and no role handles exhaustion:
+  there is no exhaustion outcome, rejection, or error variant anywhere in
+  the API. The shared primitive decides the limit once: a mint past
+  `u64::MAX` aborts the process and never wraps. Wrapping would let a
+  fence accept a stale value. An abort neither unwinds under a framework
+  lock nor runs user code, so no minted token is ever reissued and
+  identity stays exact (§3.2).
 - Inside a scope's runtime, the child address is a versioned handle whose
   **resolution is the staleness check**: resolving a stale address yields
   `None`. Per-call-site ad-hoc comparison of identity-field subsets MUST
@@ -1798,8 +1782,7 @@ Rules (normative):
   runtime, and only then reads the scope's admitting state or resident-id
   table. The error precedence is therefore `EmptyId` before `NoRuntime`,
   and `NoRuntime` before `NotAdmitting`, `RemovalInProgress`, or
-  `DuplicateId` (and before identity minting can yield
-  `IdentityExhausted`); a no-runtime rejection mints no cell and claims
+  `DuplicateId`; a no-runtime rejection mints no cell and claims
   no id. The admission future rechecks runtime availability at its first
   poll, before spawning or submitting the admission command. If a slot
   was reserved inside a runtime but its `define` future is first-polled
@@ -2929,10 +2912,11 @@ guard is released before that sink can flush. On every path a transition
 can complete — acceptance, rejection, withdrawal, terminal teardown, and
 an unwind out of any of them — no waker vtable, message destructor,
 signal callback, or runtime-disposal capability runs under either mutex.
-The one carve-out is a framework invariant break (identity-space
-exhaustion or an unreachable binding state): those unwind with the
-payload still under the guard, and they poison the mutex regardless, so
-the transition is abandoned rather than completed. The registered-waker
+The one carve-out is a framework invariant break (an unreachable binding
+state): it unwinds with the payload still under the guard and poisons the
+mutex regardless, so the transition is abandoned rather than completed.
+Identity exhaustion is not a carve-out: it aborts the process (§3.1) and
+never unwinds. The registered-waker
 slot exposes no operation that returns or replaces a waker without an
 effects sink, making an under-lock caller-code drop structurally
 unrepresentable rather than a call-site convention; cancellation returns
@@ -3105,12 +3089,8 @@ fixtures for the driver shell and end-to-end invariants.
    it; assert that different ids and different owning scopes are also
    incomparable. Repeat the fail-closed comparison check for a declared
    child replaced at runtime and for a corresponding descendant rebuilt
-   after a nested-scope restart. Exhaustion mints nothing (§3.1): drive a
-   counter to saturation and assert no duplicate token is ever issued —
-   an unmintable incarnation terminalizes the membership as under
-   `Never`; an unmintable membership is the enumerated reservation
-   rejection (B.8), or structured nested-startup provenance when a stable
-   scope cannot rebase a produced declaration. The structural half is
+   after a nested-scope restart. Counter overflow is decided in the one
+   primitive (§3.1) and is not tested per role. The structural half is
    enforced by API shape (no public bare integers) and review, not tests.
 5. **One-shot construction drops its resources exactly once across: init
    panic, startup failure, shutdown-before-start, normal exit.** One
@@ -3386,7 +3366,7 @@ feature.
 | Unified event lane | **unbounded; capped per-wake drain** | Requests are small; insertion payloads remain in producer-owned reservations. The batch cap bounds driver monopolization, not channel memory. Shutdown and `remove` ride level latches (§11, §12) |
 | Snapshot channel | conflating watch, capacity 1 | Structural |
 | `call` / `send_timeout` deadline | **none — always explicit** | One `DeadlineBudget` per call (§5.2); zero selects the no-attempt behavior |
-| Identity counters | `u64`, saturating | Fail-closed overflow, decided once in the fencing primitive (§3.1); lifecycle `seq`/`lifecycle_seq` mint through the same primitive (B.4's exhaustion rule) |
+| Identity counters | `u64`, +1 per mint | Overflow aborts, decided once in the fencing primitive (§3.1); lifecycle `seq`/`lifecycle_seq` mint through the same primitive |
 | Unrepresentable deadline | **never arrives** | `Instant + Duration` overflow or an exact point the runtime cannot arm produces no deadline; it MUST NOT substitute the budget's start or any other instant |
 
 ---
@@ -3702,25 +3682,15 @@ Ordering and delivery contract:
   authoritative. Forwarding is gated per hub, so an ancestor subscription
   still receives descendant events when the descendant itself has no
   subscriber.
-- `LifecycleSeq` exposes `get()` plus the documented `EXHAUSTED`
-  sentinel; `seq`/`lifecycle_seq` mint through §3.1's one primitive:
-  `u64`, saturating advance, the saturated value poisoned and never
-  minted. Exhaustion — unreachable at `u64` scale, pinned per §3.1's
-  decide-once rule — fails closed for observation: the scope mints no
-  further events, and each subscriber accounts the unmintable remainder
-  as ordinary `Lagged` drops (the marker carries no `seq` and needs
-  none). `snapshot()` stays authoritative, and the saturated
-  `lifecycle_seq` watermark truthfully reads "every minted event is
-  reflected", so the catch-up protocol degenerates to
-  snapshot-as-ground-truth exactly; closure at terminality then follows
-  a final `Lagged` in place of a mintable terminal event.
+- `LifecycleSeq` exposes `get()`; `seq`/`lifecycle_seq` mint through
+  §3.1's one primitive.
 - The stream ends at membership terminality, after the subscribed
-  scope's final event — closure is always preceded by one (under
-  sequence exhaustion, by the final `Lagged`), and per the restart rule
-  above a `Stopped` alone is not closure: the final `Stopped` is the one
-  no restart and no precedence upgrade follows. For a scope membership
-  that never spawns (a declaring tree dropped unspawned, a withdrawn or
-  rejected insertion, §3.2), that terminal event is
+  scope's final event — closure is always preceded by one, and per the
+  restart rule above a `Stopped` alone is not closure: the final
+  `Stopped` is the one no restart and no precedence upgrade follows. For
+  a scope membership that never spawns (a declaring tree dropped
+  unspawned, a withdrawn or rejected insertion, §3.2), that terminal
+  event is
   `ScopeState { Stopped { reason: NeverStarted } }` (B.6), published at
   terminalization, then the stream closes. Per-subscriber buffering,
   overflow, and `Lagged` coalescing are §14 / Appendix A.
@@ -3958,7 +3928,7 @@ Debug builds MAY instead assert and panic at that boundary to expose the
 internal regression instead of returning an outcome.
 
 The public `StaticReserveError` is exhaustive and contains exactly
-`EmptyId`, `DuplicateId`, and `IdentityExhausted`: pre-spawn builders
+`EmptyId` and `DuplicateId`: pre-spawn builders
 cannot observe runtime or admission state. The public dynamic
 `ReserveError` is exhaustive and includes `NoRuntime`: it
 names the absent ambient runtime at dynamic reservation or first poll,
@@ -3966,9 +3936,7 @@ with the cleanup and precedence pinned in §9. Dynamic `add_*` fails with
 exactly the union of its two halves (§9): `EmptyId`, `NoRuntime`,
 `DuplicateId` (tombstones included), and `RemovalInProgress` (same id
 mid-removal — await removal and retry) from reserve, with `NoRuntime`
-also possible at first poll — plus §3.1's enumerated identity-exhaustion
-rejection, unreachable in practice but named so fail-closed has a
-shape; `NotAdmitting` from either half. `NotAdmitting` is one outcome
+also possible at first poll; `NotAdmitting` from either half. `NotAdmitting` is one outcome
 with an enumerated, data-carried cause: the scope membership is
 terminal, its live incarnation is draining, the dynamic root is parked
 in `StartupFailed` (§9's stage rule — the park is the owner's decision
@@ -3985,7 +3953,7 @@ Defines add no definition-validation errors: validation is spent eagerly
 at spec construction (§10.3), on both flavors. A dynamic define still
 crosses §9's admission boundary, so it can return `NoRuntime` at first
 poll or `NotAdmitting`; declaration builders share the reserve id errors
-(`EmptyId`, `DuplicateId`, `IdentityExhausted`) through
+(`EmptyId`, `DuplicateId`) through
 `StaticReserveError`, require no runtime for reservation or define, and
 their defines cannot fail (§9).
 

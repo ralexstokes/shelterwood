@@ -352,12 +352,6 @@ impl fmt::Display for StartupFailure {
             StartupFailureCause::Lowering { undefined } => {
                 write!(formatter, "subtree has {} undefined slots", undefined.len())
             }
-            StartupFailureCause::IdentityExhausted { id } => {
-                write!(
-                    formatter,
-                    "membership identity space is exhausted for child `{id}`"
-                )
-            }
         }
     }
 }
@@ -373,8 +367,7 @@ impl Error for StartupFailure {
                 | ExitKind::Aborted { .. }
                 | ExitKind::NeverStarted => None,
             },
-            StartupFailureCause::Lowering { .. }
-            | StartupFailureCause::IdentityExhausted { .. } => None,
+            StartupFailureCause::Lowering { .. } => None,
         }
     }
 }
@@ -395,11 +388,6 @@ pub enum StartupFailureCause {
     Lowering {
         /// Undefined child ids relative to the subtree root.
         undefined: Vec<ChildId>,
-    },
-    /// The stable scope could mint no identity for a declared child.
-    IdentityExhausted {
-        /// Child whose stable membership could not be minted.
-        id: ChildId,
     },
 }
 
@@ -824,10 +812,7 @@ mod tests {
     fn child_startup_failure_display_summarizes_every_exit_kind() {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("worker");
-        let membership = identity
-            .mint_membership(&id)
-            .expect("membership available")
-            .membership();
+        let membership = identity.mint_membership(&id).membership();
         let deadline = Instant::now() + Duration::from_secs(1);
         let cases = [
             (
@@ -902,10 +887,7 @@ mod tests {
         let mut child_failure = |id: &str, error: ExitError| StartupFailure {
             cause: StartupFailureCause::Child {
                 id: ChildId::from(id),
-                membership: identity
-                    .mint_membership(&ChildId::from(id))
-                    .expect("membership available")
-                    .membership(),
+                membership: identity.mint_membership(&ChildId::from(id)).membership(),
                 exit: exit(ExitKind::Failed(error), Cancellation::NotObserved),
             },
         };
@@ -1257,8 +1239,8 @@ mod tests {
         assert_eq!(error.intensity_trip(), Some(&trip));
 
         let failure = StartupFailure {
-            cause: StartupFailureCause::IdentityExhausted {
-                id: ChildId::from("nested"),
+            cause: StartupFailureCause::Lowering {
+                undefined: vec![ChildId::from("nested")],
             },
         };
         let nested = stop_reason_into_nested_result(StopReason::StartupFailed(failure.clone()))
@@ -1301,8 +1283,8 @@ mod tests {
             within: Duration::from_secs(10),
         };
         let startup = StartupFailure {
-            cause: StartupFailureCause::IdentityExhausted {
-                id: ChildId::from("nested"),
+            cause: StartupFailureCause::Lowering {
+                undefined: vec![ChildId::from("nested")],
             },
         };
         let ascending = [
@@ -1359,8 +1341,8 @@ mod tests {
     fn forced_outcomes_do_not_erase_stronger_recorded_evidence() {
         let deadline = Instant::now() + Duration::from_secs(1);
         let failure = structured_startup_failure_error(StartupFailure {
-            cause: StartupFailureCause::IdentityExhausted {
-                id: ChildId::from("nested"),
+            cause: StartupFailureCause::Lowering {
+                undefined: vec![ChildId::from("nested")],
             },
         });
         let cases = [
@@ -1422,8 +1404,8 @@ mod tests {
         assert!(error.intensity_trip().is_none());
 
         let error = ExitError::from(StartupFailure {
-            cause: StartupFailureCause::IdentityExhausted {
-                id: ChildId::from("nested"),
+            cause: StartupFailureCause::Lowering {
+                undefined: vec![ChildId::from("nested")],
             },
         });
         assert!(error.startup_failure().is_none());
@@ -1444,23 +1426,23 @@ mod tests {
         );
 
         let failure = StartupFailure {
-            cause: StartupFailureCause::IdentityExhausted {
-                id: ChildId::from("nested"),
+            cause: StartupFailureCause::Lowering {
+                undefined: vec![ChildId::from("nested")],
             },
         };
         let error = structured_startup_failure_error(failure.clone());
         assert_eq!(error.startup_failure(), Some(&failure));
         assert_eq!(
             error.as_error().to_string(),
-            "membership identity space is exhausted for child `nested`"
+            "subtree has 1 undefined slots"
         );
     }
 
     #[test]
     fn startup_errors_chain_their_structured_detail() {
         let error = StartupError::StartupFailed(StartupFailure {
-            cause: StartupFailureCause::IdentityExhausted {
-                id: ChildId::from("nested"),
+            cause: StartupFailureCause::Lowering {
+                undefined: vec![ChildId::from("nested")],
             },
         });
         assert_eq!(error.to_string(), "tree startup failed");
@@ -1468,7 +1450,7 @@ mod tests {
             std::error::Error::source(&error)
                 .expect("startup failure is the source")
                 .to_string(),
-            "membership identity space is exhausted for child `nested`"
+            "subtree has 1 undefined slots"
         );
 
         let error = StartupError::IntensityTripped(IntensityTrip {

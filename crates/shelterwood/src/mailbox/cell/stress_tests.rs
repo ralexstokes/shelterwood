@@ -266,7 +266,7 @@ async fn run_controller(
     let mut token = configure(&mailbox, policy);
     let terminate_at = SENDERS * MESSAGES_PER_SENDER * TERMINATE_AFTER_PERCENT / 100;
     for cycle in 0usize.. {
-        let incarnation = incarnations.mint().expect("incarnation available");
+        let incarnation = incarnations.mint();
         bind(&mailbox, token, incarnation);
         *current.lock().expect("current incarnation mutex") = Some(incarnation);
         yields(8 + (cycle as u64 % 7) * 4).await;

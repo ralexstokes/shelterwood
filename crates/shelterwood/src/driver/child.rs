@@ -949,7 +949,7 @@ impl ScopeRuntime {
             self.deadlines.cancel(deadline);
         }
         let record = child.slot.member.record();
-        let exit = record.last_exit.unwrap_or_else(Exit::never_started);
+        let exit = record.last_exit.clone().unwrap_or_else(Exit::never_started);
         self.begin_terminal_disposal(key, Retained::new(exit), None, startup);
     }
 

@@ -33,10 +33,10 @@ struct ObserveMemberOnMailboxWake {
 
 impl ObserveMemberOnMailboxWake {
     fn observe(&self) {
-        let before = self.member.record().stage;
+        let before = self.member.record().stage.clone();
         self.member
             .terminalize(self.competing_exit.clone(), StartupDisposition::Unchanged);
-        let after = self.member.record().stage;
+        let after = self.member.record().stage.clone();
         *self.observed.lock().expect("observation mutex poisoned") = Some((before, after));
     }
 }
@@ -59,7 +59,7 @@ struct ObserveScopeOnStartupWake {
 
 impl ObserveScopeOnStartupWake {
     fn observe(&self) {
-        let member = self.scope.member.record().stage;
+        let member = self.scope.member.record().stage.clone();
         let settled = self.epoch.map(|epoch| self.scope.settled(Some(epoch)));
         *self.observed.lock().expect("observation mutex poisoned") = Some((member, settled));
     }
@@ -84,16 +84,14 @@ async fn successful_root_monitor_publishes_membership_terminality() {
         "the scope epilogue leaves root membership live until its join"
     );
 
-    let driver = crate::runtime::spawn(async {
-        crate::cells::RetainedStopReason::new(StopReason::Finished)
-    });
+    let driver = crate::runtime::spawn(async { crate::cells::Guarded::new(StopReason::Finished) });
     let monitor = monitor_root_driver(Arc::clone(&scope), driver);
     let joined = crate::runtime::join(monitor).await;
 
     assert!(matches!(
         joined,
         crate::runtime::JoinOutcome::Ok { ref value }
-            if value.as_reason() == &StopReason::Finished
+            if value.get() == &StopReason::Finished
     ));
     assert!(matches!(
         scope.member.record().stage,
@@ -122,16 +120,14 @@ async fn root_monitor_contains_a_terminal_wake_panic() {
         "the hostile observer parks behind membership terminality"
     );
 
-    let driver = crate::runtime::spawn(async {
-        crate::cells::RetainedStopReason::new(StopReason::Finished)
-    });
+    let driver = crate::runtime::spawn(async { crate::cells::Guarded::new(StopReason::Finished) });
     let monitor = monitor_root_driver(Arc::clone(&scope), driver);
     let joined = crate::runtime::join(monitor).await;
 
     assert!(matches!(
         joined,
         crate::runtime::JoinOutcome::Ok { ref value }
-            if value.as_reason() == &StopReason::Finished
+            if value.get() == &StopReason::Finished
     ));
     assert!(matches!(
         stopped
@@ -165,7 +161,7 @@ async fn panicked_root_monitor_publishes_its_exit_despite_a_terminal_wake_panic(
     let driver = crate::runtime::spawn(async {
         panic!("{DRIVER_PANIC}");
         #[allow(unreachable_code)]
-        crate::cells::RetainedStopReason::new(StopReason::Finished)
+        crate::cells::Guarded::new(StopReason::Finished)
     });
     let monitor = monitor_root_driver(Arc::clone(&scope), driver);
     let joined = crate::runtime::join(monitor).await;
@@ -173,7 +169,7 @@ async fn panicked_root_monitor_publishes_its_exit_despite_a_terminal_wake_panic(
     assert!(matches!(
         joined,
         crate::runtime::JoinOutcome::Ok { ref value }
-            if value.as_reason() == &StopReason::ShutdownRequested
+            if value.get() == &StopReason::ShutdownRequested
     ));
     assert!(matches!(
         scope.member.record().stage,
@@ -208,7 +204,7 @@ async fn cancelled_root_monitor_publishes_membership_terminality() {
         "the scope epilogue leaves root membership live until its join"
     );
 
-    let driver = crate::runtime::spawn(future::pending::<crate::cells::RetainedStopReason>());
+    let driver = crate::runtime::spawn(future::pending::<crate::cells::Guarded<StopReason>>());
     let monitor = monitor_root_driver(Arc::clone(&scope), driver);
     // Let the monitor reach its parked driver join before cancelling, so the
     // guard is exercised at the mid-await venue rather than before first poll.
@@ -247,7 +243,7 @@ async fn unpolled_root_monitor_publishes_membership_terminality() {
         .expect("test scope epoch is available");
     scope.finish_incarnation(epoch, StopReason::Finished);
 
-    let driver = crate::runtime::spawn(future::pending::<crate::cells::RetainedStopReason>());
+    let driver = crate::runtime::spawn(future::pending::<crate::cells::Guarded<StopReason>>());
     let monitor = monitor_root_driver(Arc::clone(&scope), driver);
     monitor.abort_handle().abort();
 
@@ -355,7 +351,7 @@ async fn root_driver_panic_mid_drain_upgrades_to_the_join_monitor_verdict() {
                 .build();
             panic!("root driver panicked mid-drain");
             #[allow(unreachable_code)]
-            crate::cells::RetainedStopReason::new(StopReason::Finished)
+            crate::cells::Guarded::new(StopReason::Finished)
         }
     });
     let panic_exit =
@@ -541,7 +537,7 @@ async fn resolve_competing_stops(
         Err(LifecycleTryRecvError::Closed),
         "the fallback closes observation once its verdict is published"
     );
-    let settled = scope.record().state;
+    let settled = scope.record().state.clone();
     assert_eq!(
         settled,
         ScopeState::Stopped {
@@ -1123,7 +1119,7 @@ fn mailbox_wake_observes_terminal_record_and_reentrant_terminality_is_idempotent
         ))
     );
     assert!(matches!(
-        member.record().stage,
+        member.record().stage.clone(),
         MemberStage::Terminal(exit) if exit == first_exit
     ));
 }
@@ -1161,7 +1157,7 @@ fn attach_to_a_terminal_member_finishes_record_before_mailbox_wake() {
         ))
     );
     assert!(matches!(
-        member.record().stage,
+        member.record().stage.clone(),
         MemberStage::Terminal(exit) if exit == first_exit
     ));
 }
@@ -1193,7 +1189,7 @@ fn concurrent_terminalizers_return_after_one_consistent_record_is_visible() {
     }
 
     let record = member.record();
-    let MemberStage::Terminal(exit) = record.stage else {
+    let MemberStage::Terminal(exit) = record.stage.clone() else {
         panic!("one terminal record must be visible");
     };
     assert_eq!(record.last_exit, Some(exit));

@@ -9,10 +9,10 @@ use shelterwood_core::{
 use crate::runtime;
 
 use crate::cells::{
-    MemberRecord, MemberStage, ObservationTxn, Retained,
+    Guarded, MemberStage, ObservationTxn, RetainGuards, Retained,
     observe::{
         ChildSnapshot, ChildState, LifecycleEventKind, LifecycleEvents, LifecycleSeq,
-        RetainedLifecycleEvent, RetainedScopeSnapshot, ScopeSnapshot, SnapshotReceiver,
+        RetainedLifecycleEvent, ScopeSnapshot, SnapshotReceiver,
     },
 };
 
@@ -27,20 +27,12 @@ pub(crate) struct ScopeRecord {
     /// Read only by this crate's snapshot publication; the driver takes its
     /// restart totals from the decision that produced them.
     pub(crate) total_restarts: TotalRestarts,
-    // Keep this field after every public projection that can contain a child
-    // exit. ScopeRecord clones share the guard allocation, so read-only
-    // observation does not submit one disposal job per read.
-    pub(super) retained_exits: Arc<Vec<Retained<Exit>>>,
 }
 
-impl ScopeRecord {
-    pub(super) fn refresh_retained_exits(&mut self, txn: &mut ObservationTxn<'_>) {
-        let mut retained = Vec::new();
-        Retained::retain_scope_state(&mut retained, &self.state);
-        if let Some(startup) = &self.startup {
-            Retained::retain_startup_result(&mut retained, startup);
-        }
-        Retained::install(&mut self.retained_exits, retained, txn);
+impl RetainGuards for ScopeRecord {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>) {
+        self.state.retain_guards(guards);
+        self.startup.retain_guards(guards);
     }
 }
 
@@ -50,12 +42,12 @@ pub(super) struct ObservationConfig {
 }
 
 impl ScopeCell {
-    pub(crate) fn record(&self) -> ScopeRecord {
+    pub(crate) fn record(&self) -> Guarded<ScopeRecord> {
         self.observation.record.read_cloned()
     }
 
     #[cfg(test)]
-    pub(crate) fn record_watcher(&self) -> runtime::WatchReceiver<ScopeRecord> {
+    pub(crate) fn record_watcher(&self) -> runtime::WatchReceiver<Guarded<ScopeRecord>> {
         self.observation.record.watcher()
     }
 
@@ -77,12 +69,7 @@ impl ScopeCell {
     }
 
     pub(crate) fn snapshot(&self) -> Arc<ScopeSnapshot> {
-        self.with_observation_gate(|txn| {
-            let mut surrendered = Vec::new();
-            let snapshot = self.snapshot_locked(&mut surrendered);
-            txn.surrender(surrendered);
-            snapshot.into_public(txn)
-        })
+        self.with_observation_gate(|txn| self.snapshot_locked().release(txn))
     }
 
     pub(crate) fn subscribe_snapshots(&self) -> SnapshotReceiver {
@@ -92,9 +79,7 @@ impl ScopeCell {
         // Only a `*_locked` writer that receives someone else's transaction has
         // an identity left to verify.
         let (receiver, closed_consistent) = self.with_observation_gate(|wakes| {
-            let mut surrendered = Vec::new();
-            let initial = self.snapshot_locked(&mut surrendered);
-            wakes.surrender(surrendered);
+            let initial = self.snapshot_locked();
             let receiver = self.observation.snapshots.subscribe(initial, wakes);
             let closed_consistent = !self.observation.closed.load(Ordering::Acquire)
                 || receiver.borrow_latest_and_closed().1;
@@ -121,7 +106,16 @@ impl ScopeCell {
         events
     }
 
-    fn snapshot_locked(&self, surrendered: &mut Vec<Retained<Exit>>) -> RetainedScopeSnapshot {
+    fn snapshot_locked(&self) -> Guarded<Arc<ScopeSnapshot>> {
+        Guarded::new(self.project_locked())
+    }
+
+    /// Builds the raw recursive projection under the observation gate.
+    ///
+    /// Every exit it clones stays co-owned by a member or scope record, which
+    /// only a gated writer can change, so a partial projection unwinding here
+    /// is refcount traffic. [`Self::snapshot_locked`] guards the finished cut.
+    fn project_locked(&self) -> Arc<ScopeSnapshot> {
         let record = self.record();
         let config = *self
             .observation
@@ -129,24 +123,19 @@ impl ScopeCell {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let children = self.current_children();
-        let mut projected = Vec::with_capacity(children.len());
-        let mut retained_exits = Vec::new();
-        Retained::retain_scope_state(&mut retained_exits, &record.state);
         // An admission that unwound past its residency push leaves a resident
         // whose `Added` was never published. SPEC §3.2 keeps such a membership
         // out of `children` / `child(id)` / `descendant(path)` exactly as it
         // keeps it out of the event stream, so the cut skips it. Gate rehoming,
         // terminality lookup and straggler collection still see it: it is
         // owned residency, just not yet public.
-        for resident in children.iter().filter(|resident| resident.announced) {
-            let (child, exits) = self.child_snapshot_locked(resident.projection(), surrendered);
-            projected.push(child);
-            for exit in exits {
-                Retained::retain_owned(&mut retained_exits, exit, surrendered);
-            }
-        }
-        let snapshot = Arc::new(ScopeSnapshot {
-            state: record.state,
+        let projected: Vec<_> = children
+            .iter()
+            .filter(|resident| resident.announced)
+            .map(|resident| self.child_snapshot_locked(resident.projection()))
+            .collect();
+        Arc::new(ScopeSnapshot {
+            state: record.state.clone(),
             kind: self.flavor,
             strategy: (self.flavor == ScopeFlavor::Ordered).then_some(Strategy::default()),
             intensity: config.intensity,
@@ -155,84 +144,43 @@ impl ScopeCell {
                 self.observation.lifecycle_seq.load(Ordering::Acquire),
             ),
             children: projected.into(),
-        });
-        RetainedScopeSnapshot::new(snapshot, retained_exits)
+        })
     }
 
-    fn child_snapshot_locked(
-        &self,
-        child: &ResidentProjection,
-        surrendered: &mut Vec<Retained<Exit>>,
-    ) -> (ChildSnapshot, Vec<Retained<Exit>>) {
-        let MemberRecord {
-            stage,
-            incarnation,
-            last_incarnation: _,
-            last_exit,
-            restart_count,
-            restart_at,
-            membership_status,
-            startup_aborted,
-            // Held to the end of this projection: the record's own guards keep
-            // every raw exit below alive while the snapshot's guard set is
-            // built from them.
-            retained_exits: record_guards,
-        } = child.member.record();
+    fn child_snapshot_locked(&self, child: &ResidentProjection) -> ChildSnapshot {
+        let record = child.member.record();
         let options = child.member.options();
-        let terminal = matches!(&stage, MemberStage::Terminal(_));
-        let mut retained_exits = Vec::new();
-        let nested = child
-            .scope
-            .as_ref()
-            .and_then(|scope| {
-                (incarnation.is_some() || terminal).then(|| scope.snapshot_locked(surrendered))
-            })
-            .map(|nested| {
-                let (snapshot, exits) = nested.into_parts();
-                for exit in exits {
-                    Retained::retain_owned(&mut retained_exits, exit, surrendered);
-                }
-                snapshot
-            });
-        let state = match stage {
+        let terminal = matches!(&record.stage, MemberStage::Terminal(_));
+        let nested = child.scope.as_ref().and_then(|scope| {
+            (record.incarnation.is_some() || terminal).then(|| scope.project_locked())
+        });
+        let state = match &record.stage {
             MemberStage::Reserved | MemberStage::Admitted => ChildState::Admitted,
             MemberStage::Starting => ChildState::Starting,
             MemberStage::Running => ChildState::Running,
             MemberStage::Restarting => ChildState::Restarting,
             MemberStage::Stopping => ChildState::Stopping,
-            MemberStage::Terminal(exit) if startup_aborted => {
-                Retained::retain_exit(&mut retained_exits, &exit);
-                ChildState::StartupAborted { exit }
+            MemberStage::Terminal(exit) if record.startup_aborted => {
+                ChildState::StartupAborted { exit: exit.clone() }
             }
-            MemberStage::Terminal(exit) => {
-                Retained::retain_exit(&mut retained_exits, &exit);
-                ChildState::Stopped { exit }
-            }
+            MemberStage::Terminal(exit) => ChildState::Stopped { exit: exit.clone() },
         };
-        let last_exit = last_exit.inspect(|exit| {
-            Retained::retain_exit(&mut retained_exits, exit);
-        });
-        let snapshot = ChildSnapshot {
+        ChildSnapshot {
             id: child.member.id().clone(),
             membership: child.member.membership(),
-            incarnation,
+            incarnation: record.incarnation,
             state,
-            last_exit,
-            membership_status,
-            restart_count,
+            last_exit: record.last_exit.clone(),
+            membership_status: record.membership_status,
+            restart_count: record.restart_count,
             restart_policy: options.restart,
             retention: options.retention,
-            restart_at,
+            restart_at: record.restart_at,
             nested,
             scope_seq: child.scope.as_ref().map(|scope| {
                 LifecycleSeq::new(scope.observation.lifecycle_seq.load(Ordering::Acquire))
             }),
-        };
-        // The projection above now owns a raw copy of everything these guards
-        // cover, so releasing them here is refcount traffic; their last owner
-        // is the member record itself.
-        drop(record_guards);
-        (snapshot, retained_exits)
+        }
     }
 
     fn ancestors_locked(&self, txn: &mut ObservationTxn<'_>) -> Vec<Arc<ScopeCell>> {
@@ -259,7 +207,7 @@ impl ScopeCell {
         let scope = self.owned();
         self.observation
             .snapshots
-            .publish(wakes, move |surrendered| scope.snapshot_locked(surrendered));
+            .publish(wakes, move || scope.snapshot_locked());
         for ancestor in ancestors {
             #[cfg(debug_assertions)]
             wakes.debug_assert_gate(&ancestor.current_observation_gate());
@@ -267,7 +215,7 @@ impl ScopeCell {
             ancestor
                 .observation
                 .snapshots
-                .publish(wakes, move |surrendered| scope.snapshot_locked(surrendered));
+                .publish(wakes, move || scope.snapshot_locked());
         }
     }
 
@@ -279,10 +227,10 @@ impl ScopeCell {
     pub(super) fn emit_locked(&self, wakes: &mut ObservationTxn<'_>, kind: LifecycleEventKind) {
         #[cfg(debug_assertions)]
         wakes.debug_assert_gate(&self.current_observation_gate());
-        // Mint the retention guards first, so every path below — including
-        // the receiverless early return — retires a *guarded* edge instead of
+        // Guard the kind first, so every path below — including the
+        // receiverless early return — retires a *guarded* edge instead of
         // destroying a raw `Exit` under the observation gate.
-        let guards = RetainedLifecycleEvent::retain_guards(&kind);
+        let kind = Guarded::new(kind);
         // Parent links cannot change under the resident-tree observation gate.
         // Resolve them once for snapshot and lifecycle propagation so one leaf
         // edge does not repeatedly lock every ancestor's parent mutex.
@@ -301,23 +249,20 @@ impl ScopeCell {
 
         // Sequence minting and snapshot watermarks stay unconditional: the
         // catch-up protocol uses them across stretches with no subscribers.
-        // When the whole propagation chain is receiverless, retire the raw
-        // kind before its guards after unlock and avoid event construction,
+        // When the whole propagation chain is receiverless, retire the
+        // guarded kind after unlock and avoid event construction,
         // path extension, cloning, and per-hub publication entirely.
         if !self.observation.lifecycle.has_receivers()
             && ancestors
                 .iter()
                 .all(|ancestor| !ancestor.observation.lifecycle.has_receivers())
         {
-            wakes.defer(move || {
-                drop(kind);
-                drop(guards);
-            });
+            wakes.defer(move || drop(kind));
             return;
         }
 
         let scope = self.member.membership();
-        let mut event = RetainedLifecycleEvent::from_parts(scope, seq, kind, guards);
+        let mut event = RetainedLifecycleEvent::new(scope, seq, kind);
         self.observation.lifecycle.publish(wakes, event.clone());
         let mut child_id = self.member.id().clone();
         for ancestor in &ancestors {
@@ -343,7 +288,7 @@ impl ScopeCell {
         let scope = self.owned();
         self.observation
             .snapshots
-            .close(wakes, move |surrendered| scope.snapshot_locked(surrendered));
+            .close(wakes, move || scope.snapshot_locked());
         self.observation.lifecycle.close(wakes);
         // Both hub closures are idempotent. Set the aggregate marker last so
         // an unexpected panic leaves the operation retryable.
@@ -383,13 +328,10 @@ mod tests {
             let probe = Arc::clone(&under_gate);
             let gate = gate.clone();
             let cell = Arc::clone(&scope);
-            scope
-                .observation
-                .snapshots
-                .publish(txn, move |surrendered| {
-                    probe.store(gate.is_held(), Ordering::Relaxed);
-                    cell.snapshot_locked(surrendered)
-                });
+            scope.observation.snapshots.publish(txn, move || {
+                probe.store(gate.is_held(), Ordering::Relaxed);
+                cell.snapshot_locked()
+            });
         });
 
         assert!(

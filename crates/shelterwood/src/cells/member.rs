@@ -15,7 +15,7 @@ use shelterwood_core::{
     policy::ResolvedCommonOptions,
 };
 
-use super::{ObservationGate, ObservationTxn, Retained};
+use super::{Guarded, ObservationGate, ObservationTxn, RetainGuards, Retained};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MemberStage {
@@ -95,32 +95,18 @@ pub(crate) struct MemberRecord {
     pub restart_at: Option<Instant>,
     pub membership_status: MembershipStatus,
     pub startup_aborted: bool,
-    // Keep this field after every exit-bearing projection above. Field order
-    // makes a record clone's raw exits provably refcount-only on drop, and
-    // clones share the guard allocation, so a boolean stage probe costs
-    // refcount traffic rather than one disposal job per retained exit.
-    pub(super) retained_exits: Arc<Vec<Retained<Exit>>>,
+}
+
+impl RetainGuards for MemberRecord {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>) {
+        if let MemberStage::Terminal(exit) = &self.stage {
+            exit.retain_guards(guards);
+        }
+        self.last_exit.retain_guards(guards);
+    }
 }
 
 impl MemberRecord {
-    /// Rebuilds the guard set covering this record's raw exits.
-    ///
-    /// Every mutation path calls this after writing, so the guards a mutation
-    /// displaces always still cover the raw value it overwrites: the inline
-    /// drop inside the watch mutation is refcount work, and the retired guard
-    /// set transfers any failed payload to isolated disposal once its last
-    /// record clone dies.
-    pub(super) fn refresh_retained_exits(&mut self, txn: &mut ObservationTxn<'_>) {
-        let mut retained = Vec::new();
-        if let MemberStage::Terminal(exit) = &self.stage {
-            Retained::retain_exit(&mut retained, exit);
-        }
-        if let Some(exit) = &self.last_exit {
-            Retained::retain_exit(&mut retained, exit);
-        }
-        Retained::install(&mut self.retained_exits, retained, txn);
-    }
-
     /// Applies one driver-requested transition.
     ///
     /// Every watch-channel writer routes stage changes through here (see
@@ -128,9 +114,9 @@ impl MemberRecord {
     /// rejects an event whose source stage is not one its driver call sites
     /// can present, including in release builds.
     ///
-    /// Exits are safe to retire inside the watch mutation: the record's guard
-    /// set still covers the displaced value, and [`Self::refresh_retained_exits`]
-    /// re-establishes that cover before the mutation returns.
+    /// Exits are safe to retire inside the watch mutation: it runs under
+    /// [`Guarded::update`], whose previous guard set still covers the
+    /// displaced value.
     fn apply_transition(&mut self, transition: MemberTransition) -> Result<(), MemberTransition> {
         if !transition.is_legal_from(&self.stage) {
             return Err(transition);
@@ -175,7 +161,7 @@ pub(crate) struct MemberCell {
     rebased_membership: OnceLock<Membership>,
     provisional_membership: Mutex<Option<ProvisionalMembership>>,
     incarnations: Mutex<Option<IncarnationCounter>>,
-    pub(super) record: runtime::WatchSender<MemberRecord>,
+    pub(super) record: runtime::WatchSender<Guarded<MemberRecord>>,
     // Guards only a gate-pointer swap, so no torn state is possible; every
     // access deliberately tolerates poisoning (mirroring
     // `ObservationGate::lock`) so drop-path shutdown after a panicked assert
@@ -208,7 +194,7 @@ enum MemberMailbox {
 /// preparation unwinds. The transaction still owns the post-unlock wake.
 struct TerminalRecordPulse<'a, 'gate> {
     txn: &'a mut ObservationTxn<'gate>,
-    record: Option<&'a runtime::WatchSender<MemberRecord>>,
+    record: Option<&'a runtime::WatchSender<Guarded<MemberRecord>>>,
 }
 
 impl Drop for TerminalRecordPulse<'_, '_> {
@@ -255,7 +241,7 @@ impl MemberCell {
     pub(crate) fn new(identity: MintedMembership) -> Arc<Self> {
         let id = identity.id().clone();
         let (membership, provisional_membership, incarnations) = identity.into_provisional_parts();
-        let (record, _) = runtime::watch(MemberRecord {
+        let (record, _) = runtime::watch(Guarded::new(MemberRecord {
             stage: MemberStage::Reserved,
             incarnation: None,
             last_incarnation: None,
@@ -264,8 +250,7 @@ impl MemberCell {
             restart_at: None,
             membership_status: MembershipStatus::Active,
             startup_aborted: false,
-            retained_exits: Arc::new(Vec::new()),
-        });
+        }));
         Arc::new(Self {
             id,
             membership,
@@ -338,12 +323,12 @@ impl MemberCell {
             .expect("incarnation counter mutex starts healthy")
     }
 
-    pub(crate) fn record(&self) -> MemberRecord {
+    pub(crate) fn record(&self) -> Guarded<MemberRecord> {
         self.record.read_cloned()
     }
 
     #[cfg(test)]
-    pub(crate) fn record_watcher(&self) -> runtime::WatchReceiver<MemberRecord> {
+    pub(crate) fn record_watcher(&self) -> runtime::WatchReceiver<Guarded<MemberRecord>> {
         self.record.watcher()
     }
 
@@ -540,13 +525,11 @@ impl MemberCell {
     ) {
         #[cfg(debug_assertions)]
         txn.debug_assert_gate(&self.current_observation_gate());
-        // Refreshing here rather than in each writer keeps the guard-set
+        // Guarding here rather than in each writer keeps the guard-set
         // invariant on every record mutation, including the test-only escape
         // hatch that writes fields directly.
-        self.record.modify_silently(|record| {
-            update(record);
-            record.refresh_retained_exits(txn);
-        });
+        self.record
+            .modify_silently(|record| record.update(txn, update));
         txn.pulse(&self.record);
     }
 
@@ -586,11 +569,11 @@ impl MemberCell {
             | MemberTransition::Stopping => None,
         };
         let mut rejected = None;
-        self.record
-            .modify_silently(|record| match record.apply_transition(transition) {
-                Ok(()) => record.refresh_retained_exits(txn),
-                Err(transition) => rejected = Some(transition),
-            });
+        self.record.modify_silently(|record| {
+            rejected = record
+                .update(txn, |record| record.apply_transition(transition))
+                .err();
+        });
         if let Some(rejected) = rejected {
             // Rejection leaves this cell exactly as it was. The rejected event
             // may own a failed exit, so retire it with the transaction rather
@@ -732,7 +715,10 @@ impl MemberCell {
         }
         let mut published = false;
         self.record.modify_silently(|record| {
-            if !matches!(record.stage, MemberStage::Terminal(_)) {
+            record.update(txn, |record| {
+                if matches!(record.stage, MemberStage::Terminal(_)) {
+                    return;
+                }
                 match startup {
                     StartupDisposition::Unchanged => {}
                     StartupDisposition::NotAborted => record.startup_aborted = false,
@@ -743,11 +729,7 @@ impl MemberCell {
                 record.last_exit = Some(terminal_exit.clone());
                 record.stage = MemberStage::Terminal(terminal_exit.clone());
                 published = true;
-            }
-            // The guard set displaced above still covers whatever this
-            // mutation overwrote, so refreshing after the writes is what
-            // keeps the inline drops refcount-only.
-            record.refresh_retained_exits(txn);
+            });
         });
         // First terminalizer wins: only a newly stored terminal record owes
         // a pulse. Own that obligation before fallible mailbox preparation.
@@ -776,8 +758,8 @@ impl MemberCell {
     pub(crate) async fn wait_terminal(&self) -> Exit {
         let mut watcher = self.record.watcher();
         loop {
-            if let MemberStage::Terminal(exit) = watcher.borrow_cloned().stage {
-                return exit;
+            if let MemberStage::Terminal(exit) = &watcher.borrow_cloned().stage {
+                return exit.clone();
             }
             watcher.changed().await;
         }
@@ -1006,11 +988,11 @@ mod tests {
         let first = member.record();
         let second = member.record();
         assert!(
-            !first.retained_exits.is_empty(),
+            first.guard_count() > 0,
             "a terminal failed member retains its exit"
         );
         assert!(
-            Arc::ptr_eq(&first.retained_exits, &second.retained_exits),
+            first.shares_guards_with(&second),
             "record reads must share one guard allocation instead of submitting \
              one disposal job per retained exit per read"
         );

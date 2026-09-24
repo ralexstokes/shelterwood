@@ -616,7 +616,7 @@ async fn terminality_fallback_preserves_restart_window_scope_reason() {
     terminality.discharge();
 
     assert_eq!(nested.wait_stopped().await, StopReason::Finished);
-    let MemberStage::Terminal(exit) = nested.member.record().stage else {
+    let MemberStage::Terminal(exit) = nested.member.record().stage.clone() else {
         panic!("the fallback must terminalize the nested membership");
     };
     assert!(matches!(

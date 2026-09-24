@@ -569,7 +569,7 @@ fn dynamic_close_evicts_a_terminal_reservation_before_readd() {
     let first_membership = first.slot.member.membership();
     let retained = root.with_observation_gate(|txn| control.close(&root, txn));
     assert!(matches!(
-        first.slot.member.record().stage,
+        first.slot.member.record().stage.clone(),
         MemberStage::Terminal(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
     ));
     assert!(
@@ -1043,7 +1043,7 @@ async fn annulment_before_admission_owns_never_started_terminality() {
         reservation.control.as_ref(),
         &reservation.slot,
     );
-    let annulled_stage = member.record().stage;
+    let annulled_stage = member.record().stage.clone();
     assert!(matches!(
         &annulled_stage,
         MemberStage::Terminal(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
@@ -1173,7 +1173,7 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
     // The adjudicated consistency property: the terminal record and the
     // lifecycle stream publish the same exit, because supervision was the
     // only terminalizer.
-    let MemberStage::Terminal(record_exit) = member.record().stage else {
+    let MemberStage::Terminal(record_exit) = member.record().stage.clone() else {
         panic!("the removed member publishes a terminal record");
     };
     let mut emitted_exit = None;
@@ -1276,7 +1276,7 @@ async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
             }
             Some(Err(ReserveError::NotAdmitting(crate::NotAdmittingCause::ReservationEnded))) => {
                 assert!(matches!(
-                    member.record().stage,
+                    member.record().stage.clone(),
                     MemberStage::Terminal(exit)
                         if matches!(exit.kind(), ExitKind::NeverStarted)
                 ));

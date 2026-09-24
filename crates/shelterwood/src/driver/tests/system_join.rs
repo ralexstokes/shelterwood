@@ -5,7 +5,7 @@ use std::{
 };
 
 use super::support::*;
-use crate::{cells::RetainedStopReason, policy::ScopeFlavor, test_support::probe_waker_with_wake};
+use crate::{cells::Guarded, policy::ScopeFlavor, test_support::probe_waker_with_wake};
 
 #[derive(Default)]
 struct HostileWakeState {
@@ -38,7 +38,7 @@ async fn system_run_wait_proxies_a_pending_driver_join_caller_waker() {
     let driver_release = release.clone();
     let driver = crate::runtime::spawn(async move {
         driver_release.fired().await;
-        RetainedStopReason::new(StopReason::NeverStarted)
+        Guarded::new(StopReason::NeverStarted)
     });
     let mut run = super::super::SystemRun {
         root,
@@ -75,7 +75,7 @@ async fn system_run_wait_reloads_after_self_healing_a_cancelled_monitor() {
         Exit::completed(Cancellation::NotObserved),
     );
 
-    let driver = crate::runtime::spawn(future::pending::<RetainedStopReason>());
+    let driver = crate::runtime::spawn(future::pending::<Guarded<StopReason>>());
     driver.abort_handle().abort();
     let mut run = super::super::SystemRun {
         root: Arc::clone(&root),
@@ -108,7 +108,7 @@ async fn system_run_shutdown_proxies_a_pending_driver_join_caller_waker() {
     let driver_release = release.clone();
     let driver = crate::runtime::spawn(async move {
         driver_release.fired().await;
-        RetainedStopReason::new(StopReason::NeverStarted)
+        Guarded::new(StopReason::NeverStarted)
     });
     let mut run = super::super::SystemRun {
         root,

@@ -459,17 +459,10 @@ async fn latched_removal_suppresses_a_queued_start_effect() {
 fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
     let mut identity = ScopeIdentity::new();
     let root_id = ChildId::from("root");
-    let root_member = MemberCell::new(
-        identity
-            .mint_membership(&root_id)
-            .expect("root membership available"),
-    );
+    let root_member = MemberCell::new(identity.mint_membership(&root_id));
     let root = ScopeCell::new(root_member, ScopeFlavor::Dynamic, ScopeIdentity::new());
     let child_id = ChildId::from("worker");
-    let member = MemberCell::new(
-        root.mint_membership(&child_id)
-            .expect("child membership available"),
-    );
+    let member = MemberCell::new(root.mint_membership(&child_id));
     let slot = SlotCell::new(Arc::clone(&member), None);
     assert!(root.set_admitted_children(vec![resident_projection(&slot)]));
     let (events, _receiver) = crate::runtime::unbounded_mpsc();
@@ -612,10 +605,7 @@ fn reserve_dynamic_rejects_an_empty_id_at_the_driver_boundary() {
 fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");
-    let member = MemberCell::new(
-        root.mint_membership(&child_id)
-            .expect("child membership available"),
-    );
+    let member = MemberCell::new(root.mint_membership(&child_id));
     let slot = SlotCell::new(Arc::clone(&member), None);
     assert!(root.set_admitted_children(vec![resident_projection(&slot)]));
     let (events, _receiver) = crate::runtime::unbounded_mpsc();
@@ -832,9 +822,7 @@ fn draining_cannot_publish_across_an_inflight_reservation_transaction() {
 async fn removal_from_a_foreign_thread_reaches_the_driver() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");
-    let membership = root
-        .mint_membership(&child_id)
-        .expect("membership available");
+    let membership = root.mint_membership(&child_id);
     let member = MemberCell::new(membership);
     assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let slot = SlotCell::new(Arc::clone(&member), None);

@@ -105,10 +105,7 @@ async fn rebind_waker_panic_keeps_one_shot_body_isolated() {
     // Give the mailbox a prior, fully closed incarnation so the spawn below
     // exercises the restart/rebind edge rather than the first-bind edge.
     let child = scope.children.get_mut(key).expect("the child remains live");
-    let prior = child
-        .incarnations
-        .mint()
-        .expect("a prior incarnation is available");
+    let prior = child.incarnations.mint();
     let token = child
         .mailbox_bind
         .take()

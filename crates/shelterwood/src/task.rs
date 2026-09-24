@@ -348,11 +348,8 @@ mod tests {
     fn task_context() -> (TaskContext, Latch, Latch, CompletionGatedLatch) {
         let id = ChildId::from("task");
         let mut identity = ScopeIdentity::new();
-        let (_, mut incarnations) = identity
-            .mint_membership(&id)
-            .expect("membership available")
-            .into_pair();
-        let incarnation = incarnations.mint().expect("incarnation available");
+        let (_, mut incarnations) = identity.mint_membership(&id).into_pair();
+        let incarnation = incarnations.mint();
         let shutdown = Latch::default();
         let abort = Latch::default();
         let ready = CompletionGatedLatch::default();
@@ -447,7 +444,7 @@ mod tests {
     ) {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("task");
-        let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
+        let member = MemberCell::new(identity.mint_membership(&id));
         let (sender, receiver) = runtime::oneshot();
         let claim = OneShotTaskRef::new(receiver, TaskRef::new(std::sync::Arc::clone(&member)));
         (sender, claim, member)
@@ -480,7 +477,7 @@ mod tests {
     async fn staged_one_shot_wait_cannot_double_panic_at_completion_delivery() {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("task");
-        let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
+        let member = MemberCell::new(identity.mint_membership(&id));
         let (sending, receiver) = runtime::oneshot_sending_for_test();
         let claim = OneShotTaskRef::new(receiver, TaskRef::new(Arc::clone(&member)));
         member.terminalize(

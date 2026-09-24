@@ -732,7 +732,6 @@ impl ScopeRuntime {
         {
             return;
         }
-        let startup = self.terminal_startup_disposition(key);
         let child = self
             .children
             .get_mut(key)
@@ -740,20 +739,7 @@ impl ScopeRuntime {
         if let Some(deadline) = child.restart_deadline.take() {
             self.deadlines.cancel(deadline);
         }
-        let Some(incarnation) = child.incarnations.mint() else {
-            let exit = child
-                .slot
-                .member
-                .record()
-                .last_exit
-                .unwrap_or_else(Exit::never_started);
-            // Exhaustion is a terminal outcome, not an exceptional cleanup
-            // path. Its exit publishes now; retained-definition disposal
-            // still gates retention, removal completion, and ordered-scope
-            // progression.
-            self.begin_terminal_disposal(key, RetainedExit::new(exit), None, startup);
-            return;
-        };
+        let incarnation = child.incarnations.mint();
 
         // Per-incarnation latch topology:
         // - shutdown/abort flow from the ladder into application code;
@@ -1288,8 +1274,7 @@ impl ScopeRuntime {
         // edge. A terminal without an exited incarnation never ran, so it
         // publishes the plain `Stopped { NeverStarted }` verdict (B.6) even
         // when its pre-readiness position still routes the scope's startup
-        // failure below. Incarnation exhaustion is the reachable case: it
-        // terminalizes an unspawned membership while `pre_ready` holds.
+        // failure below.
         //
         // Hand the publication seam a guarded clone rather than a raw one, so
         // no window between here and the cell layer's own retention holds the

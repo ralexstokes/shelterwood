@@ -5,8 +5,6 @@ use shelterwood_core::{
 };
 
 #[cfg(test)]
-use crate::cells::ObservationGate;
-#[cfg(test)]
 use crate::runtime;
 
 use crate::cells::{
@@ -280,9 +278,9 @@ impl ScopeCell {
     pub(super) fn emit_locked(&self, wakes: &mut ObservationTxn<'_>, kind: LifecycleEventKind) {
         #[cfg(debug_assertions)]
         wakes.debug_assert_gate(&self.current_observation_gate());
-        // Mint the retention guards before any fallible framework bookkeeping.
-        // A sequence-exhaustion path can then defer a *guarded* edge instead
-        // of destroying a raw `Exit` under the observation gate.
+        // Mint the retention guards first, so every path below — including
+        // the receiverless early return — retires a *guarded* edge instead of
+        // destroying a raw `Exit` under the observation gate.
         let guards = RetainedLifecycleEvent::retain_guards(&kind);
         // Parent links cannot change under the resident-tree observation gate.
         // Resolve them once for snapshot and lifecycle propagation so one leaf
@@ -293,25 +291,11 @@ impl ScopeCell {
         // a second, provably uncontended lock on every lifecycle edge. The
         // mint is still a compare-and-swap so an emit that ever escaped the
         // gate could reorder events but never duplicate a sequence value.
-        let seq = self
-            .observation
-            .lifecycle_seq
-            .mint(Ordering::Release, Ordering::Relaxed);
-        let Some(seq) = seq.map(LifecycleSeq::new) else {
-            // Raw projection first, guards last, so the guards are the final
-            // owner and destruction is submitted to isolated disposal — the
-            // same field-order argument `RetainedLifecycleEvent` makes.
-            wakes.defer(move || {
-                drop(kind);
-                drop(guards);
-            });
-            self.publish_snapshot_chain_through_locked(wakes, &ancestors);
-            self.observation.lifecycle.publish_lagged(wakes, 1);
-            for ancestor in &ancestors {
-                ancestor.observation.lifecycle.publish_lagged(wakes, 1);
-            }
-            return;
-        };
+        let seq = LifecycleSeq::new(
+            self.observation
+                .lifecycle_seq
+                .mint(Ordering::Release, Ordering::Relaxed),
+        );
         self.publish_snapshot_chain_through_locked(wakes, &ancestors);
 
         // Sequence minting and snapshot watermarks stay unconditional: the
@@ -364,69 +348,25 @@ impl ScopeCell {
         // an unexpected panic leaves the operation retryable.
         self.observation.closed.store(true, Ordering::Release);
     }
-
-    #[cfg(test)]
-    pub(crate) fn set_lifecycle_sequence(&self, current: u64) {
-        self.observation
-            .lifecycle_seq
-            .set(current, Ordering::Relaxed);
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fmt,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-            mpsc,
-        },
-        time::Duration,
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
     };
 
-    use shelterwood_core::{
-        Cancellation, ChildId, Exit, ExitError, ScopeState, identity::ScopeIdentity,
-        policy::ScopeFlavor,
-    };
+    use shelterwood_core::{ChildId, ScopeState, identity::ScopeIdentity, policy::ScopeFlavor};
 
     use super::*;
     use crate::cells::MemberCell;
-
-    struct GateDropError {
-        gate: super::ObservationGate,
-        dropped: mpsc::SyncSender<bool>,
-    }
-
-    impl fmt::Debug for GateDropError {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("GateDropError")
-        }
-    }
-
-    impl fmt::Display for GateDropError {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("gate drop probe")
-        }
-    }
-
-    impl std::error::Error for GateDropError {}
-
-    impl Drop for GateDropError {
-        fn drop(&mut self) {
-            let _ = self.dropped.send(!self.gate.is_held());
-        }
-    }
 
     #[test]
     fn a_staged_cut_is_installed_before_its_gate_is_released() {
         let id = ChildId::from("root");
         let mut identity = ScopeIdentity::new();
-        let member = MemberCell::new(
-            identity
-                .mint_membership(&id)
-                .expect("root membership is available"),
-        );
+        let member = MemberCell::new(identity.mint_membership(&id));
         let scope = ScopeCell::new(member, ScopeFlavor::Dynamic, ScopeIdentity::new());
         let gate = scope.observation_gate();
         let receiver = scope.subscribe_snapshots();
@@ -456,57 +396,5 @@ mod tests {
             "a staged cut is built and installed while the transaction still holds its gate"
         );
         assert_eq!(receiver.borrow_latest().state, ScopeState::Unstarted);
-    }
-
-    #[test]
-    fn lifecycle_sequence_exhaustion_retires_the_exit_after_unlock() {
-        let id = ChildId::from("root");
-        let mut identity = ScopeIdentity::new();
-        let member = MemberCell::new(
-            identity
-                .mint_membership(&id)
-                .expect("root membership is available"),
-        );
-        let membership = member.membership();
-        let mut incarnations = member.take_incarnation_counter();
-        let scope = ScopeCell::new(member, ScopeFlavor::Dynamic, ScopeIdentity::new());
-        let gate = scope.observation_gate();
-        scope.set_lifecycle_sequence(u64::MAX - 2);
-        scope.emit(LifecycleEventKind::ScopeState {
-            state: ScopeState::Running,
-        });
-        let (dropped, observed) = mpsc::sync_channel(1);
-        let exhausted = LifecycleEventKind::Exited {
-            id,
-            membership,
-            incarnation: incarnations.mint().expect("incarnation available"),
-            exit: Exit::failed(
-                ExitError::from(GateDropError { gate, dropped }),
-                Cancellation::NotObserved,
-            ),
-        };
-
-        // Retiring a `RetainedExit` never destroys the user error inline: it
-        // always submits the value to isolated disposal, so the destructor
-        // runs on a worker thread in either arrangement and its own view of
-        // the gate is a race. What the deferral changes is *when the
-        // submission happens*. Hold the gate open across the emit: nothing
-        // can arrive on this channel unless the submission already happened
-        // under the gate.
-        let retired_under_gate = scope.with_observation_gate(|wakes| {
-            scope.emit_locked(wakes, exhausted);
-            observed.recv_timeout(Duration::from_millis(500)).is_ok()
-        });
-        assert!(
-            !retired_under_gate,
-            "an unsequenced exit must not be submitted for disposal under the observation gate"
-        );
-
-        assert!(
-            observed
-                .recv_timeout(Duration::from_secs(10))
-                .expect("retained exit destructor reports"),
-            "an unsequenced exit is retired after the observation gate unlocks"
-        );
     }
 }

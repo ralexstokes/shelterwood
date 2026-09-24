@@ -517,11 +517,7 @@ mod tests {
         let (dropped, observed) = mpsc::sync_channel(1);
         let id = ChildId::from("worker");
         let mut identity = ScopeIdentity::new();
-        let member = MemberCell::new(
-            identity
-                .mint_membership(&id)
-                .expect("membership is available"),
-        );
+        let member = MemberCell::new(identity.mint_membership(&id));
         let retained = RetainedStopReason::new(StopReason::StartupFailed(StartupFailure {
             cause: StartupFailureCause::Child {
                 id,

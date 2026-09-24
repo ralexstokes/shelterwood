@@ -989,11 +989,7 @@ mod tests {
         let retiring_thread = std::thread::current().id();
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("worker");
-        let member = MemberCell::new(
-            identity
-                .mint_membership(&id)
-                .expect("membership is available"),
-        );
+        let member = MemberCell::new(identity.mint_membership(&id));
         member.terminalize(
             Exit::completed(Cancellation::NotObserved),
             StartupDisposition::Unchanged,
@@ -1023,11 +1019,7 @@ mod tests {
         let (dropped, observed) = mpsc::sync_channel(1);
         let id = ChildId::from("worker");
         let mut identity = ScopeIdentity::new();
-        let member = MemberCell::new(
-            identity
-                .mint_membership(&id)
-                .expect("membership is available"),
-        );
+        let member = MemberCell::new(identity.mint_membership(&id));
         member.terminalize(
             Exit::failed(
                 ExitError::from(ThreadProbe(dropped)),

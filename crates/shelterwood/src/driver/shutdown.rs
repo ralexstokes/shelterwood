@@ -41,10 +41,7 @@ pub(crate) async fn shutdown_scope(
     if scope.settled(None) {
         return Ok(());
     }
-    let Some(epoch) = scope.request_shutdown() else {
-        // An exhausted idle scope has no incarnation that can remain live.
-        return Ok(());
-    };
+    let epoch = scope.request_shutdown();
     let mut watcher = scope.signal().watcher();
     loop {
         if scope.settled(Some(epoch)) {

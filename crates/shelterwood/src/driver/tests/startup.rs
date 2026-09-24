@@ -57,9 +57,7 @@ fn pre_admission_restart_shutdown_is_published_when_the_scope_gets_a_parent() {
         .as_ref()
         .expect("nested scope cell");
 
-    let target = nested
-        .request_shutdown()
-        .expect("the pre-admission shutdown targets the first epoch");
+    let target = nested.request_shutdown();
     assert!(root.take_control_events().is_empty());
     assert!(
         root.set_admitted_children(
@@ -92,9 +90,7 @@ fn consumed_pre_admission_shutdown_is_not_published_when_the_scope_gets_a_parent
         .as_ref()
         .expect("nested scope cell");
 
-    let target = nested
-        .request_shutdown()
-        .expect("the pre-admission shutdown targets the first epoch");
+    let target = nested.request_shutdown();
     assert!(nested.take_shutdown_request(target));
     assert!(
         root.set_admitted_children(
@@ -133,9 +129,7 @@ async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnat
             .as_ref()
             .expect("nested scope cell"),
     );
-    let target = nested
-        .request_shutdown()
-        .expect("the pre-admission shutdown targets the first epoch");
+    let target = nested.request_shutdown();
     let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
 
     scope.spawn_child(key);
@@ -215,9 +209,7 @@ async fn expedited_restart_progresses_synchronous_readiness() {
     fixture.children[key].options.readiness = Readiness::Immediate;
     let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
     scope.reduce(SupervisorEvent::Spawned { child: key });
-    let target = nested_cell
-        .request_shutdown()
-        .expect("the shutdown targets the pending nested incarnation");
+    let target = nested_cell.request_shutdown();
 
     scope.expedite_restart_shutdown(key, target);
 
@@ -273,9 +265,7 @@ async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child(
             .as_ref()
             .expect("nested scope cell"),
     );
-    let target = nested_cell
-        .request_shutdown()
-        .expect("the pre-admission shutdown targets the first epoch");
+    let target = nested_cell.request_shutdown();
     let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(first)).build();
 
     // Ordered startup spawns "a" and parks on its (never-fired) readiness.
@@ -340,8 +330,7 @@ async fn restart_shutdown_arriving_before_exit_is_retried_after_the_child_become
         .scope
         .as_ref()
         .expect("nested scope cell")
-        .request_shutdown()
-        .expect("the shutdown targets the pending nested incarnation");
+        .request_shutdown();
     scope.spawn_child(key);
     let first = scope.children[key]
         .active
@@ -439,8 +428,7 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
         .scope
         .as_ref()
         .expect("nested scope cell")
-        .request_shutdown()
-        .expect("the shutdown targets the pending nested incarnation");
+        .request_shutdown();
     let event = root
         .take_control_events()
         .pop()
@@ -571,8 +559,7 @@ async fn same_batch_intensity_exit_suppresses_retained_expedite_retry() {
         .scope
         .as_ref()
         .expect("nested scope cell")
-        .request_shutdown()
-        .expect("the shutdown targets the pending nested incarnation");
+        .request_shutdown();
     scope.spawn_child(nested);
     let nested_first = scope.children[nested]
         .active
@@ -866,7 +853,7 @@ async fn stale_incarnation_readiness_effect_does_not_credit_startup() {
         .incarnation;
     let mut incarnations =
         IncarnationCounter::fixture(scope.children[key].slot.member.membership());
-    let stale = std::iter::from_fn(|| incarnations.mint())
+    let stale = std::iter::repeat_with(|| incarnations.mint())
         .find(|incarnation| *incarnation != live)
         .expect("a second incarnation is mintable");
 
@@ -1190,4 +1177,195 @@ async fn removal_before_pre_ready_exit_does_not_publish_startup_abort() {
     scope.publish_startup_removals();
     assert_eq!(removal.try_receive(), Some(RemoveOutcome::Removed));
     assert!(scope.supervisor.lifecycle().startup_complete());
+}
+
+/// Pins main's linearization for a scope stop latched cross-batch: a
+/// restartable initial child failing pre-ready still dispatches
+/// `ScheduleRestart`, and the latched stop's own follow-up event owns
+/// the startup verdict (`ShutdownRequested`). Exit dispatch must not
+/// consult latched-but-unprocessed scope-stop sources for its membership
+/// classification, or the failure would be rerouted into
+/// `StartupFailed` while restart suppression claims the stop was first.
+#[crate::runtime::test]
+async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
+    let mut tree = Tree::new();
+    tree.add_task(
+        "worker",
+        TaskDef::new(|_| async { Err(ExitError::message("failed before readiness")) })
+            .readiness(Readiness::Manual)
+            .expect("manual readiness is valid"),
+    )
+    .expect("valid task");
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, mut event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
+
+    assert!(scope.supervisor.is_initial(key));
+    scope.spawn_child(key);
+    assert!(!scope.supervisor.initial_ready(key));
+    let exit = recv_child_exit(
+        &mut event_receiver,
+        Duration::from_secs(2),
+        "the pre-ready failure exit",
+    )
+    .await;
+
+    // The stop request latches after this batch was collected: it is
+    // visible to `has_stop_request`, but its `Pending::Shutdown` follow-up
+    // event belongs to the next batch.
+    root.request_shutdown();
+    assert!(root.has_stop_request(scope.epoch));
+
+    exit.dispatch(&mut scope);
+    assert!(
+        scope.children[key].restart_deadline.is_some(),
+        "a latched scope stop does not reclassify exit dispatch"
+    );
+    assert!(matches!(
+        scope.children[key].slot.member.record().stage,
+        MemberStage::Restarting
+    ));
+    assert!(
+        root.record().startup.is_none(),
+        "the pre-ready failure must not claim the startup verdict: {:?}",
+        root.record().startup
+    );
+
+    // The latched stop's guaranteed follow-up event runs in the next
+    // batch and owns the verdict, exactly as an unlatched scope would.
+    assert!(root.take_shutdown_request(scope.epoch));
+    scope.begin_drain(StopReason::ShutdownRequested);
+    assert!(
+        matches!(
+            root.record().startup,
+            Some(Err(StartupError::ShutdownRequested))
+        ),
+        "the latched stop owns the startup verdict: {:?}",
+        root.record().startup
+    );
+    assert!(scope.children[key].restart_deadline.is_none());
+
+    let child = recv_construction_disposed(
+        &mut scope.disposal_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the construction disposal completion",
+    )
+    .await;
+    scope.handle_construction_disposed(child);
+    assert!(matches!(
+        scope.children[key].slot.member.record().stage,
+        MemberStage::Terminal(_)
+    ));
+    assert!(
+        !scope.children[key].slot.member.record().startup_aborted,
+        "shutdown-first linearization publishes no startup abort"
+    );
+    assert!(matches!(
+        root.record().startup,
+        Some(Err(StartupError::ShutdownRequested))
+    ));
+}
+
+#[derive(Clone, Copy)]
+enum PreLoopStopSource {
+    ScopeShutdown,
+    ScopeForce,
+    AncestorShutdown,
+}
+
+async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoopStopSource) {
+    let nested_id = ChildId::from("nested");
+    let mut parent_identity = ScopeIdentity::new();
+    let nested_membership = parent_identity.mint_membership(&nested_id);
+    let nested_member = MemberCell::new(nested_membership);
+
+    let scope = ScopeCell::new(nested_member, ScopeFlavor::Ordered, ScopeIdentity::new());
+
+    let mut tree = Tree::new();
+    let worker = tree
+        .add_task(
+            "worker",
+            TaskDef::new(|_| future::pending::<crate::ExitResult>()),
+        )
+        .expect("valid task");
+    let _undefined = tree
+        .reserve_task("missing")
+        .expect("an undefined reservation fails lowering");
+    let epoch = ScopeEpochGuard::begin(&scope).expect("the first nested epoch is available");
+    let ancestor_shutdown = Latch::default();
+    let child_shutdown = Latch::default();
+    match source {
+        PreLoopStopSource::ScopeShutdown => {
+            let target = scope.request_shutdown();
+            assert_eq!(target, epoch.epoch());
+        }
+        PreLoopStopSource::ScopeForce => scope.force_shutdown(epoch.epoch()),
+        PreLoopStopSource::AncestorShutdown => {
+            // Parent cancellation publishes the user-facing edge separately
+            // from the nested driver's framework-only observation edge. The
+            // fixture deliberately withholds that separate parent-published
+            // edge so the post-call assertion observes only what this path
+            // fires: the ancestor arm must not couple its framework observer
+            // back to user-installable cancellation waiters.
+            ancestor_shutdown.fire();
+        }
+    }
+    let ready = CompletionGatedLatch::default();
+    let result = super::super::run_nested_tree_with_epoch(
+        tree.into_core_for_test(),
+        Arc::clone(&scope),
+        crate::policy::ResolvedDefaults::default(),
+        NestedScopeLatches {
+            parent_ready: ready.clone(),
+            child_shutdown: child_shutdown.clone(),
+            ancestor: AncestorCommandLatches {
+                framework_shutdown: ancestor_shutdown.clone(),
+                abort: Latch::default(),
+                abort_ack: Latch::default(),
+            },
+        },
+        epoch,
+    )
+    .await;
+
+    assert!(result.is_ok());
+    match source {
+        PreLoopStopSource::ScopeShutdown | PreLoopStopSource::ScopeForce => assert!(
+            child_shutdown.is_fired(),
+            "a self-requested stop fires the user-facing latch that classifies the exit as cancelled"
+        ),
+        PreLoopStopSource::AncestorShutdown => assert!(
+            !child_shutdown.is_fired(),
+            "an ancestor-driven stop leaves the user-facing latch to the parent that published it"
+        ),
+    }
+    assert!(matches!(
+        scope.record().startup,
+        Some(Err(StartupError::ShutdownRequested))
+    ));
+    assert!(matches!(
+        scope.record().state,
+        ScopeState::Stopped {
+            reason: StopReason::ShutdownRequested
+        }
+    ));
+    assert!(!ready.is_fired());
+    assert!(matches!(worker.wait().await.kind(), ExitKind::NeverStarted));
+}
+
+#[crate::runtime::test]
+async fn pre_loop_shutdown_upgrades_a_nested_lowering_failure() {
+    assert_pre_loop_stop_upgrades_a_nested_lowering_failure(PreLoopStopSource::ScopeShutdown).await;
+}
+
+#[crate::runtime::test]
+async fn pre_loop_force_upgrades_a_nested_lowering_failure() {
+    assert_pre_loop_stop_upgrades_a_nested_lowering_failure(PreLoopStopSource::ScopeForce).await;
+}
+
+#[crate::runtime::test]
+async fn pre_loop_ancestor_shutdown_upgrades_a_nested_lowering_failure() {
+    assert_pre_loop_stop_upgrades_a_nested_lowering_failure(PreLoopStopSource::AncestorShutdown)
+        .await;
 }

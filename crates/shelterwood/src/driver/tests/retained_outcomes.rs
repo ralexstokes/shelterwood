@@ -33,11 +33,9 @@ fn pending_drain_suffix_contains_failed_outcome_destruction_during_unwind() {
     let child = ChildKey::fixture(1);
     let id = ChildId::from("worker");
     let mut identity = ScopeIdentity::new();
-    let minted = identity
-        .mint_membership(&id)
-        .expect("membership is available");
+    let minted = identity.mint_membership(&id);
     let (_, mut incarnations) = minted.into_pair();
-    let incarnation = incarnations.mint().expect("incarnation is available");
+    let incarnation = incarnations.mint();
     let (dropped, observed) = mpsc::sync_channel(1);
     let exited = Pending::Child(ChildEvent::Exited {
         child,

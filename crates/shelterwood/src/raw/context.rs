@@ -1397,7 +1397,7 @@ mod tests {
     -> (RawContext<M>, ActorRef<M>, Latch, Latch) {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("raw-actor");
-        let member = MemberCell::new(identity.mint_membership(&id).expect("membership available"));
+        let member = MemberCell::new(identity.mint_membership(&id));
         let mailbox = MailboxCell::new(id.clone(), crate::runtime::mailbox_runtime());
         member.attach_mailbox(mailbox.clone());
         let mut effects = MailboxEffectQueue::default();
@@ -1406,19 +1406,12 @@ mod tests {
             ResolvedDefaults::default().mailbox(),
             &mut effects,
         );
-        let incarnation = member
-            .take_incarnation_counter()
-            .mint()
-            .expect("incarnation available");
+        let incarnation = member.take_incarnation_counter().mint();
         MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
 
         let mut scope_identity = ScopeIdentity::new();
         let scope_id = ChildId::from("scope");
-        let scope_member = MemberCell::new(
-            scope_identity
-                .mint_membership(&scope_id)
-                .expect("membership available"),
-        );
+        let scope_member = MemberCell::new(scope_identity.mint_membership(&scope_id));
         let scope = ScopeCell::new(scope_member, ScopeFlavor::Ordered, ScopeIdentity::new());
 
         let myself = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));

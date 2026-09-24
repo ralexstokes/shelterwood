@@ -120,8 +120,9 @@ rests on:
   leaf mutex and invoked only after unlock, so no foreign code runs under
   the lock. The same `fn(Waker)` disposer is `WakerAction::Run` and the
   argument of `ProxiedSleep::new`; the adapter supplies `dispose_waker`, its
-  detached disposal lane, and it runs only from the post-unlock flush. `ProxiedPoll`, the probe/register/re-poll state machine that
-  wraps it, rides under the same ruling: its `poll` takes caller-supplied
+  detached disposal lane, and it runs only from the post-unlock flush.
+  `ProxiedPoll`, the probe/register/re-poll state machine that wraps it,
+  rides under the same ruling: its `poll` takes caller-supplied
   closures, but they are invoked only with no proxy mutex held, and its
   ready-edge retirement flushes the stored caller waker through the same
   post-unlock effects path. The supported façade re-exports neither type

@@ -1013,6 +1013,105 @@ mod tests {
         }))
     }
 
+    /// A guarded cut derives its guards by walking the public projection, so
+    /// every exit-bearing position must be reached: scope state, a child's
+    /// terminal state and last exit, and a nested scope's cut.
+    #[test]
+    fn a_guarded_snapshot_isolates_every_exit_it_projects() {
+        use shelterwood_core::{
+            RestartCount, RestartPolicy, Retention, StartupFailure, StartupFailureCause,
+            engine::MembershipStatus,
+        };
+
+        use super::{ChildSnapshot, ChildState};
+        use crate::cells::test_support::ThreadProbe;
+
+        let retiring_thread = std::thread::current().id();
+        let mut identity = ScopeIdentity::new();
+        let mut probes = Vec::new();
+        let mut failed = || {
+            let (dropped, observed) = mpsc::sync_channel(1);
+            probes.push(observed);
+            Exit::failed(
+                ExitError::from(ThreadProbe(dropped)),
+                Cancellation::NotObserved,
+            )
+        };
+        let membership = identity
+            .mint_membership(&ChildId::from("trigger"))
+            .membership();
+        let mut child = |id: &str, state: ChildState, last_exit, nested| ChildSnapshot {
+            id: ChildId::from(id),
+            membership: identity.mint_membership(&ChildId::from(id)).membership(),
+            incarnation: None,
+            state,
+            last_exit,
+            membership_status: MembershipStatus::Active,
+            restart_count: RestartCount::ZERO,
+            restart_policy: RestartPolicy::default(),
+            retention: Retention::Retain,
+            restart_at: None,
+            nested,
+            scope_seq: None,
+        };
+        let cut = |state: ScopeState, children: Vec<ChildSnapshot>| {
+            Arc::new(ScopeSnapshot {
+                state,
+                kind: ScopeFlavor::Dynamic,
+                strategy: None,
+                intensity: Intensity::default(),
+                total_restarts: TotalRestarts::ZERO,
+                lifecycle_seq: LifecycleSeq::new(0),
+                children: children.into(),
+            })
+        };
+        let aborted = failed();
+        let nested = cut(
+            ScopeState::Running,
+            vec![child(
+                "inner",
+                ChildState::StartupAborted { exit: aborted },
+                None,
+                None,
+            )],
+        );
+        let stopped = failed();
+        let last = failed();
+        let startup = failed();
+        let root = cut(
+            ScopeState::Stopped {
+                reason: StopReason::StartupFailed(StartupFailure {
+                    cause: StartupFailureCause::Child {
+                        id: ChildId::from("trigger"),
+                        membership,
+                        exit: startup,
+                    },
+                }),
+            },
+            vec![
+                child(
+                    "leaf",
+                    ChildState::Stopped { exit: stopped },
+                    Some(last),
+                    None,
+                ),
+                child("scope", ChildState::Running, None, Some(nested)),
+            ],
+        );
+
+        drop(Guarded::new(root));
+
+        for observed in probes {
+            assert_ne!(
+                observed
+                    .recv_timeout(TEST_WAIT)
+                    .expect("every projected failure is disposed"),
+                retiring_thread,
+                "a guarded snapshot must isolate every exit it projects"
+            );
+        }
+    }
+
     struct DropSignal(mpsc::SyncSender<()>);
 
     impl fmt::Debug for DropSignal {

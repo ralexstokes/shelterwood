@@ -34,3 +34,13 @@ fn ring_zero_names_stored_handles(
     _token: CancellationToken,
 ) {
 }
+
+/// Each ring-1 bundle is complete for its own area. A file that globs only
+/// `prelude::raw` can still name the token its `run_blocking` closures
+/// receive, even though ring 0 exports it as well.
+mod raw_bundle_alone {
+    use shelterwood::prelude::raw::*;
+
+    #[allow(dead_code)]
+    fn names_the_blocking_token(_token: CancellationToken) {}
+}

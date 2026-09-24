@@ -139,13 +139,15 @@ pub mod errors {
 /// A [`crate::RawActor`] owns its receive loop instead of returning to a callback
 /// dispatcher. The offload machinery in this bundle is shared with
 /// callback actors, so a file that leases work out without writing a raw
-/// loop still wants it. [`crate::CancellationToken`], which every `run_blocking`
-/// closure receives, is in ring 0: task contexts hand it out too.
+/// loop still wants it. [`crate::CancellationToken`] is the argument every
+/// `run_blocking` closure receives. It is also in ring 0, because task
+/// contexts hand it out too, and it stays here so this bundle is complete
+/// on its own.
 pub mod raw {
     #[doc(no_inline)]
     pub use crate::{
-        Blocking, DeadlineBudget, DeadlineElapsed, Guard, Handler, RawActor, RawContext, RawDef,
-        RawOnceDef, Rejected,
+        Blocking, CancellationToken, DeadlineBudget, DeadlineElapsed, Guard, Handler, RawActor,
+        RawContext, RawDef, RawOnceDef, Rejected,
     };
 }
 

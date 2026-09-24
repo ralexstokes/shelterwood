@@ -5,6 +5,7 @@
 //! so the hostile drop vtable never fires here — contained ready-path
 //! destruction and the detached cancellation venue are pinned by
 //! `shelterwood-runtime`'s `sync` unit tests instead.
+//! Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
 
 mod common;
 

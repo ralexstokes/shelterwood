@@ -999,7 +999,6 @@ mod tests {
             .lock()
             .expect("mailbox mutex poisoned")
             .waiters()
-            .expect("a frozen mailbox owns its parked waiters")
             .is_empty()
     }
 
@@ -1278,7 +1277,7 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let state = mailbox.state.lock().expect("mailbox mutex poisoned");
         assert!(state.queue.is_empty());
-        assert!(state.waiters().is_some_and(|waiters| waiters.is_empty()));
+        assert!(state.waiters().is_empty());
     }
 
     /// Records the thread a destructor ran on, so a test can tell an inline
@@ -1777,38 +1776,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_message_invariant_is_contained_during_an_existing_unwind() {
-        let (mailbox, actor): (Arc<MailboxCell<u8>>, ActorRef<u8>) = actor_for();
-        let mut send = Box::pin(actor.send(7));
-        assert!(
-            send.as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-        let operation = parked_operation(&send);
-        let teardown = prepare_termination(&mailbox).expect("the mailbox terminates once");
-        drop(teardown.finish());
-        let retained = {
-            let mut state = operation.state.lock().expect("send operation mutex");
-            let OperationOutcome::Terminated { message, .. } = &mut state.outcome else {
-                panic!("termination publishes a terminal operation")
-            };
-            message.take().expect("termination retains the message")
-        };
-
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _send = send;
-            panic!("primary unwind");
-        }))
-        .expect_err("the primary panic survives send drop");
-        assert_eq!(
-            panic.downcast_ref::<&'static str>().copied(),
-            Some("primary unwind")
-        );
-        assert_eq!(retained, 7);
-    }
-
-    #[test]
     fn retiring_a_clone_window_replacement_runs_outside_the_operation_lock() {
         let (mailbox, actor): (Arc<MailboxCell<u8>>, ActorRef<u8>) = actor_for();
         let mut send = Box::pin(actor.send(7));
@@ -1886,7 +1853,7 @@ mod tests {
                         .upgrade()
                         .expect("the polled operation outlives its replacement waker");
                     let mut state = operation.state.lock().expect("send operation mutex");
-                    state.outcome = OperationOutcome::Withdrawn;
+                    state.outcome = OperationOutcome::Retired;
                 }
             },
             {
@@ -1906,7 +1873,7 @@ mod tests {
         .expect_err("a withdrawn operation raises its defensive diagnostic");
         assert_eq!(
             panic.downcast_ref::<String>().map(String::as_str),
-            Some("a withdrawn send future was polled")
+            Some("a retired send operation was polled")
         );
         assert_eq!(await_disposal(&waker_thread), polling_thread);
     }

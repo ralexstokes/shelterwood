@@ -927,31 +927,27 @@ impl ScopeRuntime {
         );
     }
 
-    fn handle_admission(&mut self, mut request: AdmissionRequest) {
-        let Some(control) = request.control.upgrade() else {
-            request.complete(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
-            return;
-        };
+    fn handle_admission(&mut self, request: AdmissionRequest) {
+        // A request travels only on the lane of the `DynamicControl` that
+        // started it, and only the incarnation owning that control holds the
+        // lane's receiver, so the request's control is this driver's own.
+        let control = Arc::clone(
+            self.dynamic
+                .as_ref()
+                .expect("admission requests arrive only on a dynamic scope's control lane"),
+        );
         let lifecycle = self.supervisor.lifecycle();
         let not_admitting = if lifecycle.is_draining() {
             Some(NotAdmittingCause::Draining)
         } else if lifecycle.startup_failed() {
             Some(NotAdmittingCause::StartupFailed)
-        } else if self
-            .dynamic
-            .as_ref()
-            .is_none_or(|current| !Arc::ptr_eq(current, &control))
-        {
-            Some(NotAdmittingCause::NoLiveIncarnation)
+        } else if request.fused_cancel.as_ref().is_some_and(Latch::is_fired) {
+            Some(NotAdmittingCause::ReservationEnded)
         } else {
             None
         };
         if let Some(cause) = not_admitting {
             self.reject_reserved_admission(request, &control, cause);
-            return;
-        }
-        if request.fused_cancel.as_ref().is_some_and(Latch::is_fired) {
-            self.reject_reserved_admission(request, &control, NotAdmittingCause::ReservationEnded);
             return;
         }
 
@@ -983,14 +979,14 @@ impl ScopeRuntime {
         let mut install = AdmissionInstall::new(&self.root, request, child);
         let root = Arc::clone(&self.root);
         let installed = root.with_observation_gate(|txn| {
-            // The dynamic-state mutex rides inside the root gate here. The
-            // route check above admitted only a request whose control is this
-            // driver's live one, so its reservation was minted against this
-            // very root and adopted onto this same gate before publication,
-            // and a root with a live dynamic route cannot be re-homed. Thus
-            // `admit_child_locked`'s handoff check below short-circuits on gate
-            // identity: it never acquires a second gate under `state`. This is
-            // the install half of the admission exemption in AGENTS.md.
+            // The dynamic-state mutex rides inside the root gate here. This
+            // driver's control is the request's own, so its reservation was
+            // minted against this very root and adopted onto this same gate
+            // before publication, and a root with a live dynamic route cannot
+            // be re-homed. Thus `admit_child_locked`'s handoff check below
+            // short-circuits on gate identity: it never acquires a second
+            // gate under `state`. This is the install half of the admission
+            // exemption in AGENTS.md.
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
             let id = install.slot().member.id().clone();
             let membership = install.slot().member.membership();

@@ -3,7 +3,7 @@
 use std::{
     any::Any,
     collections::{HashMap, hash_map::Entry},
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
 };
 
 use crate::{
@@ -331,7 +331,6 @@ impl DynamicControl {
         }
         let (sender, response) = runtime::oneshot();
         let request = AdmissionRequest {
-            control: Arc::downgrade(&self),
             slot,
             fused_cancel,
             response: Obligation::new(sender, |sender| {
@@ -602,10 +601,10 @@ fn defer_driver_event(txn: &mut ObservationTxn<'_>, control: &DynamicControl, ev
     });
 }
 
+/// One admission, queued on the lane of the `DynamicControl` that reserved
+/// its slot. Only that control's incarnation drains the lane, so the driver
+/// handling a request always holds the reserving control itself.
 pub(super) struct AdmissionRequest {
-    // Concrete so rejection can dispose the reservation through the very
-    // control that reserved it, even when it is no longer the live route.
-    pub(super) control: Weak<DynamicControl>,
     pub(super) slot: Arc<SlotCell>,
     pub(super) fused_cancel: Option<Latch>,
     response: Obligation<runtime::OneShotSender<Result<(), ReserveError>>>,

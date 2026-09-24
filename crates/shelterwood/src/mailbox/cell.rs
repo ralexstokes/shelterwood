@@ -1021,9 +1021,7 @@ impl<M: Send + 'static> MailboxCell<M> {
             // Acceptance and termination took the waker in the critical
             // section that published their outcome, so this is normally
             // empty for them.
-            state
-                .waker
-                .take(disposition.action(&self.runtime), &mut waker_effects);
+            state.waker.take(disposition.action(), &mut waker_effects);
             (outcome, state.registration.take())
         };
         // Promotion clears a registration under this lock before it leaves
@@ -1262,10 +1260,10 @@ pub(super) enum WithdrawalDisposition {
 }
 
 impl WithdrawalDisposition {
-    fn action(self, runtime: &Arc<dyn MailboxRuntime>) -> WakerAction {
+    fn action(self) -> WakerAction {
         match self {
             Self::Inline => WakerAction::DropInline,
-            Self::Isolated => WakerAction::Dispose(Arc::clone(runtime)),
+            Self::Isolated => WakerAction::Run(crate::runtime::dispose_waker),
         }
     }
 }

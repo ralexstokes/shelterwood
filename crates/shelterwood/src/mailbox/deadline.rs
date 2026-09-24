@@ -154,7 +154,7 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
                 && let Some(deadline) = budget.instant()
             {
                 let timer = this.runtime.sleep_until(Some(deadline));
-                this.timer = Some(ProxiedSleep::new(timer, Arc::clone(&this.runtime)));
+                this.timer = Some(ProxiedSleep::new(timer, crate::runtime::dispose_waker));
             }
         }
         // A zero budget short-circuits: the operation is never attempted, so

@@ -1,12 +1,11 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use crate::{
-    BoxedSleep, MailboxRuntime,
+    BoxedSleep,
     panic::PanicAccumulator,
     waker::{WakerAction, WakerEffects},
     waker_proxy::ProxiedPoll,
@@ -14,18 +13,18 @@ use crate::{
 
 /// Timer future that keeps a caller-owned waker out of the runtime's wheel.
 ///
-/// Runtime adapters supply the raw timer, while this wrapper owns the common
-/// framework boundary: the external primitive registers only a stable proxy,
+/// Runtime adapters supply the raw timer and a waker disposer, while this
+/// wrapper owns the common framework boundary: the external primitive registers only a stable proxy,
 /// and the caller's waker stays in the proxy's effects-mediated private slot.
 /// A timer that is ready on the first no-op probe allocates no proxy.
 ///
 /// Poll-path retirement is synchronous and contained. Drop-glue retirement
-/// first hands the caller waker to the runtime's disposal lane, then cancels
+/// first hands the caller waker to the adapter's disposer, then cancels
 /// the framework-only wheel entry synchronously. This is the venue split
 /// established for public mailbox deadlines by #398.
 #[doc(hidden)]
 pub struct ProxiedSleep {
-    runtime: Arc<dyn MailboxRuntime>,
+    dispose: fn(Waker),
     timer: Option<BoxedSleep>,
     timer_poll: ProxiedPoll,
     completed: bool,
@@ -37,10 +36,12 @@ impl ProxiedSleep {
     /// The timer must be framework-owned: its poll and drop implementations
     /// are invoked inside framework containment boundaries, and the supported
     /// façade exposes no way for an application to construct this type.
+    /// `dispose` receives a caller waker still registered when drop glue runs,
+    /// and is invoked only from the post-unlock effects flush.
     #[doc(hidden)]
-    pub fn new(timer: BoxedSleep, runtime: Arc<dyn MailboxRuntime>) -> Self {
+    pub fn new(timer: BoxedSleep, dispose: fn(Waker)) -> Self {
         Self {
-            runtime,
+            dispose,
             timer: Some(timer),
             timer_poll: ProxiedPoll::new(),
             completed: false,
@@ -73,7 +74,7 @@ impl ProxiedSleep {
     }
 
     fn retire_disposing(&mut self, panics: &mut PanicAccumulator) {
-        self.retire(WakerAction::Dispose(Arc::clone(&self.runtime)), panics);
+        self.retire(WakerAction::Run(self.dispose), panics);
     }
 
     fn retire(&mut self, action: WakerAction, panics: &mut PanicAccumulator) {
@@ -152,48 +153,16 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-        time::Instant,
     };
 
     use super::ProxiedSleep;
-    use crate::{
-        BoxedSleep, ErasedOneShotReceiver, ErasedOneShotSender, MailboxRuntime, MailboxSignal,
-    };
+    use crate::BoxedSleep;
 
-    /// Stub capability object: `ProxiedSleep` itself touches the runtime only
-    /// through `dispose`, and every path these tests drive retires the caller
-    /// slot inline, so every capability is unreachable by construction.
-    struct InertRuntime;
-
-    impl MailboxRuntime for InertRuntime {
-        fn oneshot(
-            &self,
-        ) -> (
-            Box<dyn ErasedOneShotSender>,
-            Pin<Box<dyn ErasedOneShotReceiver>>,
-        ) {
-            unreachable!("proxied-sleep tests never open a one-shot");
-        }
-
-        fn signal(&self) -> Arc<dyn MailboxSignal> {
-            unreachable!("proxied-sleep tests never mint a signal");
-        }
-
-        fn dispose(&self, _value: Box<dyn Send + 'static>) {
-            unreachable!("inline retirement leaves drop glue nothing to dispose");
-        }
-
-        fn now(&self) -> Instant {
-            unreachable!("proxied-sleep tests never read the clock");
-        }
-
-        fn sleep_until(&self, _deadline: Option<Instant>) -> BoxedSleep {
-            unreachable!("proxied-sleep tests supply their raw timer directly");
-        }
-    }
-
-    fn runtime() -> Arc<dyn MailboxRuntime> {
-        Arc::new(InertRuntime)
+    /// `ProxiedSleep` hands a waker to its disposer only from drop glue, and
+    /// every path these tests drive retires the caller slot inline first, so
+    /// this disposer is never reached.
+    fn inert(waker: Waker) {
+        drop(waker);
     }
 
     #[derive(Default)]
@@ -292,7 +261,7 @@ mod tests {
         let waker = ManuallyDrop::new(counting_waker(&state));
         let mut context = Context::from_waker(&waker);
         let raw: BoxedSleep = Box::pin(std::future::ready(()));
-        let mut timer = Box::pin(ProxiedSleep::new(raw, runtime()));
+        let mut timer = Box::pin(ProxiedSleep::new(raw, inert));
 
         assert!(timer.as_mut().poll(&mut context).is_ready());
         assert_eq!(state.clones.load(Ordering::SeqCst), 0);
@@ -326,7 +295,7 @@ mod tests {
             polls: 0,
             registered: None,
         });
-        let mut timer = Box::pin(ProxiedSleep::new(raw, runtime()));
+        let mut timer = Box::pin(ProxiedSleep::new(raw, inert));
 
         assert!(timer.as_mut().poll(&mut context).is_pending());
         assert_eq!(state.clones.load(Ordering::SeqCst), 1);
@@ -355,7 +324,7 @@ mod tests {
         let waker = ManuallyDrop::new(counting_waker(&state));
         let mut context = Context::from_waker(&waker);
         let raw: BoxedSleep = Box::pin(std::future::pending());
-        let mut timer = ProxiedSleep::new(raw, runtime());
+        let mut timer = ProxiedSleep::new(raw, inert);
 
         assert!(Pin::new(&mut timer).poll(&mut context).is_pending());
         assert_eq!(state.clones.load(Ordering::SeqCst), 1);
@@ -387,7 +356,7 @@ mod tests {
         let waker = ManuallyDrop::new(counting_waker(&state));
         let mut context = Context::from_waker(&waker);
         let raw: BoxedSleep = Box::pin(WakeOnDropTimer::default());
-        let mut timer = ProxiedSleep::new(raw, runtime());
+        let mut timer = ProxiedSleep::new(raw, inert);
 
         assert!(Pin::new(&mut timer).poll(&mut context).is_pending());
         assert_eq!(state.clones.load(Ordering::SeqCst), 1);

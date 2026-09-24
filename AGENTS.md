@@ -26,7 +26,7 @@ Two types implement the rule and are the shapes to reach for:
   Every retained control-plane writer takes the token, which makes both an
   out-of-transaction mutation and a post-commit surrender unavailable by
   construction.
-- **`MailboxTxn`** (`crates/shelterwood/src/mailbox/cell.rs`) is the same idea for
+- **`MailboxTxn`** (`crates/shelterwood/src/mailbox/cell/effects.rs`) is the same idea for
   every mutable mailbox transition. It owns the state guard beside a
   `MailboxEffects` sink that collects signal pulses, waker wake/drop actions,
   displaced payloads and isolated-disposal requests; its `Drop` empties the

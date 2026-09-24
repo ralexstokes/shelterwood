@@ -36,11 +36,6 @@ impl RetainGuards for ScopeRecord {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct ObservationConfig {
-    intensity: Intensity,
-}
-
 impl ScopeCell {
     pub(crate) fn record(&self) -> Guarded<ScopeRecord> {
         self.observation.record.read_cloned()
@@ -51,14 +46,13 @@ impl ScopeCell {
         self.observation.record.watcher()
     }
 
-    pub(crate) fn set_observation_config(&self, intensity: Intensity) {
+    pub(crate) fn set_intensity(&self, intensity: Intensity) {
         self.with_observation_gate(|wakes| {
             *self
                 .observation
-                .config
+                .intensity
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                ObservationConfig { intensity };
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = intensity;
             self.publish_snapshot_chain_locked(wakes);
         });
     }
@@ -117,9 +111,9 @@ impl ScopeCell {
     /// is refcount traffic. [`Self::snapshot_locked`] guards the finished cut.
     fn project_locked(&self) -> Arc<ScopeSnapshot> {
         let record = self.record();
-        let config = *self
+        let intensity = *self
             .observation
-            .config
+            .intensity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let children = self.current_children();
@@ -138,7 +132,7 @@ impl ScopeCell {
             state: record.state.clone(),
             kind: self.flavor,
             strategy: (self.flavor == ScopeFlavor::Ordered).then_some(Strategy::default()),
-            intensity: config.intensity,
+            intensity,
             total_restarts: record.total_restarts,
             lifecycle_seq: LifecycleSeq::new(
                 self.observation.lifecycle_seq.load(Ordering::Acquire),

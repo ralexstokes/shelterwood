@@ -969,7 +969,7 @@ fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
     let scope = isolated_scope("scope", ScopeFlavor::Ordered);
     let first = Intensity::new(1, Duration::from_secs(1)).expect("valid first intensity");
     let second = Intensity::new(2, Duration::from_secs(2)).expect("valid second intensity");
-    scope.set_observation_config(first);
+    scope.set_intensity(first);
 
     let start = Arc::new(Barrier::new(2));
     let (first_update, first_update_seen) = std::sync::mpsc::sync_channel(0);
@@ -980,7 +980,7 @@ fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
         writer_start.wait();
         for update in 0..UPDATES {
             let intensity = if update % 2 == 0 { second } else { first };
-            writer_scope.set_observation_config(intensity);
+            writer_scope.set_intensity(intensity);
             if update == 0 {
                 first_update
                     .send(())
@@ -1157,7 +1157,7 @@ fn plain_parent_state_preserves_nested_snapshot_propagation() {
     let snapshots = root.subscribe_snapshots();
     let intensity = Intensity::new(7, Duration::from_secs(11)).expect("valid intensity");
 
-    nested.set_observation_config(intensity);
+    nested.set_intensity(intensity);
 
     assert_eq!(
         snapshots

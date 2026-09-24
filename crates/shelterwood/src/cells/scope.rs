@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicUsize;
 
 use crate::runtime;
 use shelterwood_core::{
-    ChildId, Exit, Incarnation, Membership, TotalRestarts,
+    ChildId, Exit, Incarnation, Intensity, Membership, TotalRestarts,
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{StartupError, StopReason, stop_reason_precedence},
     identity::{
@@ -254,7 +254,7 @@ pub(crate) enum ScopeControlEvent {
 /// lifecycle sequence minting remain independent driver-only counters. The
 /// member-record watch is intentionally also the driver's wake bus.
 struct ScopeObservation {
-    config: Mutex<ObservationConfig>,
+    intensity: Mutex<Intensity>,
     record: runtime::WatchSender<Guarded<ScopeRecord>>,
     // Removal paths move residents into transaction effects before emitting
     // their `Removed` edges. A projection can be the last member/mailbox
@@ -317,7 +317,6 @@ mod projection;
 #[cfg(test)]
 mod stress_tests;
 
-use projection::ObservationConfig;
 pub(crate) use projection::ScopeRecord;
 
 impl ScopeCell {
@@ -363,7 +362,7 @@ impl ScopeCell {
             control: Mutex::new(ScopeControl::default()),
             dynamic_route: Mutex::new(None),
             observation: ScopeObservation {
-                config: Mutex::new(ObservationConfig::default()),
+                intensity: Mutex::new(Intensity::default()),
                 record,
                 current_children: Mutex::new(Vec::new()),
                 parent: Mutex::new(None),

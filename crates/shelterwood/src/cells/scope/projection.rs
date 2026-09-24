@@ -1,14 +1,15 @@
 use std::sync::{Arc, atomic::Ordering};
 
 use shelterwood_core::{
-    Intensity, Strategy, TotalRestarts, engine::ScopeState, exit::StartupError, policy::ScopeFlavor,
+    Exit, Intensity, Strategy, TotalRestarts, engine::ScopeState, exit::StartupError,
+    policy::ScopeFlavor,
 };
 
 #[cfg(test)]
 use crate::runtime;
 
 use crate::cells::{
-    MemberRecord, MemberStage, ObservationTxn, RetainedExit,
+    MemberRecord, MemberStage, ObservationTxn, Retained,
     observe::{
         ChildSnapshot, ChildState, LifecycleEventKind, LifecycleEvents, LifecycleSeq,
         RetainedLifecycleEvent, RetainedScopeSnapshot, ScopeSnapshot, SnapshotReceiver,
@@ -29,17 +30,17 @@ pub(crate) struct ScopeRecord {
     // Keep this field after every public projection that can contain a child
     // exit. ScopeRecord clones share the guard allocation, so read-only
     // observation does not submit one disposal job per read.
-    pub(super) retained_exits: Arc<Vec<RetainedExit>>,
+    pub(super) retained_exits: Arc<Vec<Retained<Exit>>>,
 }
 
 impl ScopeRecord {
-    pub(super) fn refresh_retained_exits(&mut self, surrendered: &mut Vec<RetainedExit>) {
+    pub(super) fn refresh_retained_exits(&mut self, txn: &mut ObservationTxn<'_>) {
         let mut retained = Vec::new();
-        RetainedExit::retain_scope_state(&mut retained, &self.state);
+        Retained::retain_scope_state(&mut retained, &self.state);
         if let Some(startup) = &self.startup {
-            RetainedExit::retain_startup_result(&mut retained, startup);
+            Retained::retain_startup_result(&mut retained, startup);
         }
-        RetainedExit::install(&mut self.retained_exits, retained, surrendered);
+        Retained::install(&mut self.retained_exits, retained, txn);
     }
 }
 
@@ -120,7 +121,7 @@ impl ScopeCell {
         events
     }
 
-    fn snapshot_locked(&self, surrendered: &mut Vec<RetainedExit>) -> RetainedScopeSnapshot {
+    fn snapshot_locked(&self, surrendered: &mut Vec<Retained<Exit>>) -> RetainedScopeSnapshot {
         let record = self.record();
         let config = *self
             .observation
@@ -130,7 +131,7 @@ impl ScopeCell {
         let children = self.current_children();
         let mut projected = Vec::with_capacity(children.len());
         let mut retained_exits = Vec::new();
-        RetainedExit::retain_scope_state(&mut retained_exits, &record.state);
+        Retained::retain_scope_state(&mut retained_exits, &record.state);
         // An admission that unwound past its residency push leaves a resident
         // whose `Added` was never published. SPEC §3.2 keeps such a membership
         // out of `children` / `child(id)` / `descendant(path)` exactly as it
@@ -141,7 +142,7 @@ impl ScopeCell {
             let (child, exits) = self.child_snapshot_locked(resident.projection(), surrendered);
             projected.push(child);
             for exit in exits {
-                RetainedExit::retain_owned(&mut retained_exits, exit, surrendered);
+                Retained::retain_owned(&mut retained_exits, exit, surrendered);
             }
         }
         let snapshot = Arc::new(ScopeSnapshot {
@@ -161,8 +162,8 @@ impl ScopeCell {
     fn child_snapshot_locked(
         &self,
         child: &ResidentProjection,
-        surrendered: &mut Vec<RetainedExit>,
-    ) -> (ChildSnapshot, Vec<RetainedExit>) {
+        surrendered: &mut Vec<Retained<Exit>>,
+    ) -> (ChildSnapshot, Vec<Retained<Exit>>) {
         let MemberRecord {
             stage,
             incarnation,
@@ -189,7 +190,7 @@ impl ScopeCell {
             .map(|nested| {
                 let (snapshot, exits) = nested.into_parts();
                 for exit in exits {
-                    RetainedExit::retain_owned(&mut retained_exits, exit, surrendered);
+                    Retained::retain_owned(&mut retained_exits, exit, surrendered);
                 }
                 snapshot
             });
@@ -200,16 +201,16 @@ impl ScopeCell {
             MemberStage::Restarting => ChildState::Restarting,
             MemberStage::Stopping => ChildState::Stopping,
             MemberStage::Terminal(exit) if startup_aborted => {
-                RetainedExit::retain_exit(&mut retained_exits, &exit);
+                Retained::retain_exit(&mut retained_exits, &exit);
                 ChildState::StartupAborted { exit }
             }
             MemberStage::Terminal(exit) => {
-                RetainedExit::retain_exit(&mut retained_exits, &exit);
+                Retained::retain_exit(&mut retained_exits, &exit);
                 ChildState::Stopped { exit }
             }
         };
         let last_exit = last_exit.inspect(|exit| {
-            RetainedExit::retain_exit(&mut retained_exits, exit);
+            Retained::retain_exit(&mut retained_exits, exit);
         });
         let snapshot = ChildSnapshot {
             id: child.member.id().clone(),

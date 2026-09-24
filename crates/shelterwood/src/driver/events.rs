@@ -19,7 +19,7 @@ pub(super) enum ChildEvent {
     Exited {
         child: ChildKey,
         incarnation: Incarnation,
-        recorded: Option<RetainedRecordedOutcome>,
+        recorded: Option<Retained<RecordedOutcome>>,
         join: runtime::JoinOutcome<()>,
         cancellation: Cancellation,
         readiness_signal_seen: bool,

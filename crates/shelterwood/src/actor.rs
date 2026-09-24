@@ -8,7 +8,7 @@ use crate::{
     ActorRef, Blocking, ChildId, DeadlineBudget, DeadlineElapsed, ExitError, ExitResult, Guard,
     Incarnation, Mailbox, MailboxShutdown, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
     ReadinessDeadline, Rejected, RestartPolicy, Retention, ScopeRef, Shutdown,
-    cells::{CancellationToken, RetainedExitResult},
+    cells::{CancellationToken, Retained},
     policy::CommonOptions,
 };
 
@@ -749,7 +749,7 @@ async fn fail_after_teardown<M: Send + 'static>(
     // A hard abort can cancel the resource join before the outer raw runner
     // receives this result. Keep its application error on the retained
     // disposal path throughout that earlier cleanup window too.
-    let result = RetainedExitResult::new(Err(error));
+    let result = Retained::new(Err(error));
     raw.freeze_resources();
     raw.join_resources().await;
     result.into_result()

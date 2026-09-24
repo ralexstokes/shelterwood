@@ -27,7 +27,7 @@ use crate::cells::observe::{LifecycleEventKind, LifecycleHub, SnapshotHub};
 
 use super::{
     MemberCell, MemberRecord, MemberStage, MemberTransition, ObservationGate, ObservationTxn,
-    RetainedExit, RetainedStopReason, StartupDisposition,
+    Retained, RetainedStopReason, StartupDisposition,
 };
 
 /// Crate-private close-admission hook retained by a restart-stable scope cell.
@@ -739,7 +739,7 @@ impl ScopeCell {
         // driver thread.
         let mut retained_startup = Vec::new();
         if let Some(startup) = &startup {
-            RetainedExit::retain_startup_result(&mut retained_startup, startup);
+            Retained::retain_startup_result(&mut retained_startup, startup);
         }
         let mut state = Some(state);
         let mut startup = startup;
@@ -800,12 +800,10 @@ impl ScopeCell {
         {
             route.close_admission(txn);
         }
-        let mut surrendered = Vec::new();
         self.observation.record.modify_silently(|record| {
             record.state = state.clone();
-            record.refresh_retained_exits(&mut surrendered);
+            record.refresh_retained_exits(txn);
         });
-        txn.surrender(surrendered);
         txn.pulse(&self.observation.record);
         txn.pulse(&self.member.record);
         self.emit_locked(txn, LifecycleEventKind::ScopeState { state });
@@ -912,7 +910,7 @@ impl ScopeCell {
         &self,
         member: &MemberCell,
         total_restarts: TotalRestarts,
-        exit_guard: RetainedExit,
+        exit_guard: Retained<Exit>,
         transition: MemberTransition,
         exited: LifecycleEventKind,
         scheduled: LifecycleEventKind,
@@ -940,7 +938,7 @@ impl ScopeCell {
     pub(crate) fn terminalize_child(
         &self,
         member: &MemberCell,
-        exit: impl Into<RetainedExit>,
+        exit: impl Into<Retained<Exit>>,
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
@@ -981,7 +979,7 @@ impl ScopeCell {
                 return None;
             };
             let nested = resident.scope;
-            let terminal_exit = member.terminalize_locked(exit.as_exit().clone(), startup, wakes);
+            let terminal_exit = member.terminalize_locked(exit.get().clone(), startup, wakes);
             // The terminal member record now owns the equivalent retained
             // copy, so surrender this transient guard as refcount traffic.
             wakes.surrender([exit]);
@@ -1094,23 +1092,21 @@ impl ScopeCell {
         txn: &mut ObservationTxn<'_>,
     ) -> bool {
         let mut retained = Vec::new();
-        RetainedExit::retain_startup_result(&mut retained, &startup);
+        Retained::retain_startup_result(&mut retained, &startup);
         let mut incoming = Some((startup, retained));
         let mut published = false;
-        let mut surrendered = Vec::new();
         self.observation.record.modify_silently(|record| {
             if record.startup.is_none() {
                 let (startup, retained) = incoming
                     .take()
                     .expect("startup result is installed at most once");
                 record.startup = Some(startup);
-                record.refresh_retained_exits(&mut surrendered);
+                record.refresh_retained_exits(txn);
                 // The record now owns an equivalent retained copy.
-                surrendered.extend(retained);
+                txn.surrender(retained);
                 published = true;
             }
         });
-        txn.surrender(surrendered);
         // Tuple field order is intentional: a rejected raw startup result is
         // released while its retained guards still exist, then those guards
         // transfer failed destruction to isolated disposal.
@@ -1156,14 +1152,12 @@ impl ScopeCell {
             // pairing is what lets `settled` treat terminal membership
             // plus a settled projection as final without stranding a scope
             // that still owns a live incarnation.
-            let mut surrendered = Vec::new();
             self.observation.record.modify_silently(|record| {
                 record.total_restarts = TotalRestarts::ZERO;
                 record.startup = None;
                 record.state = state.clone();
-                record.refresh_retained_exits(&mut surrendered);
+                record.refresh_retained_exits(wakes);
             });
-            wakes.surrender(surrendered);
             // Hold epoch ownership through its observation projection. A
             // stale finish and a newer begin can no longer cross these two
             // state planes in opposite orders.
@@ -1218,7 +1212,7 @@ impl ScopeCell {
         &self,
         epoch: Epoch,
         reason: StopReason,
-        exit: impl Into<RetainedExit>,
+        exit: impl Into<Retained<Exit>>,
     ) {
         let exit = exit.into();
         self.finish_incarnation_with_terminal(
@@ -1233,7 +1227,7 @@ impl ScopeCell {
         &self,
         epoch: Epoch,
         reason: RetainedStopReason,
-        mut terminal_exit: Option<RetainedExit>,
+        mut terminal_exit: Option<Retained<Exit>>,
         poison: ControlPoison,
     ) {
         self.with_observation_gate(move |wakes| {
@@ -1247,7 +1241,7 @@ impl ScopeCell {
                 drop(control);
                 if let Some(exit) = terminal_exit.take() {
                     self.member.terminalize_locked(
-                        exit.as_exit().clone(),
+                        exit.get().clone(),
                         StartupDisposition::Unchanged,
                         wakes,
                     );
@@ -1280,7 +1274,7 @@ impl ScopeCell {
             self.publish_stopped_locked(
                 wakes,
                 reason.as_reason().clone(),
-                terminal_exit.as_ref().map(|exit| exit.as_exit().clone()),
+                terminal_exit.as_ref().map(|exit| exit.get().clone()),
                 Some(control),
             );
             if terminal || membership_terminal {
@@ -1301,7 +1295,7 @@ impl ScopeCell {
         // These wrappers precede the control lookup: a poisoned framework
         // mutex must not retire either user-bearing input on this thread.
         let reason = RetainedStopReason::new(reason);
-        let exit = RetainedExit::new(exit);
+        let exit = Retained::new(exit);
         let epoch = {
             let control = self.control.lock().expect("scope control mutex poisoned");
             control.epochs.live_epoch()
@@ -1313,7 +1307,7 @@ impl ScopeCell {
                 self.publish_stopped_locked(
                     wakes,
                     reason.as_reason().clone(),
-                    Some(exit.as_exit().clone()),
+                    Some(exit.get().clone()),
                     None,
                 );
                 self.close_observation_locked(wakes);
@@ -1841,9 +1835,8 @@ impl ScopeCell {
         let incoming = stop_reason_precedence(&reason);
         let state = ScopeState::Stopped { reason };
         let mut transient_retained = Vec::new();
-        RetainedExit::retain_scope_state(&mut transient_retained, &state);
+        Retained::retain_scope_state(&mut transient_retained, &state);
         let mut published = false;
-        let mut surrendered = Vec::new();
         self.observation.record.modify_silently(|record| {
             if let ScopeState::Stopped { reason: recorded } = &record.state
                 && incoming <= stop_reason_precedence(recorded)
@@ -1854,10 +1847,9 @@ impl ScopeCell {
                 record.startup = Some(Err(StartupError::ShutdownRequested));
             }
             record.state = state.clone();
-            record.refresh_retained_exits(&mut surrendered);
+            record.refresh_retained_exits(wakes);
             published = true;
         });
-        wakes.surrender(surrendered);
         if let Some(exit) = terminal_exit {
             self.member
                 .terminalize_locked(exit, StartupDisposition::Unchanged, wakes);
@@ -2802,7 +2794,7 @@ mod tests {
             !root.publish_child_restart(
                 &member,
                 TotalRestarts::ZERO,
-                RetainedExit::new(exit.clone()),
+                Retained::new(exit.clone()),
                 MemberTransition::RestartScheduled {
                     exit: Exit::completed(Cancellation::NotObserved),
                     restart_count: RestartCount::ZERO.bump(),

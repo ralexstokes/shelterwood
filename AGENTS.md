@@ -18,7 +18,7 @@ Two types implement the rule and are the shapes to reach for:
 
 - **`ObservationTxn`** (`crates/shelterwood/src/cells/gate.rs`) holds the
   observation-gate guard plus a deferred-effect list. `defer`/`pulse` queue
-  work; `surrender` queues framework-internal `RetainedExit` raw drops in a
+  work; `surrender` queues framework-internal `Retained<Exit>` raw drops in a
   separate priority queue, so they run after unlock but before an ordinary
   effect can hand their co-owner to concurrent disposal. `commit` drops the guard *then* runs the
   queue through a `PanicAccumulator`. Its `Drop` runs the same path during an
@@ -58,15 +58,18 @@ rests on:
   provable. Prefer restructuring over the proof — the usual violation is a
   drop that *looks* like refcount traffic. Resident
   member records, scope records, lifecycle events, snapshot projections and
-  driver completions protect failed exits through `RetainedExit`; its drop
-  transfers destruction to `runtime::dispose_critical`, whose every path —
+  driver completions protect failed exits through `Retained<Exit>`. Every
+  `Retained<T: CarriesUserError>` drop transfers a value that owns a user
+  error to `runtime::dispose_critical`, whose every path —
   exhausted thread creation, and a runtime torn down under an accepted
   submission — keeps the job rather than destroying it inline. Records that
   hand out clones (`MemberRecord`, `ScopeRecord`) keep their guards behind one
   shared `Arc` placed after every raw projection, so a read is refcount
-  traffic and only the last clone submits disposal. Scope state and startup
+  traffic and only the last clone submits disposal. A write that changes the
+  guard set defers the displaced allocation to the transaction: it can be the
+  last owner of a user error the record no longer holds. Scope state and startup
   results need that protection too: a structured startup failure recursively
-  owns the triggering child's `Exit`. `RetainedRecordedOutcome` is the same
+  owns the triggering child's `Exit`. `Retained<RecordedOutcome>` is the same
   carrier one step earlier: a *provisional* `RecordedOutcome` owns the same
   type-erased application error before any verdict is selected, so the child
   task's report cell and the driver's exit event carry it retained and the
@@ -74,7 +77,7 @@ rests on:
   reaches those folds through `classify_exit_retaining` and
   `reconcile_recorded_outcomes_retaining`; the raw `shelterwood-core` folds hand
   both halves back and are for core's own tests.
-  `RetainedExit::into_user_owned` is deliberately narrower than surrender, and
+  `Retained<Exit>::into_user_owned` is deliberately narrower than surrender, and
   `pub(in crate::cells)` is what keeps it narrow: no driver-layer caller can
   extract a raw `Exit` from a carrier at all, so a carrier crossing a driver
   seam stays a carrier. Its two remaining users are
@@ -83,7 +86,7 @@ rests on:
   sites release a framework copy beside an installed co-owner and therefore
   rest on that co-owner proof rather than on construction. Every other
   framework-internal raw refcount drop goes through `ObservationTxn::surrender`.
-  `RetainedExitResult` covers the raw incarnation's epilogue: the completed
+  `Retained<ExitResult>` covers the raw incarnation's epilogue: the completed
   callback result stays in that carrier across the fallible teardown epilogue,
   so an epilogue panic transfers a failed result to critical disposal instead
   of destroying its application error during the unwind. The normal path takes
@@ -92,7 +95,7 @@ rests on:
   `admit_child_locked` route `Arc<MemberCell>`s through
   `runtime::dispose_detached` after unlock: the last member owner can also be
   the last owner of a mailbox containing unread user messages, which
-  `RetainedExit` does not cover. The first two displace an existing resident;
+  `Retained<Exit>` does not cover. The first two displace an existing resident;
   the third pushes the *incoming* projection into residency before its first
   fallible step, so a bookkeeping panic leaves the graph owned by residency
   and retires it the same way at scope clear. Such a resident stays
@@ -140,7 +143,7 @@ rests on:
   Runtime disposal (`dispose_detached`) is nonetheless kept off every locked
   path: it hands work to a blocking worker, so it belongs to the effects flush
   like the user code it carries. That is a preference, not a prohibition, and
-  `RetainedExit::drop` is where the difference shows: a submission runs no user
+  `Retained::drop` is where the difference shows: a submission runs no user
   code, so it is legal under a lock, but it can cost a native thread start, so
   a caller that already owns an effects sink should still flush it. The one
   exception to "no user code" is the process panic hook: when native-thread
@@ -163,7 +166,7 @@ rests on:
   (`ScopeCell::admit_observation_gate`, `ScopeCell::admit_child_locked`) —
   hold the exemption. Admission widens what runs inside the doubled section:
   the member record's watch-value mutex is taken there, and admission's
-  `MemberTransition` reaches `RetainedExit` clone/drop under both gates. That
+  `MemberTransition` reaches `Retained<Exit>` clone/drop under both gates. That
   stays inside the rule — the record is framework-owned data and the retained
   clone is provably non-last — but it is the deepest the exemption goes, so a
   new operation added to the doubled section needs the same accounting.
@@ -200,7 +203,7 @@ lifecycle events and admission projections. Raw incarnation-owned values —
 async offload futures, continuations, timers and completions — instead
 follow SPEC §6.5's on-task contained funnel, because a destructor panic
 there is cleanup evidence that exit classification must fold in.
-Framework-retained `Exit` copies meet it through `RetainedExit`,
+Framework-retained `Exit` copies meet it through `Retained<Exit>`,
 including driver completions and pending terminal disposal; exits handed to
 users keep ordinary drop timing. Its fail-safe under exhausted thread
 creation is an unreclaimed queued job — memory held for the life of the
@@ -219,7 +222,7 @@ recorded outcomes — lives in an owner whose `Drop` reports it, never in an
 async local held across an `.await`. A hard abort drops the future at whatever
 await it is parked on, and every local with it, silently; only a
 `Drop`-bearing owner (`RawIncarnationOwner` and the first-wins `PanicSlot`
-it reads, `RetainedExitResult`) still sees the evidence on that path. The shape to
+it reads, `Retained<ExitResult>`) still sees the evidence on that path. The shape to
 avoid is an epilogue that drains panics into a local and then awaits a join:
 an abort during the join publishes `Aborted` where SPEC §8's verdict
 precedence ("a panic is never masked, wherever it lands") requires `Panicked`.

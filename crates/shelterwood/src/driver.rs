@@ -33,9 +33,9 @@ use crate::{
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     cells::{
         LifecycleEventKind, MemberCell, MemberStage, MemberTransition, NotAdmittingCause,
-        ReserveError, ResidentProjection, RetainedExit, RetainedRecordedOutcome,
-        RetainedStopReason, ScopeCell, ScopeControlEvent, StartupDisposition,
-        classify_exit_retaining, reconcile_recorded_outcomes_retaining,
+        ReserveError, ResidentProjection, Retained, RetainedStopReason, ScopeCell,
+        ScopeControlEvent, StartupDisposition, classify_exit_retaining,
+        reconcile_recorded_outcomes_retaining,
     },
     deadline::Deadline,
     engine::{
@@ -450,7 +450,7 @@ struct ScopeRuntime {
     // finished result can all retain a structured startup reason containing
     // a child's raw Exit. Their fields retire before these guards detach the
     // corresponding failed payloads.
-    retained_exits: Vec<RetainedExit>,
+    retained_exits: Vec<Retained<Exit>>,
 }
 
 struct ScopeRuntimeWiring {
@@ -973,7 +973,7 @@ struct ScopeEpochGuard {
     // The core lifecycle retains raw structured stop reasons. Keep the
     // cells-layer guards last so unwind retires the reasons before detaching
     // their nested failed exits.
-    retained_exits: Vec<RetainedExit>,
+    retained_exits: Vec<Retained<Exit>>,
 }
 
 type NestedScopeStart = Obligation<Arc<ScopeCell>>;
@@ -1124,7 +1124,7 @@ async fn run_nested_tree_with_epoch(
             // verdict it generalizes.
             epoch.lifecycle.begin_drain({
                 let reason = StopReason::StartupFailed(failure);
-                RetainedExit::retain_stop_reason(&mut epoch.retained_exits, &reason);
+                Retained::retain_stop_reason(&mut epoch.retained_exits, &reason);
                 reason
             });
             let reason = epoch

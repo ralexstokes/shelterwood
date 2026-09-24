@@ -1,5 +1,5 @@
 use super::support::*;
-use crate::{cells::RetainedExit, driver::Instant, test_support::SHUTDOWN_BUDGET};
+use crate::{cells::Retained, driver::Instant, test_support::SHUTDOWN_BUDGET};
 
 struct BlockingFactoryDrop(Arc<FactoryGate>);
 
@@ -165,7 +165,7 @@ async fn refused_terminal_disposal_retires_its_exit_off_the_driver() {
     // still pins the refusal's disposal artifact to the blocking pool.
     scope.begin_terminal_disposal(
         ChildKey::fixture(999),
-        RetainedExit::new(Exit::failed(error, Cancellation::NotObserved)),
+        Retained::new(Exit::failed(error, Cancellation::NotObserved)),
         None,
         StartupDisposition::NotAborted,
     );
@@ -238,9 +238,9 @@ async fn latched_shutdown_upgrades_an_intensity_drain() {
     scope.handle_exit(
         key,
         incarnation,
-        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-            Err(ExitError::message("trip intensity")),
-        ))),
+        Some(Retained::new(RecordedOutcome::returned(Err(
+            ExitError::message("trip intensity"),
+        )))),
         crate::runtime::JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,
@@ -286,9 +286,9 @@ async fn force_upgrades_an_intensity_drain_to_shutdown_requested() {
     scope.handle_exit(
         key,
         incarnation,
-        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-            Err(ExitError::message("trip intensity")),
-        ))),
+        Some(Retained::new(RecordedOutcome::returned(Err(
+            ExitError::message("trip intensity"),
+        )))),
         crate::runtime::JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,

@@ -66,7 +66,7 @@ Exits follow SPEC §15.3's E1 rule — record, destroy, join, publish:
   join offloads, drop context, drop actor state) with cleanup panics
   subordinated to the primary, and the primary is resumed so the runtime
   join observes it.
-- Recording wraps the outcome in `RetainedRecordedOutcome`: a `Failed`
+- Recording wraps the outcome in `Retained<RecordedOutcome>`: a `Failed`
   outcome owns a type-erased user error, and retention keeps its eventual
   destruction off framework-critical paths (see
   [Locks, effects, and disposal](internals-concurrency.md)).
@@ -150,7 +150,7 @@ teardown in [Shutdown from the inside](internals-shutdown.md).
 ## Terminal
 
 A terminal exit is final at dispatch. The driver retains the exit
-(`RetainedExit`) and publishes it at once: terminalizing writes the
+(`Retained<Exit>`) and publishes it at once: terminalizing writes the
 member's terminal stage and last exit, and prepares mailbox termination —
 every parked sender wakes with `Terminated`, and unread payloads leave
 for detached disposal. A pre-ready failure then becomes a startup

@@ -29,7 +29,9 @@ fn fail_closed<T>(response: Option<T>, fallback: T, debug_panics: bool, what: &s
 
 /// An admission future.
 ///
-/// Fused additions abort on drop; split definitions detach after their first
+/// *Fused* admissions — the `add_*` methods on [`DynamicScopeRef`](crate::DynamicScopeRef),
+/// which reserve and define in one call — abort on drop. *Split* admissions —
+/// `define` on a slot from a `reserve_*` method — detach once their first
 /// poll starts admission. Reservation and that first poll require an ambient
 /// Tokio runtime. A first poll outside one returns [`ReserveError::NoRuntime`]
 /// and releases the reservation.
@@ -42,14 +44,16 @@ fn fail_closed<T>(response: Option<T>, fallback: T, debug_panics: bool, what: &s
 /// detach: the handles taken from the slot beforehand stay valid but name a
 /// child that never ran.
 ///
-/// The driver's admission obligation publishes an outcome on every path,
-/// including its own drop fallback, so this future always resolves to the
-/// admitted handles or a [`ReserveError`]. Should that obligation ever be
-/// destroyed without publishing — a framework invariant failure, not a
-/// condition callers can provoke — debug builds panic and release builds
+/// Polled to completion, the future yields the admitted handles or a
+/// [`ReserveError`]: the driver's admission obligation publishes an outcome
+/// on every path, including its own drop fallback. Should that obligation
+/// ever be destroyed without publishing — a framework invariant failure, not
+/// a condition callers can provoke — debug builds panic and release builds
 /// fail closed, resolving [`ReserveError::NotAdmitting`] with a terminal
 /// cause.
-/// Once complete, further polls return `Pending`.
+///
+/// After it has produced its result, further polls return `Pending`; they
+/// neither panic nor produce a second result.
 #[must_use]
 pub struct Admission<H> {
     state: AdmissionState<H>,
@@ -229,7 +233,8 @@ impl<H> Drop for Admission<H> {
 /// invariant failure — debug builds panic and release builds resolve
 /// [`RemoveOutcome::Removed`]: the removal latched at the call, and its route
 /// becoming terminal satisfies the removal goal.
-/// Once complete, further polls return `Pending`, as on [`Admission`].
+/// After it has produced its outcome, further polls return `Pending`, as on
+/// [`Admission`].
 #[must_use]
 pub struct Removal {
     inner: DisposingReceiver<RemoveOutcome>,

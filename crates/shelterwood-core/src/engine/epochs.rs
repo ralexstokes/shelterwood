@@ -71,10 +71,7 @@ impl ScopeEpochs {
         // A shutdown wait settles on `finished(target)`, so a freshly minted
         // epoch must not already read as finished — that would settle a wait
         // against the incarnation it just started.
-        // Diagnostic-only: the assignment above constructs the exact state
-        // `finished` reads. Cells calls this while holding scope control, so
-        // an always-on panic would poison that mutex without changing any
-        // reachable verdict.
+        // Debug-only: callers hold scope control (see the lock rule in AGENTS.md).
         debug_assert!(
             !self.finished(current),
             "a freshly minted epoch is not already finished"
@@ -112,9 +109,7 @@ impl ScopeEpochs {
                 // every later `finished(epoch)` — including one asked across a
                 // subsequent incarnation — keeps reporting it. A waiter that
                 // missed the pulse can therefore never park forever.
-                // Diagnostic-only for the same state written immediately
-                // above. The cells caller holds scope control here, and no
-                // correctness path depends on this redundant observation.
+                // Debug-only: callers hold scope control (see the lock rule in AGENTS.md).
                 debug_assert!(
                     self.finished(epoch),
                     "a finished epoch stays observably finished"

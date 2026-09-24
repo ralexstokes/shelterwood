@@ -10,21 +10,39 @@
 //! The broad exports are implementation seams for sibling crates. Runtime
 //! types remain unreachable from the supported `shelterwood` public API.
 
+mod blocking;
+mod channel;
 mod disposal;
+mod jitter;
+mod latch;
+mod oneshot;
+mod panic_payload;
+mod select;
 mod spawn;
-mod sync;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+#[allow(unsafe_code)] // raw-waker test doubles
+mod test_wakers;
 mod timer;
+mod waiters;
 mod waker_proxy;
+mod watch;
 
+pub use blocking::*;
+pub use channel::*;
 pub use disposal::*;
+pub use jitter::*;
+pub use latch::*;
+pub use oneshot::*;
+pub(crate) use panic_payload::*;
+pub use select::*;
 // Unwind handling is plain `std::panic`, so it lives in the runtime-neutral
 // core. Re-exported here because the adapter's own modules and the façade
 // reach it as a runtime facility.
 pub use shelterwood_core::{exit::JoinOutcome, panic::*};
 pub use spawn::*;
-pub use sync::*;
 pub use timer::*;
 #[cfg(feature = "test-util")]
 pub use tokio::test;
+pub use watch::*;

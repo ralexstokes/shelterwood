@@ -10,7 +10,7 @@ impl ScopeRuntime {
         if self.supervisor.membership_status(key) == MembershipStatus::Removing {
             return true;
         }
-        let Some(child) = self.children.get(key) else {
+        let Some(child) = self.children.get(&key) else {
             return false;
         };
         let Some(control) = &self.dynamic else {
@@ -37,7 +37,7 @@ impl ScopeRuntime {
         let Some(control) = &self.dynamic else {
             return;
         };
-        let member = Arc::clone(&self.children[key].slot.member);
+        let member = Arc::clone(&self.children[&key].slot.member);
         let id = member.id().clone();
         let root = Arc::clone(&self.root);
         let entry = root.with_observation_gate(|txn| {
@@ -83,7 +83,7 @@ impl ScopeRuntime {
     }
 
     pub(super) fn prune_terminal(&mut self, key: ChildKey) {
-        let member = Arc::clone(&self.children[key].slot.member);
+        let member = Arc::clone(&self.children[&key].slot.member);
         let root = Arc::clone(&self.root);
         let removed = root.with_observation_gate(|txn| {
             let mut state = self
@@ -119,7 +119,7 @@ impl ScopeRuntime {
     }
 
     pub(super) fn reclaim_child(&mut self, key: ChildKey) {
-        if self.children.get(key).is_none() {
+        if !self.children.contains_key(&key) {
             return;
         }
         assert!(
@@ -128,7 +128,7 @@ impl ScopeRuntime {
         );
         let mut child = self
             .children
-            .remove(key)
+            .remove(&key)
             .expect("the just-observed child remains registered");
         if let Some(deadline) = child.restart_deadline.take() {
             self.deadlines.cancel(deadline);

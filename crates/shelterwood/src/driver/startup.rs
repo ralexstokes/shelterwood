@@ -18,7 +18,7 @@ impl ScopeRuntime {
                 );
                 if let Some(active) = self
                     .children
-                    .get_mut(key)
+                    .get_mut(&key)
                     .and_then(|child| child.active.as_mut())
                     && active.incarnation == incarnation
                 {
@@ -48,7 +48,7 @@ impl ScopeRuntime {
                 // successor.
                 let live = self
                     .children
-                    .get(key)
+                    .get(&key)
                     .and_then(|child| child.active.as_ref())
                     .is_some_and(|active| active.incarnation == incarnation);
                 if !live {
@@ -59,7 +59,7 @@ impl ScopeRuntime {
                 }
                 self.reduce(SupervisorEvent::Ready { child: key });
                 let removing = self.supervisor.membership_status(key) == MembershipStatus::Removing;
-                let Some(child) = self.children.get_mut(key) else {
+                let Some(child) = self.children.get_mut(&key) else {
                     return false;
                 };
                 let Some(active) = child.active.as_mut() else {
@@ -104,7 +104,7 @@ impl ScopeRuntime {
     pub(super) fn handle_ready(&mut self, key: ChildKey, incarnation: Incarnation) {
         let effect = self
             .children
-            .get_mut(key)
+            .get_mut(&key)
             .and_then(|child| child.active.as_mut())
             .filter(|active| active.incarnation == incarnation)
             .and_then(|active| active.readiness.step(ReadinessEvent::Signal));
@@ -125,7 +125,7 @@ impl ScopeRuntime {
         // transition or replace the authoritative cause. Keep the caller's
         // retained owner alive while this raw structured copy crosses the
         // child lookup, reducer verdict and publication paths.
-        let child = &self.children[key];
+        let child = &self.children[&key];
         let failure = StartupFailure {
             cause: StartupFailureCause::Child {
                 id: child.slot.member.id().clone(),

@@ -91,7 +91,7 @@ async fn a_join_panic_disposes_the_recorded_application_failure_off_the_driver()
     let (mut scope, mut event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
 
     scope.spawn_child(key);
-    let active = scope.children[key]
+    let active = scope.children[&key]
         .active
         .as_ref()
         .expect("worker is active");
@@ -153,10 +153,10 @@ async fn handle_exit_retains_the_selected_failure_across_dispatch_panics() {
             child
                 .active
                 .as_ref()
-                .map(|active| (key, active.incarnation))
+                .map(|active| (*key, active.incarnation))
         })
         .expect("admission starts one child incarnation");
-    scope.children[key]
+    scope.children[&key]
         .active
         .as_ref()
         .expect("the child remains active")
@@ -231,7 +231,7 @@ async fn a_refused_restart_publication_retains_the_selected_failure() {
     let (mut scope, mut event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
 
     scope.spawn_child(key);
-    let active = scope.children[key]
+    let active = scope.children[&key]
         .active
         .as_ref()
         .expect("worker is active");
@@ -248,7 +248,7 @@ async fn a_refused_restart_publication_retains_the_selected_failure() {
     // from `Starting`, `Running` and `Stopping`, so an `Admitted` source makes
     // the cell reducer refuse and reaches the driver's publication invariant
     // exactly.
-    let member = Arc::clone(&scope.children[key].slot.member);
+    let member = Arc::clone(&scope.children[&key].slot.member);
     member.update(|record| record.stage = MemberStage::Admitted);
 
     let (recorded, observed) = thread_reporting_error();

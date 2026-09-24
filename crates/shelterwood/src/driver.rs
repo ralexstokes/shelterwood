@@ -9,7 +9,6 @@ mod startup;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::{Index, IndexMut},
     sync::{Arc, OnceLock},
     time::Instant,
 };
@@ -413,7 +412,7 @@ struct ScopeRuntime {
     intensity: IntensityState,
     // Runtime resources are keyed by the arena owned by `supervisor`; this
     // map carries no lifecycle or membership decisions.
-    children: ChildResources<ChildRuntime>,
+    children: BTreeMap<ChildKey, ChildRuntime>,
     supervisor: SupervisorState,
     supervisor_effects: Vec<SupervisorEffect>,
     events: runtime::UnboundedMpscSender<DriverEvent>,
@@ -444,7 +443,7 @@ struct ScopeRuntimeWiring {
     root: Arc<ScopeCell>,
     defaults: ResolvedDefaults,
     intensity_policy: Intensity,
-    children: ChildResources<ChildRuntime>,
+    children: BTreeMap<ChildKey, ChildRuntime>,
     supervisor: SupervisorState,
     events: runtime::UnboundedMpscSender<DriverEvent>,
     disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
@@ -464,68 +463,6 @@ struct ScopeRuntimeTestWiring {
     events: runtime::UnboundedMpscSender<DriverEvent>,
     dynamic: Option<Arc<DynamicControl>>,
     hard_forced: bool,
-}
-
-struct ChildResources<T>(BTreeMap<ChildKey, T>);
-
-impl<T> Default for ChildResources<T> {
-    fn default() -> Self {
-        Self(BTreeMap::new())
-    }
-}
-
-impl<T> ChildResources<T> {
-    fn insert(&mut self, key: ChildKey, child: T) -> Option<T> {
-        self.0.insert(key, child)
-    }
-
-    fn get(&self, key: ChildKey) -> Option<&T> {
-        self.0.get(&key)
-    }
-
-    fn get_mut(&mut self, key: ChildKey) -> Option<&mut T> {
-        self.0.get_mut(&key)
-    }
-
-    fn remove(&mut self, key: ChildKey) -> Option<T> {
-        self.0.remove(&key)
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (ChildKey, &T)> {
-        self.0.iter().map(|(key, child)| (*key, child))
-    }
-
-    fn values(&self) -> impl Iterator<Item = &T> {
-        self.0.values()
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    fn clear(&mut self) {
-        self.0.clear();
-    }
-}
-
-impl<T> Index<ChildKey> for ChildResources<T> {
-    type Output = T;
-
-    fn index(&self, key: ChildKey) -> &Self::Output {
-        self.get(key).expect("live child resource key")
-    }
-}
-
-impl<T> IndexMut<ChildKey> for ChildResources<T> {
-    fn index_mut(&mut self, key: ChildKey) -> &mut Self::Output {
-        self.get_mut(key).expect("live child resource key")
-    }
 }
 
 /// Runs the synchronous fail-closed scope epilogue.
@@ -552,12 +489,12 @@ impl Drop for ScopeRuntime {
         // waiting only for its retained construction's release edge (SPEC
         // §11). Teardown keeps that verdict and stops waiting: the disposal
         // job stays detached, and its later completion finds nothing to join.
-        let child_keys: Vec<_> = self.children.iter().map(|(key, _)| key).collect();
+        let child_keys: Vec<_> = self.children.keys().copied().collect();
         for key in child_keys {
             if self.supervisor.is_disposing(key) {
                 panics.run(|| self.handle_construction_disposed(key));
             }
-            let Some(child) = self.children.get_mut(key) else {
+            let Some(child) = self.children.get_mut(&key) else {
                 // Terminal publication can reclaim a remove-retained dynamic
                 // child; its terminality obligation was completed in that
                 // path, so there is no fallback left to discharge here.
@@ -652,7 +589,7 @@ impl ScopeRuntime {
     #[cfg(test)]
     fn for_test(wiring: ScopeRuntimeTestWiring, epoch: ScopeEpochGuard) -> Self {
         let mut supervisor = SupervisorState::new(wiring.root.flavor, wiring.lifecycle);
-        let mut children = ChildResources::default();
+        let mut children = BTreeMap::new();
         for (expected, child) in wiring.children {
             let actual = supervisor_admit(&mut supervisor, child.slot.member.membership(), true);
             assert_eq!(actual, expected);
@@ -666,7 +603,7 @@ impl ScopeRuntime {
         if let Some(control) = &wiring.dynamic {
             wiring.root.with_observation_gate(|txn| {
                 control
-                    .register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
+                    .register_initial(children.iter().map(|(key, child)| (&child.slot, *key)), txn);
             });
         }
         let (disposal_events, disposal_event_receiver) = runtime::unbounded_mpsc();
@@ -1306,7 +1243,7 @@ async fn run_scope_incarnation(
     // child's obligation before fallible setup. Thus a panic at any point has
     // exactly one terminality owner for every child.
     let mut supervisor = SupervisorState::new(root.flavor, epoch.lifecycle());
-    let mut children = ChildResources::default();
+    let mut children = BTreeMap::new();
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
         let child = ChildRuntime::from_plan(child, &root);
@@ -1315,7 +1252,7 @@ async fn run_scope_incarnation(
     }
     if let Some(control) = &dynamic {
         root.with_observation_gate(|txn| {
-            control.register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
+            control.register_initial(children.iter().map(|(key, child)| (&child.slot, *key)), txn);
         });
     }
     let mut scope = ScopeRuntime::new(

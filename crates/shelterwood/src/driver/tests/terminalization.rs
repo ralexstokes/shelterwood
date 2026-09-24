@@ -444,7 +444,7 @@ async fn scope_runtime_drop_finishes_every_child_and_epoch_after_a_hostile_wake(
     let cancellation = keys
         .iter()
         .map(|key| {
-            let active = scope.children[*key]
+            let active = scope.children[key]
                 .active
                 .as_ref()
                 .expect("the child is active");

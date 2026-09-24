@@ -216,7 +216,7 @@ impl ScopeRuntime {
     /// a stop had ended: the clean cooperative outcome, `Completed` with
     /// `Cancellation::Observed` (SPEC §12's nested-shutdown rule).
     pub(super) fn restarts_a_stopped_incarnation(&self, key: ChildKey) -> bool {
-        self.children.get(key).is_some_and(|child| {
+        self.children.get(&key).is_some_and(|child| {
             dispatch_exit(
                 &Exit::completed(Cancellation::Observed),
                 child.options.restart,
@@ -248,7 +248,7 @@ impl ScopeRuntime {
         {
             return;
         }
-        let Some(child) = self.children.get(key) else {
+        let Some(child) = self.children.get(&key) else {
             return;
         };
         if child.active.is_some() {
@@ -280,7 +280,7 @@ impl ScopeRuntime {
                 child: key,
                 incarnation,
             } => {
-                let Some(child) = self.children.get_mut(key) else {
+                let Some(child) = self.children.get_mut(&key) else {
                     return;
                 };
                 let Some(active) = child.active.as_mut() else {
@@ -310,7 +310,7 @@ impl ScopeRuntime {
                 // the level-triggered sources at execution time so a stale
                 // backoff edge never invokes user construction.
                 if self.construction_is_suppressed(child) {
-                    if let Some(child) = self.children.get_mut(child) {
+                    if let Some(child) = self.children.get_mut(&child) {
                         child.restart_deadline.take();
                     }
                 } else {
@@ -324,7 +324,7 @@ impl ScopeRuntime {
             DeadlineKind::Stop { child, incarnation } => {
                 if self
                     .children
-                    .get(child)
+                    .get(&child)
                     .and_then(|child| child.active.as_ref())
                     .is_some_and(|active| active.incarnation == incarnation)
                 {

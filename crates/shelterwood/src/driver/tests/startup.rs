@@ -126,7 +126,7 @@ fn failed_exit(message: &'static str) -> Option<Retained<RecordedOutcome>> {
 /// idle: a request accepted now is a pending-incarnation request.
 fn spawn_unpolled(scope: &mut ScopeRuntime, key: ChildKey) -> Incarnation {
     scope.spawn_child(key);
-    let active = scope.children[key]
+    let active = scope.children[&key]
         .active
         .as_ref()
         .expect("the spawned incarnation is active");
@@ -187,7 +187,7 @@ async fn window_stop_before_exit(
     let key = fixture.children.keys().next().expect("one child plan");
     let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
     let nested = Arc::clone(
-        scope.children[key]
+        scope.children[&key]
             .slot
             .scope
             .as_ref()
@@ -211,7 +211,7 @@ async fn window_stop_before_exit(
         Cancellation::NotObserved,
         false,
     );
-    assert!(scope.children[key].active.is_none());
+    assert!(scope.children[&key].active.is_none());
     (scope, key, nested, target)
 }
 
@@ -222,11 +222,11 @@ async fn always_window_stop_arriving_before_exit_is_spent_when_the_window_opens(
     assert_eq!(nested.pending_incarnation_shutdown(), None);
     assert!(nested.settled(Some(target)));
     assert!(
-        scope.children[key].restart_deadline.is_some(),
+        scope.children[&key].restart_deadline.is_some(),
         "the pending restart keeps its schedule"
     );
     assert_eq!(
-        scope.children[key].slot.member.record().stage,
+        scope.children[&key].slot.member.record().stage,
         MemberStage::Restarting
     );
 }
@@ -236,10 +236,10 @@ async fn on_failure_window_stop_arriving_before_exit_cancels_the_opened_window()
     let (scope, key, nested, _target) = window_stop_before_exit(RestartCondition::OnFailure).await;
 
     assert!(
-        scope.children[key].restart_deadline.is_none(),
+        scope.children[&key].restart_deadline.is_none(),
         "the pending restart is cancelled"
     );
-    let record = scope.children[key].slot.member.record();
+    let record = scope.children[&key].slot.member.record();
     let MemberStage::Terminal(exit) = &record.stage else {
         panic!("the window member terminalizes in place")
     };
@@ -268,7 +268,7 @@ async fn restart_deadline_ahead_of_window_stop(
     let key = fixture.children.keys().next().expect("one child plan");
     let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
     let nested = Arc::clone(
-        scope.children[key]
+        scope.children[&key]
             .slot
             .scope
             .as_ref()
@@ -283,7 +283,7 @@ async fn restart_deadline_ahead_of_window_stop(
         Cancellation::NotObserved,
         false,
     );
-    assert!(scope.children[key].restart_deadline.is_some());
+    assert!(scope.children[&key].restart_deadline.is_some());
     let target = nested.request_shutdown();
 
     scope.handle_deadline(super::super::DeadlineKind::Restart { child: key });
@@ -296,11 +296,12 @@ async fn on_failure_restart_deadline_ahead_of_a_window_stop_constructs_nothing()
         restart_deadline_ahead_of_window_stop(RestartCondition::OnFailure).await;
 
     assert!(
-        scope.children[key].active.is_none(),
+        scope.children[&key].active.is_none(),
         "the due restart constructs no incarnation for a stopped window"
     );
-    assert!(scope.children[key].restart_deadline.is_none());
-    let MemberStage::Terminal(exit) = scope.children[key].slot.member.record().stage.clone() else {
+    assert!(scope.children[&key].restart_deadline.is_none());
+    let MemberStage::Terminal(exit) = scope.children[&key].slot.member.record().stage.clone()
+    else {
         panic!("the construction site terminalizes the window member")
     };
     assert!(matches!(exit.kind(), ExitKind::Failed(_)));
@@ -311,7 +312,7 @@ async fn always_restart_deadline_ahead_of_a_window_stop_runs_the_policys_own_res
     let (scope, key, nested, target, first) =
         restart_deadline_ahead_of_window_stop(RestartCondition::Always).await;
 
-    let active = scope.children[key]
+    let active = scope.children[&key]
         .active
         .as_ref()
         .expect("the scheduled restart still constructs");
@@ -435,8 +436,8 @@ async fn same_batch_intensity_trip_owns_a_window_stop_terminal() {
         Cancellation::NotObserved,
         false,
     );
-    assert!(scope.children[nested].restart_deadline.is_some());
-    let target = scope.children[nested]
+    assert!(scope.children[&nested].restart_deadline.is_some());
+    let target = scope.children[&nested]
         .slot
         .scope
         .as_ref()
@@ -503,9 +504,9 @@ async fn same_batch_intensity_trip_owns_a_window_stop_terminal() {
     // Ordered teardown reaches `nested` only after `trip` joins. The resolver
     // must leave the member to that turn rather than terminalize it early.
     assert!(!scope.supervisor.is_disposing(nested));
-    assert!(scope.children[nested].active.is_none());
+    assert!(scope.children[&nested].active.is_none());
     assert_eq!(
-        scope.children[nested].slot.member.record().stage,
+        scope.children[&nested].slot.member.record().stage,
         MemberStage::Restarting,
         "the drain, not the window stop, owns the member's terminal"
     );
@@ -563,7 +564,7 @@ async fn pre_spawn_stop_on_an_ordered_child_resolves_at_its_turn_without_constru
 
     // Ordered startup spawns "a" and parks on its never-fired readiness.
     scope.settle_supervisor();
-    let a_incarnation = scope.children[first]
+    let a_incarnation = scope.children[&first]
         .active
         .as_ref()
         .expect("the first ordered child is active")
@@ -588,7 +589,7 @@ async fn pre_spawn_stop_on_an_ordered_child_resolves_at_its_turn_without_constru
 
     assert!(
         !matches!(
-            scope.children[nested].slot.member.record().stage,
+            scope.children[&nested].slot.member.record().stage,
             MemberStage::Terminal(_)
         ),
         "the member is not terminalized ahead of its ordered turn"
@@ -604,9 +605,9 @@ async fn pre_spawn_stop_on_an_ordered_child_resolves_at_its_turn_without_constru
         0,
         "the ordered turn constructs nothing on the request's behalf"
     );
-    assert!(scope.children[nested].active.is_none());
+    assert!(scope.children[&nested].active.is_none());
     assert!(!scope.supervisor.spawned_once(nested));
-    let record = scope.children[nested].slot.member.record();
+    let record = scope.children[&nested].slot.member.record();
     let MemberStage::Terminal(exit) = &record.stage else {
         panic!("the ordered turn terminalizes the member")
     };
@@ -654,7 +655,7 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
     let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
 
     scope.spawn_child(key);
-    let active = scope.children[key]
+    let active = scope.children[&key]
         .active
         .as_ref()
         .expect("spawned child is active");
@@ -728,11 +729,11 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
     );
     assert_eq!(root.record().state, ScopeState::Running);
     assert!(matches!(
-        scope.children[key].slot.member.record().stage,
+        scope.children[&key].slot.member.record().stage,
         MemberStage::Terminal(ref exit) if matches!(exit.kind(), ExitKind::Completed)
     ));
     assert!(
-        !scope.children[key].slot.member.record().startup_aborted,
+        !scope.children[&key].slot.member.record().startup_aborted,
         "a post-ready clean self-stop is not a startup abort"
     );
 }
@@ -759,7 +760,7 @@ async fn drain_stop_suppresses_an_already_fired_readiness_latch() {
     let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
 
     scope.spawn_child(key);
-    let active = scope.children[key]
+    let active = scope.children[&key]
         .active
         .as_ref()
         .expect("spawned child is active");
@@ -775,7 +776,7 @@ async fn drain_stop_suppresses_an_already_fired_readiness_latch() {
 
     assert!(
         matches!(
-            scope.children[key].slot.member.record().stage,
+            scope.children[&key].slot.member.record().stage,
             MemberStage::Stopping
         ),
         "the regression premise: the drain stopped the gated child"
@@ -814,13 +815,13 @@ async fn stale_incarnation_readiness_effect_does_not_credit_startup() {
     let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
 
     scope.spawn_child(key);
-    let live = scope.children[key]
+    let live = scope.children[&key]
         .active
         .as_ref()
         .expect("spawned child is active")
         .incarnation;
     let mut incarnations =
-        IncarnationCounter::fixture(scope.children[key].slot.member.membership());
+        IncarnationCounter::fixture(scope.children[&key].slot.member.membership());
     let stale = std::iter::repeat_with(|| incarnations.mint())
         .find(|incarnation| *incarnation != live)
         .expect("a second incarnation is mintable");
@@ -835,7 +836,7 @@ async fn stale_incarnation_readiness_effect_does_not_credit_startup() {
     );
     assert!(!scope.supervisor.lifecycle().startup_complete());
     assert!(matches!(
-        scope.children[key].slot.member.record().stage,
+        scope.children[&key].slot.member.record().stage,
         MemberStage::Starting
     ));
 }
@@ -881,7 +882,7 @@ async fn ordered_startup_advances_past_a_reclaimed_cursor() {
     scope.reduce(SupervisorEvent::Terminalized { child: gone });
     scope
         .children
-        .remove(gone)
+        .remove(&gone)
         .expect("the cursor's child is live before the reclaim");
     scope.reduce(SupervisorEvent::Reclaim { child: gone });
 
@@ -893,7 +894,7 @@ async fn ordered_startup_advances_past_a_reclaimed_cursor() {
         "a vacated cursor advances to the next live child instead of panicking"
     );
     assert!(
-        scope.children[next].active.is_some(),
+        scope.children[&next].active.is_some(),
         "the following child starts at its ordered turn"
     );
     assert!(
@@ -1004,7 +1005,7 @@ async fn queued_removal_suppresses_replayed_self_stop_readiness() {
         .build();
 
     scope.spawn_child(key);
-    let active = scope.children[key]
+    let active = scope.children[&key]
         .active
         .as_ref()
         .expect("the spawned child is active");
@@ -1111,7 +1112,7 @@ async fn removal_before_pre_ready_exit_does_not_publish_startup_abort() {
         .build();
 
     scope.spawn_child(key);
-    let active = scope.children[key].active.as_ref().expect("active child");
+    let active = scope.children[&key].active.as_ref().expect("active child");
     let incarnation = active.incarnation;
     active.abort_handle.abort();
     let mut removal = super::super::remove_dynamic(&root, member.id(), Some(member.membership()));
@@ -1187,11 +1188,11 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
 
     exit.dispatch(&mut scope);
     assert!(
-        scope.children[key].restart_deadline.is_some(),
+        scope.children[&key].restart_deadline.is_some(),
         "a latched scope stop does not reclassify exit dispatch"
     );
     assert!(matches!(
-        scope.children[key].slot.member.record().stage,
+        scope.children[&key].slot.member.record().stage,
         MemberStage::Restarting
     ));
     assert!(
@@ -1212,7 +1213,7 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
         "the latched stop owns the startup verdict: {:?}",
         root.record().startup
     );
-    assert!(scope.children[key].restart_deadline.is_none());
+    assert!(scope.children[&key].restart_deadline.is_none());
 
     let child = recv_construction_disposed(
         &mut scope.disposal_event_receiver,
@@ -1222,11 +1223,11 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
     .await;
     scope.handle_construction_disposed(child);
     assert!(matches!(
-        scope.children[key].slot.member.record().stage,
+        scope.children[&key].slot.member.record().stage,
         MemberStage::Terminal(_)
     ));
     assert!(
-        !scope.children[key].slot.member.record().startup_aborted,
+        !scope.children[&key].slot.member.record().startup_aborted,
         "shutdown-first linearization publishes no startup abort"
     );
     assert!(matches!(

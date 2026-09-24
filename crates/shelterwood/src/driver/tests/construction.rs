@@ -240,7 +240,7 @@ async fn nested_body_aborted_before_first_poll_publishes_never_started_and_close
     let (mut scope, mut events) = fixture.build();
 
     scope.spawn_child(key);
-    scope.children[key]
+    scope.children[&key]
         .active
         .as_ref()
         .expect("nested child is active")

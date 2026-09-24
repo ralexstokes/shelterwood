@@ -1,4 +1,4 @@
-//! Multithreaded mailbox stress (review gap T-1a).
+//! Multithreaded mailbox stress.
 //!
 //! Many senders race one receiver and one lifecycle controller through bind,
 //! freeze, close and terminate. Every message carries a unique id and a

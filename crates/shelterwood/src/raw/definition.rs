@@ -11,7 +11,8 @@ use crate::{
     mailbox::{MailboxCell, MailboxControl, MailboxEffectQueue, actor_ref_from_parts},
     policy::CommonOptions,
     runtime::{
-        CompletionGatedLatch, Isolated, Latch, PanicPayload, UnwindPanics, resume_preferred_panic,
+        CompletionGatedLatch, Isolated, Latch, PanicAccumulator, PanicPayload, UnwindPanics,
+        resume_preferred_panic,
     },
     scope::ScopeRef,
 };
@@ -219,15 +220,19 @@ impl<R: RawActor> RawIncarnationOwner<R> {
 
     /// Closes mailbox intake and freezes incarnation resources.
     fn freeze(&mut self, mailbox: &MailboxCell<R::Msg>, incarnation: Incarnation) {
-        let mut effects = MailboxEffectQueue::default();
-        self.cleanup
-            .run(|| mailbox.freeze(incarnation, &mut effects));
+        // Wake receivers before synchronous resource destruction: a resource
+        // destructor can wait for that wake. Keep its lower-priority panic in
+        // a Drop-bearing accumulator until resource freezing has finished.
+        let mut mailbox_panics = PanicAccumulator::default();
+        mailbox_panics.run(|| {
+            let mut effects = MailboxEffectQueue::default();
+            mailbox.freeze(incarnation, &mut effects);
+        });
         let raw = self.raw.as_mut().expect("raw context owner is armed");
         self.cleanup.run(|| raw.freeze_resources());
-        // The mailbox freeze's wake flush is ranked behind the resource
-        // freeze, so a resource destructor's panic outranks a panicking
-        // receive waker.
-        self.cleanup.run(|| drop(effects));
+        if let Some(payload) = mailbox_panics.take() {
+            self.cleanup.record(payload);
+        }
     }
 
     async fn join(&mut self) {

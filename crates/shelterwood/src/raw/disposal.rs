@@ -71,11 +71,11 @@ impl<F> Drop for CatchUnwindFuture<F> {
 
 /// The incarnation's one record of cleanup panics.
 ///
-/// First wins: every caught cleanup panic — offload work, destructors run by
-/// the disposal funnel, wakes, and each teardown step — is recorded here the
-/// moment it is caught, so arrival order is precedence and a later loser is
-/// discarded. The raw incarnation owner holds the slot and reads it from its
-/// `Drop`, which is what keeps the evidence across a hard abort.
+/// First recorded wins: resource cleanup records directly; the mailbox
+/// freeze records its lower-priority failure after synchronous resource
+/// freezing. Before any epilogue await, all cleanup evidence is here. The raw
+/// incarnation owner reads the slot from its `Drop`, which keeps the evidence
+/// across a hard abort.
 #[derive(Default)]
 pub(super) struct PanicSlot {
     payload: Mutex<Option<PanicPayload>>,

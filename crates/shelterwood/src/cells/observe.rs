@@ -534,25 +534,12 @@ fn install_snapshot(
 /// never built at all and the survivor runs exactly once, inside `commit`,
 /// while the observation gate still holds the resident tree still.
 ///
-/// The producer is `FnMut` rather than `FnOnce` so that running it does not
-/// also destroy it: it captures an `Arc<ScopeCell>` whose release belongs
-/// after the gate is unlocked, like every other user-bearing drop. The
-/// transaction hands the whole spent publication to its effect list after
-/// each attempted install, including one that trips an invariant.
-type SnapshotProducer = dyn FnMut() -> Option<Guarded<Arc<ScopeSnapshot>>>;
-
-pub(crate) struct SnapshotProjection(Box<SnapshotProducer>);
-
-impl SnapshotProjection {
-    fn new(build: impl FnOnce() -> Guarded<Arc<ScopeSnapshot>> + 'static) -> Self {
-        let mut build = Some(build);
-        Self(Box::new(move || build.take().map(|build| build())))
-    }
-
-    fn build(&mut self) -> Guarded<Arc<ScopeSnapshot>> {
-        (self.0)().expect("a staged projection is built exactly once")
-    }
-}
+/// The producer is `Fn` rather than `FnOnce` so that running it does not also
+/// destroy it: it captures an `Arc<ScopeCell>` whose release belongs after the
+/// gate is unlocked, like every other user-bearing drop. The transaction hands
+/// the whole spent publication to its effect list after each attempted
+/// install, including one that trips an invariant.
+pub(crate) type SnapshotProjection = Box<dyn Fn() -> Guarded<Arc<ScopeSnapshot>>>;
 
 pub(crate) struct SnapshotPublication {
     sender: runtime::WatchSender<SnapshotHubState>,
@@ -619,8 +606,7 @@ impl SnapshotPublication {
     pub(crate) fn install(&mut self, txn: &mut ObservationTxn<'_>) {
         // A hub closed by an earlier transaction keeps the authoritative
         // terminal projection `close` installed; this cut is never built.
-        let snapshot =
-            (!self.sender.read_with(|state| state.closed)).then(|| self.projection.build());
+        let snapshot = (!self.sender.read_with(|state| state.closed)).then(|| (self.projection)());
         for effect in install_snapshot(
             &self.sender,
             snapshot,
@@ -700,7 +686,7 @@ impl SnapshotHub {
     pub(crate) fn publish(
         &self,
         txn: &mut ObservationTxn<'_>,
-        snapshot: impl FnOnce() -> Guarded<Arc<ScopeSnapshot>> + 'static,
+        snapshot: impl Fn() -> Guarded<Arc<ScopeSnapshot>> + 'static,
     ) {
         let Some(sender) = self.sender.get() else {
             return;
@@ -713,7 +699,7 @@ impl SnapshotHub {
         }
         txn.stage_snapshot(SnapshotPublication::published(
             sender.clone(),
-            SnapshotProjection::new(snapshot),
+            Box::new(snapshot),
         ));
     }
 
@@ -726,19 +712,12 @@ impl SnapshotHub {
     pub(crate) fn close(
         &self,
         txn: &mut ObservationTxn<'_>,
-        final_snapshot: impl FnOnce() -> Guarded<Arc<ScopeSnapshot>> + 'static,
+        final_snapshot: impl Fn() -> Guarded<Arc<ScopeSnapshot>> + 'static,
     ) {
-        let mut final_snapshot = Some(final_snapshot);
         let mut initialized = false;
         let sender = self.sender.get_or_init(|| {
             initialized = true;
-            runtime::watch(SnapshotHubState::new(
-                final_snapshot
-                    .take()
-                    .expect("final snapshot is built exactly once")(),
-                true,
-            ))
-            .0
+            runtime::watch(SnapshotHubState::new(final_snapshot(), true)).0
         });
         if initialized {
             return;
@@ -757,11 +736,7 @@ impl SnapshotHub {
         // this final one.
         txn.stage_snapshot(SnapshotPublication::closed(
             sender.clone(),
-            SnapshotProjection::new(move || {
-                final_snapshot
-                    .take()
-                    .expect("final snapshot is built exactly once")()
-            }),
+            Box::new(final_snapshot),
         ));
     }
 
@@ -1243,7 +1218,7 @@ mod tests {
             let builds = Arc::clone(&builds);
             hub.publish(&mut txn, move || {
                 builds.fetch_add(1, Ordering::Relaxed);
-                snapshot(state)
+                snapshot(state.clone())
             });
         }
         drop(txn);

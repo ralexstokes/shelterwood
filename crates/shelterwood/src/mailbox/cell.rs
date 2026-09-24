@@ -924,11 +924,12 @@ impl<M: Send + 'static> MailboxCell<M> {
         if let Some(envelope) = state.take_next(binding.kind, mode) {
             returned.value = Some(envelope.message);
             // Receiving frees one slot, so a bound mailbox admits its oldest
-            // parked senders.
+            // parked senders. Neither the receipt nor the promotion pulses:
+            // the receiving actor is the change signal's only watcher, and it
+            // re-reads the accepted sequence before it waits.
             if live {
                 promote_waiters(state, binding, &self.accepted, effects);
             }
-            effects.pulse();
         }
         transaction.finish(());
         returned.value.take()

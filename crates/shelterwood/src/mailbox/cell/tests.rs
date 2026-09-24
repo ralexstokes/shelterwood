@@ -1394,3 +1394,44 @@ fn a_panicking_receive_flush_isolates_the_received_message() {
         Poll::Ready(Ok(bound)) if bound == incarnation
     ));
 }
+
+#[test]
+fn receiving_does_not_pulse_the_receivers_own_change_signal() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Arc::new(BindOrderingRuntime {
+        inner: crate::mailbox::capability::tests::runtime(),
+        events: Arc::clone(&events),
+    });
+    let (mailbox, actor) = actor_for_with_runtime::<u8>(runtime);
+    let token = configure(
+        &mailbox,
+        ResolvedMailbox::Queue(std::num::NonZeroUsize::new(1).expect("non-zero queue capacity")),
+    );
+    let incarnation = mint_actor_incarnation();
+    bind(&mailbox, token, incarnation);
+    assert!(matches!(actor.try_send(1), Ok(bound) if bound == incarnation));
+    let mut parked = Box::pin(actor.send(2));
+    park_with(&mut parked, Waker::noop());
+    let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+    events.lock().expect("effect recorder mutex").clear();
+
+    assert_eq!(receiver.try_recv(), Some(1));
+    assert_eq!(
+        receiver.try_recv(),
+        Some(2),
+        "receiving promoted the sender"
+    );
+    assert!(
+        !events
+            .lock()
+            .expect("effect recorder mutex")
+            .contains(&BindEffectEvent::SignalPulsed),
+        "neither a receipt nor its promotion pulses the change signal"
+    );
+    assert!(matches!(
+        parked
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(bound)) if bound == incarnation
+    ));
+}

@@ -145,7 +145,8 @@ rests on:
   exception to "no user code" is the process panic hook: when native-thread
   creation is exhausted, Tokio's `spawn_blocking` panics before
   `submit_blocking_job` contains it, and the hook runs on the submitting
-  thread.
+  thread. That is accepted (SPEC §15.4) and listed for re-audit beside the
+  Tokio pin.
   Retained exits retire from drop glue, which has no sink to reach, so they
   submit in place.
 - **Nested framework locks in one direction.** The resident-tree observation

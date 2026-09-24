@@ -496,13 +496,9 @@ pub async fn join_resuming<T>(handle: JoinHandle<T>) -> T {
 }
 
 pub(super) fn contain_panic_payload(payload: PanicPayload) -> Option<String> {
-    let message = match catch_panic(|| panic_message(payload.as_ref())) {
-        Ok(message) => message,
-        Err(inspection_panic) => {
-            discard_panic(Some(inspection_panic));
-            None
-        }
-    };
+    // Inspection runs no user code: `downcast_ref` reads the compiler's
+    // `Any::type_id`, and copying a `str` only allocates.
+    let message = panic_message(payload.as_ref());
     // A custom panic payload is user-owned too. Its destructor may panic or
     // block, so retire it on the detached disposal lane before publishing
     // completion.

@@ -21,12 +21,12 @@ use super::{PanicAccumulator, dispose_detached, waker_proxy::ProxiedPoll};
 /// draining only move wakers out; their vtables run after unlock, one behind
 /// each accumulator boundary. A waiter's identity is a plain id minted by
 /// its registry.
+///
 /// Cancellation destroys a removed caller-waker clone inline on the thread
 /// dropping `LatchWait` or `WatchWait`: unlike the external-primitive proxy
 /// family, the registry owns the waker directly and has no foreign drop seam
-/// that requires detached retirement. That inherits the reply receiver's
-/// ruling rather than the proxy wrapper's — a slow caller-waker destructor
-/// stalls the abandoning waiter alone, and a hostile one is contained by the
+/// that requires detached retirement. A slow caller-waker destructor stalls
+/// the abandoning waiter alone, and a hostile one is contained by the
 /// accumulator above.
 #[derive(Default)]
 struct WaiterRegistry {

@@ -426,8 +426,7 @@ where
 /// The waker parked raw in Tokio's join trailer here is the polling
 /// executor's own, so its destruction stays framework traffic. A future that
 /// a public API caller polls supplies that caller's waker instead and must
-/// join through [`join_user_polled`] — reaching for this helper from a public
-/// seam is exactly the class #409 closed.
+/// join through [`join_user_polled`].
 pub async fn join<T>(handle: JoinHandle<T>) -> JoinOutcome<T> {
     let JoinHandle { inner } = handle;
     classify_join_result(inner.await)

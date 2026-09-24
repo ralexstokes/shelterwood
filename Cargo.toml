@@ -45,6 +45,9 @@ thiserror = "2.0.19"
 #     completion until the `JoinHandle` drops, hence the parked proxy.
 #   - `is_available`: no non-panicking probe for an enabled time driver. If
 #     the new Tokio has one, detect a timer-less runtime as `NoRuntime` (#525).
+#   - `submit_blocking_job`: `spawn_blocking` panics on native-thread
+#     exhaustion, so the panic hook can run under a lock (SPEC §15.4's one
+#     accepted exception). If the new Tokio can refuse without panicking, use it.
 # shelterwood-runtime/src/sync.rs
 #   - `OneShotReceiver::completed`: `poll`/`try_recv` clear `Inner` on a
 #     terminal edge and a later `poll` panics; `close` alone does not.

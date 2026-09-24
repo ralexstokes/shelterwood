@@ -844,7 +844,7 @@ impl ScopeLifecycle {
                     StartupPhase::Complete => 1,
                     StartupPhase::Failed => 2,
                 },
-                stop_reason_precedence(reason),
+                stop_reason_precedence(reason) as u8,
             ),
         }
     }

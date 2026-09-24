@@ -88,8 +88,8 @@ impl Drop for HostileReply {
 }
 
 /// An actor handle is the only public route to a reply channel, and
-/// `reply_channel` reads nothing from it but the installed runtime. This actor
-/// therefore exists to be declared and never spawned, messaged, or stopped.
+/// `reply_channel` reads nothing from it. This actor therefore exists to be
+/// declared and never spawned, messaged, or stopped.
 struct ChannelSource;
 
 impl Actor for ChannelSource {

@@ -1,7 +1,7 @@
 //! Membership-owned actor mailboxes and request/reply capabilities.
 //!
-//! Tokio details remain behind `shelterwood-runtime`; this module consumes the
-//! runtime-neutral capability interface declared by `shelterwood-core`.
+//! Tokio details remain behind `shelterwood-runtime`; like every other façade
+//! layer, this module reaches the runtime only through `crate::runtime`.
 
 use std::{
     fmt,
@@ -12,10 +12,8 @@ use std::{
 };
 
 use crate::identity::{ChildId, Incarnation, Membership};
+pub(crate) use shelterwood_core::ProxiedSleep;
 use shelterwood_core::policy::ResolvedMailbox;
-pub(crate) use shelterwood_core::{
-    MailboxRuntime, MailboxSignal, MailboxSignalWatcher, ProxiedSleep,
-};
 
 mod capability;
 mod cell;
@@ -72,19 +70,13 @@ impl MailboxBindToken {
 pub(crate) struct MailboxClose {
     bind: Option<MailboxBindToken>,
     disposal: Option<MailboxDisposal>,
-    runtime: Arc<dyn MailboxRuntime>,
 }
 
 impl MailboxClose {
-    pub(crate) fn new(
-        bind: MailboxBindToken,
-        disposal: MailboxDisposal,
-        runtime: Arc<dyn MailboxRuntime>,
-    ) -> Self {
+    pub(crate) fn new(bind: MailboxBindToken, disposal: MailboxDisposal) -> Self {
         Self {
             bind: Some(bind),
             disposal: Some(disposal),
-            runtime,
         }
     }
 
@@ -104,7 +96,7 @@ impl MailboxClose {
 impl Drop for MailboxClose {
     fn drop(&mut self) {
         if let Some(disposal) = self.disposal.take() {
-            self.runtime.dispose(disposal);
+            crate::runtime::dispose_detached(disposal);
         }
     }
 }

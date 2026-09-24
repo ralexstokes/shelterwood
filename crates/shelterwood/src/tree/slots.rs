@@ -112,7 +112,7 @@ impl<M: Send + 'static> SlotKind for ActorKind<M> {
     const SCOPE_FLAVOR: Option<ScopeFlavor> = None;
 
     fn attach(slot: &SlotCell) -> Self {
-        let mailbox = MailboxCell::new(slot.member.id().clone(), crate::runtime::mailbox_runtime());
+        let mailbox = MailboxCell::new(slot.member.id().clone());
         slot.member.attach_mailbox(mailbox.clone());
         Self { mailbox }
     }

@@ -691,9 +691,11 @@ impl<T> OneShotReceiver<T> {
 /// `T: Send + 'static` onto the definition of the public `OneShotTaskRef`
 /// wrapper that holds it and force downstream generic declarations to carry a
 /// bound they never asked for. Reply and call wrappers hold the separate
-/// erased `DisposingReceiver` in the façade's mailbox capability module; the two
-/// boundary types preserve the same constructor-only bound. Execution bounds
-/// belong on constructors and operational impls here.
+/// `DisposingReceiver` in the façade's mailbox capability module, which wraps
+/// this crate's [`OneShotReceiver`] but retires a cancelled caller waker inline
+/// rather than on the disposal lane; the two boundary types preserve the same
+/// constructor-only bound. Execution bounds belong on constructors and
+/// operational impls here.
 pub struct DisposingReceiver<T> {
     inner: Option<OneShotReceiver<T>>,
     dispose: fn(T),

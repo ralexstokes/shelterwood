@@ -819,10 +819,7 @@ mod tests {
         time::Duration,
     };
 
-    use crate::{
-        mailbox::{MailboxCell, MailboxControl},
-        runtime,
-    };
+    use crate::mailbox::{MailboxCell, MailboxControl};
     use shelterwood_core::{Cancellation, ExitError, identity::ScopeIdentity, policy::ScopeFlavor};
 
     use super::*;
@@ -880,8 +877,8 @@ mod tests {
     #[test]
     fn attaching_a_second_mailbox_panics_without_replacing_or_poisoning_the_first() {
         let scope = isolated_scope("root", ScopeFlavor::Ordered);
-        let first = MailboxCell::<u8>::new(scope.member.id().clone(), runtime::mailbox_runtime());
-        let second = MailboxCell::<u8>::new(scope.member.id().clone(), runtime::mailbox_runtime());
+        let first = MailboxCell::<u8>::new(scope.member.id().clone());
+        let second = MailboxCell::<u8>::new(scope.member.id().clone());
         let first_control: Arc<dyn MailboxControl> = first;
         let second_control: Arc<dyn MailboxControl> = second;
         scope.member.attach_mailbox(Arc::clone(&first_control));
@@ -925,7 +922,7 @@ mod tests {
         );
         let mut watcher = scope.member.record_watcher();
         watcher.borrow_and_update_cloned();
-        let mailbox = MailboxCell::<u8>::new(scope.member.id().clone(), runtime::mailbox_runtime());
+        let mailbox = MailboxCell::<u8>::new(scope.member.id().clone());
 
         scope.member.attach_mailbox(mailbox);
 

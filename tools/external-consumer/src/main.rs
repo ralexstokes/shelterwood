@@ -17,11 +17,9 @@ fn retype_scope<T: shelterwood::Subtree>(scope: shelterwood::ScopeRef) -> T::Ref
 
 #[cfg(feature = "installable-seams")]
 use shelterwood::{
-    DynamicRoute, ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, MailboxCell,
-    MailboxControl, MailboxEffectQueue, MailboxEffectSink, MailboxRuntime, MailboxSignal,
-    MailboxSignalWatcher, MailboxTermination, MemberCell, ParentCancellationToken, ProxiedPoll,
-    ProxiedSleep, ScopeCell, WakerAction, WakerEffects, WakerProxy, WakerSlot,
-    actor_ref_from_parts,
+    BoxedSleep, DynamicRoute, MailboxCell, MailboxControl, MailboxEffectQueue, MailboxEffectSink,
+    MailboxTermination, MemberCell, ParentCancellationToken, ProxiedPoll, ProxiedSleep, ScopeCell,
+    WakerAction, WakerEffects, WakerProxy, WakerSlot, actor_ref_from_parts,
 };
 
 fn main() {

@@ -5,11 +5,13 @@ use std::{
 };
 
 use crate::{
-    BoxedSleep,
     panic::PanicAccumulator,
     waker::{WakerAction, WakerEffects},
     waker_proxy::ProxiedPoll,
 };
+
+/// A runtime adapter's raw timer, handed to [`ProxiedSleep::new`].
+pub type BoxedSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// Timer future that keeps a caller-owned waker out of the runtime's wheel.
 ///

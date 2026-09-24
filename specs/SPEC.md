@@ -2670,27 +2670,30 @@ a reachable escape hatch:
 (and with any randomness source) is confined to the runtime-adapter crate
 and the façade's private runtime module; no runtime or adapter type is
 reachable from a public item (§1 principle 7, checked per §16.13). The
-type-erased capability interface lives in the runtime-neutral core: one-shot
-delivery, change signals, isolated disposal, and the clock/timer pair. Each
-mailbox receives one capability object, and the same object flows through
-reply channels and deadline futures, so virtual-time and disposal semantics
-cannot silently switch adapters. Runtime choice is deliberately absent from
-`ActorRef<M>`'s type parameters. The production graph makes the isolation
+runtime is selected once per build, at that private module: every façade
+layer — driver, mailbox, reply channels, deadline futures — reaches one-shot
+delivery, change signals, isolated disposal, and the clock/timer pair
+through it by static dispatch, so virtual-time and disposal semantics cannot
+differ between mailboxes or between a mailbox and its driver. Replacing the
+executor means supplying an adapter with the same module surface; it never
+adds a type parameter, and runtime choice is deliberately absent from
+`ActorRef<M>`'s type parameters. The runtime-neutral core carries only what
+its own proxy types need from a runtime — a plain waker-disposal function
+supplied by the adapter. The production graph makes the isolation
 structural: the core has no runtime dependency, the runtime adapter depends
 only on the core among implementation crates, and only the adapter names the
 concrete runtime.
 
 **The supported boundary.** The cells, mailbox, and façade share one crate,
 so locked-path implementation traits (`MailboxControl`,
-`MailboxTermination`, `MailboxEffectSink`, and
-`DynamicRoute`) and every installer are crate-private: foreign
-implementations are excluded by construction. Cross-crate core/runtime
-capability traits remain technically public so the adapter can implement
-them, but the supported façade exports neither those traits nor a path that
-installs a foreign object. Implementing a capability through a direct core
-dependency remains unsupported, while installing one is unrepresentable.
-How the supported boundary's residual cross-crate surface is checked
-(visibility, documentation reachability, and external-consumer probes) is
+`MailboxTermination`, `MailboxEffectSink`, and `DynamicRoute`) and every
+installer are crate-private: foreign implementations are excluded by
+construction. Cross-crate core items the adapter must name — the waker proxy
+and effects family — remain technically public, but the supported façade
+exports none of them, and no runtime capability is installed per object, so
+there is no foreign-object installation path to exclude. How the supported
+boundary's residual cross-crate surface is checked (visibility,
+documentation reachability, and external-consumer probes) is
 implementation-defined; that the supported surface excludes it is not.
 
 ### 15.2 Policies are plain data
@@ -3282,10 +3285,9 @@ fixtures for the driver shell and end-to-end invariants.
     core re-exports remain opaque to it, but the core's runtime-free manifest
     is the structural proof that those hidden signatures cannot name a
     concrete adapter — and an automated check MUST assert that manifest's
-    dependency allowlist rather than assume it. The core/runtime capability
-    traits are outside the
-    supported boundary, every façade installer is crate-private, and an
-    external-consumer probe MUST reject their façade reachability. A public
+    dependency allowlist rather than assume it. Cross-crate core seams (the
+    waker proxy and effects family) are outside the supported boundary, and
+    an external-consumer probe MUST reject their façade reachability. A public
     re-export of a runtime-typed seam is a hard failure — compile-time where
     achievable — not a documentation nicety. Public adapter types on the
     event lane are opaque wrappers, never aliases of runtime types, and

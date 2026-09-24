@@ -108,19 +108,17 @@ rests on:
   `MailboxEffectSink` and `DynamicRoute` are `pub(crate)`
   implementation seams inside the façade, not user traits. Their only
   implementations are framework-owned, and a foreign implementation is
-  unrepresentable. `MailboxRuntime` and the sub-capabilities it mints —
-  `MailboxSignal`, `MailboxSignalWatcher` and the `ErasedOneShot*` family —
-  remain public, unsealed, doc-hidden traits in `shelterwood-core` because the
-  separate `shelterwood-runtime` adapter must implement them. They ride under
-  the same framework-only ruling, but every path that installs one in a
-  mailbox is private to the façade.
+  unrepresentable. No runtime capability is installed per object: the
+  mailbox, reply channels and deadline futures reach the adapter through
+  `crate::runtime` by static dispatch, like every other façade layer.
   `WakerProxy` and its `retire_with` seam ride with them: the proxy is a
   public doc-hidden cross-crate type whose `retire_with` takes a
   caller-supplied `fn(Waker)`, but the effect is queued under the proxy's
   leaf mutex and invoked only after unlock, so no foreign code runs under
   the lock. The same `fn(Waker)` disposer is `WakerAction::Run` and the
-  argument of `ProxiedSleep::new`; the adapter supplies `dispose_waker`, its
-  detached disposal lane, and it runs only from the post-unlock flush.
+  argument of `ProxiedSleep::new`, and it is the only runtime service core
+  names; the adapter supplies `dispose_waker`, its detached disposal lane,
+  and it runs only from the post-unlock flush.
   `ProxiedPoll`, the probe/register/re-poll state machine that wraps it,
   rides under the same ruling: its `poll` takes caller-supplied
   closures, but they are invoked only with no proxy mutex held, and its
@@ -133,19 +131,21 @@ rests on:
   an unsupported direct dependent can neither construct a sink nor supply its
   own. The same construction-held boundary covers `MailboxControl`,
   `MailboxTermination`, and `DynamicRoute`; what remains conventional is the
-  core-to-runtime capability family plus the waker machinery that lives in
-  core beside the proxy — `WakerSlot`,
+  waker machinery that lives in core beside the proxy — `WakerSlot`,
   `WakerAction`, and `WakerEffects` are public doc-hidden core items a direct
   core dependent could construct. They ride under the same framework-only
   ruling; the supported façade re-exports none of them, and the
   external-consumer probe rejects façade reachability for the whole family.
-  `MailboxRuntime`
-  is nonetheless kept off every locked path: its disposal capability hands
-  work to a blocking worker, so it belongs to the effects flush like the user
-  code it carries. That is a preference, not a prohibition, and
+  Runtime disposal (`dispose_detached`) is nonetheless kept off every locked
+  path: it hands work to a blocking worker, so it belongs to the effects flush
+  like the user code it carries. That is a preference, not a prohibition, and
   `RetainedExit::drop` is where the difference shows: a submission runs no user
   code, so it is legal under a lock, but it can cost a native thread start, so
-  a caller that already owns an effects sink should still flush it.
+  a caller that already owns an effects sink should still flush it. The one
+  exception to "no user code" is the process panic hook: when native-thread
+  creation is exhausted, Tokio's `spawn_blocking` panics before
+  `submit_blocking_job` contains it, and the hook runs on the submitting
+  thread.
   Retained exits retire from drop glue, which has no sink to reach, so they
   submit in place.
 - **Nested framework locks in one direction.** The resident-tree observation

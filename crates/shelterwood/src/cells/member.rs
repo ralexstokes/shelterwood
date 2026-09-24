@@ -7,10 +7,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{
-    mailbox::{MailboxControl, MailboxTermination},
-    runtime,
-};
+use crate::{mailbox::MailboxControl, runtime};
 use shelterwood_core::{
     ChildId, Exit, ExitKind, Incarnation, Membership, RestartCount,
     engine::MembershipStatus,
@@ -204,8 +201,22 @@ enum MemberMailbox {
     Terminal {
         control: Option<Arc<dyn MailboxControl>>,
         exit: RetainedExit,
-        teardown: Option<Box<dyn MailboxTermination>>,
     },
+}
+
+/// Queues the committed record edge after mailbox discharge, including when
+/// preparation unwinds. The transaction still owns the post-unlock wake.
+struct TerminalRecordPulse<'a, 'gate> {
+    txn: &'a mut ObservationTxn<'gate>,
+    record: Option<&'a runtime::WatchSender<MemberRecord>>,
+}
+
+impl Drop for TerminalRecordPulse<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(record) = self.record {
+            self.txn.pulse(record);
+        }
+    }
 }
 
 impl fmt::Debug for MemberMailbox {
@@ -213,11 +224,7 @@ impl fmt::Debug for MemberMailbox {
         match self {
             Self::Unattached => formatter.write_str("Unattached"),
             Self::Attached(control) => formatter.debug_tuple("Attached").field(control).finish(),
-            Self::Terminal {
-                control,
-                exit,
-                teardown,
-            } => {
+            Self::Terminal { control, exit } => {
                 // Formatting `ExitKind::Failed` would invoke the user's error
                 // formatter while `MemberCell::mailbox` is held by the
                 // derived `MemberCell` Debug implementation. A static tag is
@@ -234,7 +241,6 @@ impl fmt::Debug for MemberMailbox {
                     .debug_struct("Terminal")
                     .field("control", control)
                     .field("exit", &exit)
-                    .field("teardown_pending", &teardown.is_some())
                     .finish()
             }
         }
@@ -640,24 +646,10 @@ impl MemberCell {
                         rejected = Some(mailbox);
                         None
                     }
-                    MemberMailbox::Terminal {
-                        control, teardown, ..
-                    } => {
-                        // Unreachable under the gate — `terminalize_locked`
-                        // only stores a teardown alongside a control, which the
-                        // arm above already rejects — and kept as total
-                        // defense against ever draining one twice.
-                        if teardown.is_some() {
-                            rejected = Some(mailbox);
-                            None
-                        } else {
-                            // The stored `teardown` field stays empty: the
-                            // drain below is the only reader this one can have,
-                            // and it owns it before the mailbox guard drops.
-                            let drained = mailbox.prepare_termination(txn);
-                            *control = Some(mailbox);
-                            drained
-                        }
+                    MemberMailbox::Terminal { control, .. } => {
+                        let drained = mailbox.prepare_termination(txn);
+                        *control = Some(mailbox);
+                        drained
                     }
                 }
             };
@@ -705,34 +697,35 @@ impl MemberCell {
         // destructor may block, panic, or re-enter observation. Hand it to the
         // transaction rather than dropping it under the gate.
         let mut losing_exit = None;
-        let terminal_exit = {
+        let (terminal_exit, attached) = {
             let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
-            match &*state {
+            match &mut *state {
                 MemberMailbox::Terminal {
                     exit: terminal_exit,
                     ..
                 } => {
                     let terminal_exit = terminal_exit.as_exit().clone();
                     losing_exit = Some(exit);
-                    terminal_exit
+                    (terminal_exit, None)
                 }
                 MemberMailbox::Unattached => {
                     *state = MemberMailbox::Terminal {
                         control: None,
                         exit: RetainedExit::new(exit.clone()),
-                        teardown: None,
                     };
-                    exit
+                    (exit, None)
                 }
                 MemberMailbox::Attached(control) => {
+                    // Record the winner here, but leave the mailbox itself
+                    // live: every writer of this state holds the observation
+                    // gate, so no other terminalizer or attach can observe
+                    // the window before `prepare_termination` below.
                     let control = Arc::clone(control);
-                    let teardown = control.prepare_termination(txn);
                     *state = MemberMailbox::Terminal {
-                        control: Some(control),
+                        control: Some(Arc::clone(&control)),
                         exit: RetainedExit::new(exit.clone()),
-                        teardown,
                     };
-                    exit
+                    (exit, Some(control))
                 }
             }
         };
@@ -764,36 +757,26 @@ impl MemberCell {
             record.refresh_retained_exits(&mut surrendered);
         });
         txn.surrender(surrendered);
-        // Store before discharge so reentrant mailbox wakers observe the
-        // winning exit. Notification-driven readers still see
-        // discharge-before-pulse; tree-scoped publication defers both until
-        // the complete observation transaction has released its gate.
-        let mut nonterminal_mailbox = false;
-        let teardown = match &mut *self.mailbox.lock().expect("member mailbox mutex poisoned") {
-            MemberMailbox::Terminal { teardown, .. } => teardown.take(),
-            MemberMailbox::Unattached | MemberMailbox::Attached(_) => {
-                // Panicking here would poison the member mailbox and can
-                // retire a retained user exit during unwind. Compute the
-                // verdict under the lock and raise it below, once the guard
-                // has been released; release builds keep the already-published
-                // terminal state.
-                nonterminal_mailbox = true;
-                None
-            }
+        // First terminalizer wins: only a newly stored terminal record owes
+        // a pulse. Own that obligation before fallible mailbox preparation.
+        let notification = TerminalRecordPulse {
+            txn,
+            record: published.then_some(&self.record),
         };
-        if nonterminal_mailbox {
-            txn.defer(|| panic!("terminal publication requires terminal mailbox state"));
-        }
-        if let Some(teardown) = teardown {
+        let txn = &mut *notification.txn;
+        // SPEC §3.2: store the terminal record, then terminalize the mailbox.
+        // The phase flip inside `prepare_termination` is what makes a new
+        // send fail `Terminated`, so a sender holding that verdict reads the
+        // terminal record, and reentrant mailbox wakers observe the winning
+        // exit. Parked operations are discharged by the deferred `finish`,
+        // and notification-driven readers still see discharge-before-pulse;
+        // tree-scoped publication defers both until the complete observation
+        // transaction has released its gate. The member mailbox guard is not
+        // needed here: the gate already serializes every writer of it.
+        if let Some(teardown) = attached.and_then(|control| control.prepare_termination(txn)) {
             txn.defer(move || {
                 runtime::dispose_detached(teardown.finish());
             });
-        }
-        // First terminalizer wins. A losing edge neither reclassifies startup
-        // nor publishes a second record edge; a future caller that needs
-        // different semantics must make that race explicit at its boundary.
-        if published {
-            txn.pulse(&self.record);
         }
         terminal_exit
     }
@@ -816,10 +799,13 @@ mod tests {
         panic::{AssertUnwindSafe, catch_unwind},
         sync::mpsc,
         task::{Context, Waker},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
-    use crate::mailbox::{MailboxCell, MailboxControl};
+    use crate::{
+        SendErrorKind,
+        mailbox::{MailboxCell, MailboxControl, actor_ref_from_parts},
+    };
     use shelterwood_core::{Cancellation, ExitError, identity::ScopeIdentity, policy::ScopeFlavor};
 
     use super::*;
@@ -1054,6 +1040,68 @@ mod tests {
                 .expect("the last guard set disposes the payload"),
             reading_thread,
             "the member record's final guard must isolate its failed payload"
+        );
+    }
+
+    /// SPEC §3.2: terminal publication stores the cell record before it
+    /// discharges the mailbox, so a sender holding a `Terminated` verdict can
+    /// never read a nonterminal record. Holding the record's value guard
+    /// stalls the terminalizer at exactly its record store; whatever the
+    /// sender surface reports during that stall was published before the
+    /// store. Wait for the terminalizer's mailbox-state transition before
+    /// checking the verdict; a scheduling timeout fails instead of passing.
+    #[test]
+    fn a_terminated_send_verdict_is_never_observed_before_the_terminal_record() {
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let member = MemberCell::new(identity.mint_membership(&id));
+        let mailbox = MailboxCell::<u8>::new(member.id().clone());
+        let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
+        member.attach_mailbox(mailbox);
+
+        // Only plain evidence leaves the guarded section; every verdict is
+        // judged below, after the watch guard has been released.
+        let (transitioned, verdict, stage_under_guard, terminalizer) =
+            member.record.read_with(|record| {
+                let terminalizer = {
+                    let member = Arc::clone(&member);
+                    std::thread::spawn(move || {
+                        member.terminalize(Exit::never_started(), StartupDisposition::Unchanged);
+                    })
+                };
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let transitioned = loop {
+                    let terminal = matches!(
+                        *member.mailbox.lock().expect("member mailbox mutex healthy"),
+                        MemberMailbox::Terminal { .. }
+                    );
+                    if terminal || Instant::now() >= deadline {
+                        break terminal;
+                    }
+                    std::thread::yield_now();
+                };
+                let verdict = actor.try_send(1).map_err(|error| error.kind);
+                (transitioned, verdict, record.stage.clone(), terminalizer)
+            });
+        terminalizer.join().expect("terminalizer thread succeeds");
+
+        assert!(
+            transitioned,
+            "terminalizer must reach the held record guard"
+        );
+        assert_eq!(stage_under_guard, MemberStage::Reserved);
+        assert_eq!(
+            verdict,
+            Err(SendErrorKind::NotRunning),
+            "a sender observed `Terminated` while the member record was still {stage_under_guard:?}"
+        );
+        assert_eq!(
+            actor.try_send(1).map_err(|error| error.kind),
+            Err(SendErrorKind::Terminated)
+        );
+        assert_eq!(
+            member.record().stage,
+            MemberStage::Terminal(Exit::never_started())
         );
     }
 }

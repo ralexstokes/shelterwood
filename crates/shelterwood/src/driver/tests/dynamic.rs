@@ -228,6 +228,61 @@ impl Wake for GateVenueWake {
 }
 
 #[crate::runtime::test]
+async fn terminal_record_watchers_wake_after_mailbox_preparation_panics() {
+    let (scope, _events, _dynamic_events, _control) = running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    let member = Arc::clone(&reservation.slot.member);
+    member.attach_mailbox(Arc::new(PanicTerminationMailbox { fuse: None }));
+    let mut watcher = member.record_watcher();
+    watcher.borrow_and_update_cloned();
+    let held = Arc::new(Mutex::new(None));
+    let waker = Waker::from(Arc::new(GateVenueWake {
+        root,
+        held: Arc::clone(&held),
+    }));
+    let mut changed = Box::pin(watcher.changed());
+    assert!(
+        changed
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        member.terminalize(Exit::never_started(), StartupDisposition::Unchanged);
+    }))
+    .expect_err("mailbox preparation panics");
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"injected locked admission terminalization panic")
+    );
+    assert_eq!(*held.lock().expect("probe mutex healthy"), Some(false));
+    assert!(
+        changed
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
+    drop(changed);
+    assert!(matches!(
+        watcher.borrow_and_update_cloned().stage,
+        MemberStage::Terminal(_)
+    ));
+
+    member.terminalize(Exit::never_started(), StartupDisposition::Unchanged);
+    let mut changed = Box::pin(watcher.changed());
+    assert!(
+        changed
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "a retry must not publish a second terminal edge"
+    );
+}
+
+#[crate::runtime::test]
 async fn rejected_admission_wakes_its_removal_waiter_outside_the_gate() {
     let (mut scope, _events, mut dynamic_events, control) = running_dynamic_fixture();
     let root = Arc::clone(&scope.root);

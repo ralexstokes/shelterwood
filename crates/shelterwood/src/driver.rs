@@ -23,7 +23,7 @@ use child::{ChildRuntime, fire_shutdown_edges};
 use child::{ChildTerminality, discharge_child_terminality, report_slot};
 use events::{
     ChildEvent, DeadlineKind, DriverEvent, EventLanes, MIN_EVENT_BATCH_LIMIT, Pending,
-    collect_event_lanes, restart_shutdown_work, retain_woken_event,
+    collect_event_lanes, retain_woken_event,
 };
 use removal::RemovalRequest;
 pub(crate) use shutdown::shutdown_scope;
@@ -527,12 +527,6 @@ struct ScopeRuntime {
     children: ChildResources<ChildRuntime>,
     supervisor: SupervisorState,
     supervisor_effects: Vec<SupervisorEffect>,
-    // Retained restart-shutdown facts whose subjects became inactive mid-batch.
-    // `handle_exit` queues them here instead of expediting synchronously so the
-    // retry re-enters arbitration on the next wake: an exit collected in the
-    // same batch must first get the chance to trip intensity or fail startup.
-    // Duplicates are harmless — expediting is idempotent.
-    restart_shutdown_retries: Vec<(ChildKey, Epoch)>,
     events: runtime::UnboundedMpscSender<DriverEvent>,
     disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
     disposal_event_receiver: runtime::UnboundedMpscReceiver<DriverEvent>,
@@ -753,7 +747,6 @@ impl ScopeRuntime {
             children: wiring.children,
             supervisor: wiring.supervisor,
             supervisor_effects: Vec::new(),
-            restart_shutdown_retries: Vec::new(),
             events: wiring.events,
             disposal_events: wiring.disposal_events,
             disposal_event_receiver: wiring.disposal_event_receiver,
@@ -842,6 +835,36 @@ impl ScopeRuntime {
         );
         #[cfg(test)]
         self.record_storage();
+    }
+
+    /// Stages a finished incarnation's completion for the driver to return.
+    ///
+    /// ScopeRuntime's synchronous epilogue clears dynamic state, discharges
+    /// child obligations and residency, and only then publishes the stopped
+    /// projection. For the root, the join monitor owns the later
+    /// membership-terminal fence.
+    fn take_completion(&mut self) -> Option<StopReason> {
+        let reason = self.finished.take()?;
+        self.completion = Some(ScopeCompletion {
+            reason: RetainedStopReason::new(reason.clone()),
+        });
+        Some(reason)
+    }
+
+    /// Acts on this incarnation's own consumed shutdown request.
+    fn accept_shutdown_request(&mut self) {
+        if let ScopeRole::Nested(nested) = &self.role {
+            // Firing the child-facing latch is what makes this incarnation's
+            // exit read `Cancellation::Observed` at its parent (§12).
+            nested.child_shutdown.fire();
+            // The ancestor arm's sole action is the same
+            // `begin_drain(ShutdownRequested)` call immediately below, so
+            // consuming its observation here suppresses only a duplicate
+            // idempotent transition. Construction suppression still reads the
+            // ancestor latch itself rather than this consumption flag.
+            self.ancestor_shutdown_seen = true;
+        }
+        self.begin_drain(StopReason::ShutdownRequested);
     }
 
     fn reduce(&mut self, event: SupervisorEvent) {
@@ -1478,7 +1501,19 @@ async fn run_scope_incarnation(
     plan.finish_transfer();
     scope.publish_initial_children();
 
+    // SPEC §11: a stop never constructs the incarnation it stops. A request
+    // latched before this first settlement is consumed ahead of it, so the
+    // incarnation enters `Draining` with its initial children still unspawned
+    // and drain entry terminalizes each as `NeverStarted`.
+    if root.take_shutdown_request(scope.epoch) {
+        scope.accept_shutdown_request();
+    }
     scope.settle_supervisor();
+    // That drain can finish the incarnation before any event exists to
+    // wake the loop below.
+    if let Some(reason) = scope.take_completion() {
+        return reason;
+    }
 
     let mut signal = root.signal().watcher();
     let mut pending = Vec::new();
@@ -1490,12 +1525,6 @@ async fn run_scope_incarnation(
             if let Some(work) = scope.control_event_work(event) {
                 pending.push(work);
             }
-        }
-        // Retries queued at the tail of a previous batch's exit handling
-        // re-enter arbitration here, so a same-wake exit sorts ahead of them
-        // and the execution-time suppression re-check observes its drain.
-        for (child, target) in std::mem::take(&mut scope.restart_shutdown_retries) {
-            pending.push(restart_shutdown_work(child, target));
         }
         if !scope.ancestor_shutdown_seen
             && scope
@@ -1554,21 +1583,9 @@ async fn run_scope_incarnation(
         arbitrate(&mut pending);
         for (_, event) in pending.drain(..) {
             match event {
-                Pending::Shutdown => {
-                    if let ScopeRole::Nested(nested) = &scope.role {
-                        nested.child_shutdown.fire();
-                        // The ancestor arm's sole action is the same
-                        // `begin_drain(ShutdownRequested)` call immediately
-                        // below, so consuming its observation here suppresses
-                        // only a duplicate idempotent transition. Construction
-                        // suppression still reads the ancestor latch itself
-                        // rather than this consumption flag.
-                        scope.ancestor_shutdown_seen = true;
-                    }
-                    scope.begin_drain(StopReason::ShutdownRequested);
-                }
-                Pending::RestartShutdown { child, target } => {
-                    scope.expedite_restart_shutdown(child, target);
+                Pending::Shutdown => scope.accept_shutdown_request(),
+                Pending::WindowStop { child, target } => {
+                    scope.resolve_window_stop(child, target);
                 }
                 Pending::AncestorShutdown => {
                     scope.begin_drain(StopReason::ShutdownRequested);
@@ -1627,14 +1644,7 @@ async fn run_scope_incarnation(
         // startup aggregate. Finalization retains starting-phase obligations
         // until the recomputation above establishes that order.
         scope.publish_startup_removals();
-        if let Some(reason) = scope.finished.take() {
-            // ScopeRuntime's synchronous epilogue clears dynamic state,
-            // discharges child obligations and residency, and only then
-            // publishes the stopped projection. For the root, the join
-            // monitor owns the later membership-terminal fence.
-            scope.completion = Some(ScopeCompletion {
-                reason: RetainedStopReason::new(reason.clone()),
-            });
+        if let Some(reason) = scope.take_completion() {
             return reason;
         }
 

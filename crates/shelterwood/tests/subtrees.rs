@@ -988,37 +988,34 @@ async fn locally_requested_subtree_shutdown_reads_cancelled() {
     );
 }
 
-/// The pre-driver lowering-failure path resolves the same verdict as the loop
-/// above, including the cancellation evidence: a stop request latched against
-/// the first (still pending) incarnation outranks the lowering failure, so the
-/// subtree exits `Completed`/`Observed` rather than `Failed`.
+/// A declaration-time request lands before the one-shot subtree's first
+/// incarnation exists, so the parent resolves it without constructing that
+/// incarnation (SPEC §11): the subtree is never lowered, and the parent's
+/// startup fails naming a `NeverStarted` member. The pre-driver
+/// lowering-failure path that a request latched on a *live* incarnation
+/// takes is pinned by the driver's `pre_loop_*_upgrades_a_nested_lowering_failure`
+/// unit tests.
 #[tokio::test]
-async fn shutdown_latched_before_a_subtree_lowering_failure_reads_cancelled() {
+async fn pre_spawn_shutdown_of_a_one_shot_subtree_never_lowers_it() {
     let mut nested = Tree::new();
     let _undefined = nested.reserve_task("missing").expect("reservation");
     let mut root = Tree::new();
     let sub = root
         .add_subtree_once("nested", SubtreeOnceDef::new(nested))
         .expect("valid subtree edge");
-    // Declaration-time request: it latches against the incarnation the nested
-    // driver has not minted yet, so lowering fails with the stop already held.
     sub.request_shutdown();
     let system = root.spawn().expect("runtime is available");
     let startup = system
         .wait_started()
         .await
-        .expect_err("the nested stop aborts parent startup pre-ready");
+        .expect_err("the never-started member fails parent startup");
     let (id, exit) = startup_failed_child(startup);
     assert_eq!(id.as_str(), "nested");
     assert!(
-        matches!(exit.kind(), ExitKind::Completed),
-        "the latched stop outranks the lowering failure: {exit:?}"
+        matches!(exit.kind(), ExitKind::NeverStarted),
+        "the stop constructs no incarnation to lower: {exit:?}"
     );
-    assert_eq!(
-        exit.cancellation(),
-        Cancellation::Observed,
-        "a pre-loop stop request is still a stop request: {exit:?}"
-    );
+    assert_eq!(sub.wait_stopped().await, StopReason::NeverStarted);
     system
         .shutdown(SHUTDOWN_BUDGET)
         .await

@@ -169,7 +169,6 @@ pub(super) struct ChildRuntime {
     pub(super) incarnations: IncarnationCounter,
     pub(super) restarts: RestartState,
     pub(super) restart_deadline: Option<DeadlineHandle>,
-    pub(super) restart_shutdown_pending: Option<Epoch>,
     pub(super) active: Option<ActiveChild>,
 }
 
@@ -208,7 +207,6 @@ impl ChildRuntime {
             incarnations,
             restarts: RestartState::new(),
             restart_deadline: None,
-            restart_shutdown_pending: None,
             active: None,
         }
     }
@@ -732,6 +730,26 @@ impl ScopeRuntime {
         {
             return;
         }
+        let nested = child.slot.scope.as_ref().map(Arc::clone);
+        let restart_stopped = self.restarts_a_stopped_incarnation(key);
+        let incarnation = self
+            .children
+            .get_mut(key)
+            .expect("the spawnable child remains registered")
+            .incarnations
+            .mint();
+        // The pending-stop decision and Starting publication share the gate
+        // with request_shutdown. A separate peek leaves a race in which an
+        // idle request could be carried into a newly constructed body.
+        if let Some(nested) = &nested
+            && !self
+                .root
+                .start_scope_child(nested, incarnation, restart_stopped)
+        {
+            let startup = self.terminal_startup_disposition(key);
+            self.terminate_inactive(key, startup);
+            return;
+        }
         let child = self
             .children
             .get_mut(key)
@@ -739,7 +757,6 @@ impl ScopeRuntime {
         if let Some(deadline) = child.restart_deadline.take() {
             self.deadlines.cancel(deadline);
         }
-        let incarnation = child.incarnations.mint();
 
         // Per-incarnation latch topology:
         // - shutdown/abort flow from the ladder into application code;
@@ -765,24 +782,28 @@ impl ScopeRuntime {
                 .expect("configuration or close supplies each bind token");
             mailbox.bind(token, incarnation, &mut effects);
         }
+        // Non-scope children publish after mailbox binding. Nested members
+        // already committed Starting together with their stop decision.
         // A spawn reaches here only from `Admitted` (first incarnation) or
         // `Restarting` (a scheduled restart), both accepted sources. The body
         // and the mailbox bind above are already committed, so a refusal would
         // run the incarnation with no `Started` edge — see the partial-effect
         // note on issue #392.
-        let started = self.root.transition_child_stage(
-            &child.slot.member,
-            MemberTransition::Starting { incarnation },
-            Some(LifecycleEventKind::Started {
-                id: child.slot.member.id().clone(),
-                membership: child.slot.member.membership(),
-                incarnation,
-            }),
-        );
-        assert!(
-            started,
-            "a spawn starts an admitted or restarting member's projection"
-        );
+        if nested.is_none() {
+            let started = self.root.transition_child_stage(
+                &child.slot.member,
+                MemberTransition::Starting { incarnation },
+                Some(LifecycleEventKind::Started {
+                    id: child.slot.member.id().clone(),
+                    membership: child.slot.member.membership(),
+                    incarnation,
+                }),
+            );
+            assert!(
+                started,
+                "a spawn starts an admitted or restarting member's projection"
+            );
+        }
 
         let mut readiness = ReadinessGate::new();
         let deadline = child
@@ -909,26 +930,27 @@ impl ScopeRuntime {
             });
             self.advance_ladder(key, runtime::now());
         } else {
-            let child = self
-                .children
-                .get_mut(key)
-                .expect("the inactive child remains registered");
-            if let Some(deadline) = child.restart_deadline.take() {
-                self.deadlines.cancel(deadline);
-            }
-            let record = child.slot.member.record();
-            let exit = record.last_exit.unwrap_or_else(Exit::never_started);
-            // A never-ran child and a child stopped between restart
-            // incarnations share the same terminal route: publish, then
-            // release through disposal. Hard shutdown still detaches that
-            // disposal through `hard_forced`.
-            self.begin_terminal_disposal(
-                key,
-                RetainedExit::new(exit),
-                None,
-                StartupDisposition::NotAborted,
-            );
+            // A drain has already taken the startup verdict, and removal
+            // shrinks the initial set, so neither reports a startup abort.
+            self.terminate_inactive(key, StartupDisposition::NotAborted);
         }
+    }
+
+    /// Terminalizes a membership with no live incarnation: one that never
+    /// ran, or one stopped between restart incarnations. Both share one
+    /// route — cancel any pending restart, publish the last exit (or
+    /// `NeverStarted`), then release through disposal. Hard shutdown still
+    /// detaches that disposal through `hard_forced`.
+    pub(super) fn terminate_inactive(&mut self, key: ChildKey, startup: StartupDisposition) {
+        let Some(child) = self.children.get_mut(key) else {
+            return;
+        };
+        if let Some(deadline) = child.restart_deadline.take() {
+            self.deadlines.cancel(deadline);
+        }
+        let record = child.slot.member.record();
+        let exit = record.last_exit.unwrap_or_else(Exit::never_started);
+        self.begin_terminal_disposal(key, RetainedExit::new(exit), None, startup);
     }
 
     pub(super) fn advance_ladder(&mut self, key: ChildKey, now: Instant) {
@@ -1195,26 +1217,22 @@ impl ScopeRuntime {
                 }
             }
         }
+        // A window stop can beat this exit into an earlier batch, where the
+        // resolver found the incarnation still active and left the request
+        // pending. Re-check the level now that the member is inactive. The
+        // resolver constructs nothing, so resolving mid-batch cannot start a
+        // doomed incarnation ahead of a same-batch intensity trip.
         if let Some(target) = self
             .children
             .get(key)
-            .and_then(|child| child.restart_shutdown_pending)
+            .and_then(|child| child.slot.scope.as_ref())
+            .and_then(|scope| scope.pending_incarnation_shutdown())
         {
-            // A subject-carrying control event can beat the corresponding
-            // child exit into an earlier driver batch. Retry the retained
-            // fact now that the old incarnation is inactive; otherwise the
-            // one-shot event would be consumed while `spawn_child` still
-            // rejects the active child and the requested expedite is lost.
-            // Queue the retry rather than expediting synchronously: it
-            // re-enters arbitration on the next wake, so a later exit
-            // collected in this same batch first gets the chance to trip
-            // intensity or fail startup, and the execution-time suppression
-            // re-check then observes that drain.
-            self.restart_shutdown_retries.push((key, target));
+            self.resolve_window_stop(key, target);
         }
     }
 
-    fn terminal_startup_disposition(&self, key: ChildKey) -> StartupDisposition {
+    pub(super) fn terminal_startup_disposition(&self, key: ChildKey) -> StartupDisposition {
         // §7's startup abort is a startup-sequence property: the membership
         // failed before its *initial* readiness edge. A later incarnation
         // stopped pre-ready (for example during drain) does not rewind it.
@@ -1271,17 +1289,19 @@ impl ScopeRuntime {
         // The exit is final at dispatch, and so is its publication (SPEC
         // §9). §7's `StartupAborted` is a startup-sequence property of a
         // membership that *ran* and failed before its initial readiness
-        // edge. A terminal without an exited incarnation never ran, so it
-        // publishes the plain `Stopped { NeverStarted }` verdict (B.6) even
-        // when its pre-readiness position still routes the scope's startup
-        // failure below.
+        // edge. A membership that never spawned publishes the plain
+        // `Stopped { NeverStarted }` verdict (B.6) even when its
+        // pre-readiness position still routes the scope's startup failure
+        // below. One stopped in its restart window did run: its terminal
+        // carries its last exit and keeps the startup disposition, though it
+        // has no exiting incarnation to name.
         //
         // Hand the publication seam a guarded clone rather than a raw one, so
         // no window between here and the cell layer's own retention holds the
         // user error unguarded. The cell layer surrenders its copy inside the
         // publishing transaction, where the terminal member record is its
         // structural co-owner.
-        let publication = if exited_incarnation.is_some() {
+        let publication = if exited_incarnation.is_some() || self.supervisor.spawned_once(key) {
             startup
         } else {
             StartupDisposition::NotAborted

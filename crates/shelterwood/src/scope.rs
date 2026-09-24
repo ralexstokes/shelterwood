@@ -93,6 +93,17 @@ impl ScopeRef {
     /// finish after this call returns.
     /// A zero budget still requests cooperative cancellation, then skips its
     /// wait and enters the ordinary escalation tail immediately.
+    ///
+    /// A request accepted while this nested scope has no live incarnation —
+    /// between restart incarnations, or before its first spawn — constructs
+    /// none, and `timeout` never arms for it. The parent resolves it under the
+    /// scope's restart policy. If the policy would restart a stopped
+    /// incarnation (`Always`), the call returns `Ok` without touching the
+    /// membership: a pending restart keeps its schedule, and a never-spawned
+    /// scope still spawns in its turn. Otherwise the pending restart is
+    /// cancelled, or the first spawn skipped, and the call returns `Ok` once
+    /// the membership is terminal: `Stopped` with its last exit after a
+    /// restart window, or `NeverStarted` before any spawn.
     pub async fn shutdown_and_wait(
         &self,
         timeout: impl Into<DeadlineBudget>,

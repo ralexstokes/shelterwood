@@ -810,6 +810,15 @@ async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
         )
         .expect("valid task");
     let shutdown_system = shutdown_tree.spawn().expect("runtime is available");
+    // Shut down only once the task is live and still pre-ready: a stop latched
+    // before the driver's first settlement constructs nothing (SPEC §11).
+    let shutdown_scope = shutdown_system.scope();
+    assert_eventually_frozen!(|| {
+        shutdown_scope
+            .child("edge")
+            .is_some_and(|child| matches!(child.state, ChildState::Starting))
+    })
+    .await;
     shutdown_system
         .shutdown(Duration::ZERO)
         .await

@@ -2160,22 +2160,32 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   **per-incarnation** state: it stops the scope incarnation it was set
   on and does not outlive it — a restarted scope incarnation starts with
   a clear latch (§12's nested-shutdown rule), so an `Always`-restarted
-  scope cannot enter a stop/restart storm. One deliberate, named
-  companion: the **pending-incarnation stop latch**. A stop request
-  accepted while the membership has *no live incarnation* (a restart
-  window — B.9's `shutdown_and_wait` landing between incarnations) is
-  held on the membership and armed onto the next incarnation at its
-  start, which then starts and immediately begins teardown. The
-  scope-level latch has its own version of that window: a stop latched
-  before the driver's first settlement is read only at the top of the
-  driver's first loop pass, after the initial incarnations are already
-  published, so it too constructs and then immediately tears down. The
-  two carry rules partition by target and never conflict:
-  fresh-restart-starts-clear says a latch *consumed by* incarnation N
-  never carries to N+1; the pending latch holds a request that arrived
-  with no incarnation to consume it — it was never any incarnation's
-  spent latch, and it waits for its first. What cannot exist is a stop
-  request silently dropped in the window. Cancelling an awaited
+  scope cannot enter a stop/restart storm. **A stop never constructs the
+  incarnation it stops.** A request accepted while the membership has *no
+  live incarnation* — a restart window, or a pre-spawn handle (B.9) — is
+  resolved by the parent in place. In a restart window the parent applies
+  the child's restart policy to the outcome a stopped incarnation would
+  have produced, a `Completed` exit with `Cancellation::Observed` (§12).
+  A policy that would restart it (`Always`) leaves the membership
+  untouched: the pending restart keeps its schedule and its charge, and
+  the request is spent without effect. Otherwise the pending restart is
+  cancelled and the membership terminalizes exactly as a restart-window
+  child does under drain or removal, with `Stopped { exit }` carrying its
+  last exit (B.6), under the startup disposition its pre-readiness
+  position assigns (§7). A pre-spawn request takes the same test: a
+  policy that would restart vacates the first incarnation's target, the
+  first spawn proceeds normally in its turn, and the request is spent;
+  otherwise the membership terminalizes as `Stopped { NeverStarted }`
+  when its parent first reaches it, constructing nothing. The check is
+  level-triggered at every construction site, so no ordering between the
+  request and a due restart constructs the incarnation; a request that
+  lands after construction has begun addresses that incarnation as a
+  live stop. The scope-level latch obeys the same rule: a stop latched
+  before a scope driver's first settlement is consumed before any
+  initial child is constructed, and the incarnation enters `Draining`
+  with every initial child `Stopped { NeverStarted }`. What cannot exist
+  is a stop request silently dropped in the window, or a construction
+  source run on behalf of one. Cancelling an awaited
   membership operation never rides the channel either: it is a
   per-operation level latch on the operation's cell (§9's linearization
   rule).
@@ -2330,7 +2340,10 @@ the engine's other decision-layer invariants in §15.3.)
   the fresh incarnation starts with a clear latch rather than
   immediately re-stopping. (A scope torn down by its *ancestor's* own
   shutdown is not this case: the exit is recorded by the funnel, but the
-  draining parent schedules nothing — §11's mode dispatch.)
+  draining parent schedules nothing — §11's mode dispatch.) A request
+  that lands while the scope membership has no live incarnation is not
+  this case either: §11 resolves it without constructing an incarnation,
+  so nothing publishes `ShutdownRequested` for it.
 - The owner has two further consuming awaits. `shutdown(timeout)`
   requests the §11 ladder and waits for the root driver's terminal
   epilogue. While a framework driver remains scheduled, it joins each
@@ -2844,9 +2857,10 @@ observable rules in §7, §8, §11, and §12.
   sampled, the state stays `Removing` through stop, terminalization,
   finalization, and reclaim.
 - **T6.** Non-owning scope shutdown targets an incarnation (B.9): a live request
-  resolves after that incarnation's scope epilogue; a restart-window
-  request arms the next incarnation; a membership that never spawns
-  resolves at terminality.
+  resolves after that incarnation's scope epilogue; a restart-window or
+  pre-spawn request is resolved by the parent without constructing an
+  incarnation (§11); a membership that never spawns resolves at
+  terminality.
 - **T7.** Dynamic capability is explicit: `DynamicScopeRef` exposes only dynamic
   operations inherently; shared observation/control is reached via
   `as_scope() -> &ScopeRef`; there is no mirrored forwarding block and no
@@ -3241,11 +3255,22 @@ fixtures for the driver shell and end-to-end invariants.
     never-polled included — and assert the removal still completes,
     `membership_status: Removing` having flipped synchronously at the
     call; concurrent removes resolve one shared outcome. A pre-spawn
-    `shutdown_and_wait` arms the pending stop latch, its timeout arming
-    only at teardown start (B.9). §11's pending-incarnation stop latch: a
-    stop request landing in a restart window stops the next incarnation,
-    while a latch consumed by a previous incarnation never carries
-    forward — no stop/restart storm under `Always`.
+    `shutdown_and_wait` constructs nothing on its own behalf, and its
+    timeout never arms (B.9): under `Always` the call resolves at once and
+    the first incarnation then spawns normally and is not stopped (an
+    initial child does not fail its parent's startup); under `OnFailure`
+    or `Never`, when the parent reaches the membership it publishes
+    `Stopped { NeverStarted }`. §11's restart-window rule, with a
+    construction counter on the factory and on every initial child: under
+    `Always` the call resolves without constructing, and the pending
+    restart then fires on its original schedule into an incarnation that
+    is not stopped; under `OnFailure` the pending restart is cancelled and
+    the membership publishes `Stopped { exit }` equal to its prior
+    `last_exit`, and advancing past the old `restart_at` constructs
+    nothing. A request racing a due restart deadline constructs nothing
+    either. A latch consumed by a previous incarnation never carries
+    forward — no stop/restart storm under `Always`. A stop latched before
+    a scope driver's first settlement constructs no initial child.
 13. **No runtime or runtime-adapter types are reachable from public
     façade items.** Runtime and randomness integration is confined to the
     runtime adapter and the façade's private runtime module (§15.1), so no
@@ -4005,27 +4030,31 @@ implied on all; error/outcome types are B.3 and B.8):
   structured straggler report. Because the handle is
   membership-addressed (§2) and the §11 latch is per-incarnation, the
   call is **incarnation-targeted by construction**: the request rides
-  the latch of the scope incarnation live at acceptance (a request
-  landing in a restart window is held by §11's pending-incarnation stop
-  latch and armed onto the next incarnation, which starts and
-  immediately begins teardown), and the call resolves once *that
-  incarnation* has finished its scope epilogue. On the ordinary teardown
-  path that includes joining its children; §12 defines the
-  recursive-join exception when an ancestor hard-aborts a framework
-  driver. Under a parent `Always` policy (§12's nested-shutdown rule) a
-  fresh incarnation may already be running at resolution — the contract
-  is about the incarnation the latch stopped, deliberately not about the
-  membership. A **pre-spawn** handle is the same window at the
-  membership's start of life: no incarnation has ever existed, so the
-  request arms §11's pending latch and waits for the first incarnation,
-  which starts and immediately begins teardown. The timeout is an
-  escalation bound on a live teardown and **arms only when the latch
-  begins acting** — at that incarnation's *drain entry*, never at the
-  call: pre-spawn there is nothing to escalate, and the call waits
-  exactly as a parked send does, bounded by §3.2's no-hang rule — a
-  membership terminalized with no incarnation ever spawned (tree dropped
-  unspawned, rejected or withdrawn insertion) resolves the call
-  immediately as already-stopped. Drain entry is the precise arming edge
+  the latch of the scope incarnation live at acceptance, and the call
+  resolves once *that incarnation* has finished its scope epilogue. On
+  the ordinary teardown path that includes joining its children; §12
+  defines the recursive-join exception when an ancestor hard-aborts a
+  framework driver. Under a parent `Always` policy (§12's
+  nested-shutdown rule) a fresh incarnation may already be running at
+  resolution — the contract is about the incarnation the latch stopped,
+  deliberately not about the membership. A request accepted with **no
+  live incarnation** addresses none and constructs none (§11). In a
+  restart window it resolves `Ok` at once when the child's policy would
+  restart a stopped incarnation, leaving the pending restart on its
+  schedule; otherwise it resolves `Ok` once the parent has cancelled the
+  pending restart and terminalized the membership with its last exit. A
+  **pre-spawn** handle is the same case at the membership's start of
+  life, under the same test. When the policy would restart, the call
+  resolves `Ok` as soon as the parent evaluates the request, and the
+  first incarnation then spawns normally in its turn. Otherwise the call
+  waits exactly as a parked send does, bounded by §3.2's no-hang rule,
+  until the parent reaches the membership and terminalizes it as
+  `Stopped { NeverStarted }`. A membership terminalized with no
+  incarnation ever spawned (tree dropped unspawned, rejected or withdrawn
+  insertion) resolves the call immediately as already-stopped. The
+  timeout is an escalation bound on a live teardown and **arms only when
+  the latch begins acting** — at that incarnation's *drain entry*, never
+  at the call — so it never arms for a request with no live incarnation. Drain entry is the precise arming edge
   because the budget bounds the **cooperative** phase: the incarnation
   must first get the wake in which it consumes the latch, enters
   `Draining`, and starts each child's stop ladder, or a zero budget

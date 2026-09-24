@@ -588,11 +588,7 @@ fn dynamic_close_evicts_a_terminal_reservation_before_readd() {
     let replacement_membership = replacement.slot.member.membership();
     assert!(!first_membership.supersedes(replacement_membership));
     assert!(!replacement_membership.supersedes(first_membership));
-    cancel_dynamic_reservation(
-        &replacement.scope,
-        replacement.control.as_ref(),
-        &replacement.slot,
-    );
+    replacement.cancel();
 }
 
 #[test]
@@ -623,11 +619,7 @@ fn removing_a_reservation_evicts_its_identity_before_readd() {
     let replacement_membership = replacement.slot.member.membership();
     assert!(!first_membership.supersedes(replacement_membership));
     assert!(!replacement_membership.supersedes(first_membership));
-    cancel_dynamic_reservation(
-        &replacement.scope,
-        replacement.control.as_ref(),
-        &replacement.slot,
-    );
+    replacement.cancel();
 }
 
 #[crate::runtime::test]
@@ -775,11 +767,7 @@ async fn final_removal_holds_the_id_until_removed_publication_commits() {
 
     let replacement = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("the id is reusable after the Removed commit");
-    cancel_dynamic_reservation(
-        &replacement.scope,
-        replacement.control.as_ref(),
-        &replacement.slot,
-    );
+    replacement.cancel();
 }
 
 #[crate::runtime::test]
@@ -865,11 +853,7 @@ fn draining_cannot_publish_across_an_inflight_reservation_transaction() {
             .join()
             .expect("draining completes after reservation");
         assert_eq!(root.record().state, ScopeState::Draining);
-        cancel_dynamic_reservation(
-            &reservation.scope,
-            reservation.control.as_ref(),
-            &reservation.slot,
-        );
+        reservation.cancel();
     });
 }
 
@@ -1038,11 +1022,7 @@ async fn annulment_before_admission_owns_never_started_terminality() {
     let (response, request) =
         begin_admission(&reservation, &mut dynamic_event_receiver, None).await;
 
-    cancel_dynamic_reservation(
-        &reservation.scope,
-        reservation.control.as_ref(),
-        &reservation.slot,
-    );
+    reservation.cancel();
     let annulled_stage = member.record().stage.clone();
     assert!(matches!(
         &annulled_stage,
@@ -1122,11 +1102,7 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
     // The promoted entry is no longer reserved, so a late annul (a dropped
     // `Admission` future racing its own completion) must not terminalize the
     // now-supervised member.
-    cancel_dynamic_reservation(
-        &reservation.scope,
-        reservation.control.as_ref(),
-        &reservation.slot,
-    );
+    reservation.cancel();
     assert!(
         !matches!(member.record().stage, MemberStage::Terminal(_)),
         "a late annul cannot compete with supervised terminalization"
@@ -1214,14 +1190,16 @@ async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
             .lock()
             .expect("dynamic-state mutex remains healthy");
         let annul_ready = contender_ready.clone();
-        let annul_control = Arc::clone(&reservation.control);
-        let annul_slot = Arc::clone(&reservation.slot);
-        let annul_scope = Arc::clone(&reservation.scope);
+        let annul_reservation = DynamicReservation {
+            scope: Arc::clone(&reservation.scope),
+            slot: Arc::clone(&reservation.slot),
+            control: Arc::clone(&reservation.control),
+        };
         let annul = std::thread::spawn(move || {
             annul_ready
                 .send(())
                 .expect("the race coordinator remains available");
-            cancel_dynamic_reservation(&annul_scope, annul_control.as_ref(), &annul_slot);
+            annul_reservation.cancel();
         });
         let (admission_runtime, admission) = DedicatedRuntime::spawn(async move {
             contender_ready

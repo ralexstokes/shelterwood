@@ -304,40 +304,6 @@ impl DynamicControl {
         Ok(slot)
     }
 
-    pub(super) fn start_admission(
-        self: Arc<Self>,
-        slot: Arc<SlotCell>,
-        fused_cancel: Option<Latch>,
-    ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
-        if !runtime::is_available() {
-            return Err(ReserveError::NoRuntime);
-        }
-        let (sender, response) = runtime::oneshot();
-        let request = AdmissionRequest {
-            slot,
-            fused_cancel,
-            response: Obligation::new(sender, |sender| {
-                let _ = sender.send(Err(LOST_ADMISSION_RESPONSE_ERROR));
-            }),
-        };
-        // Queue synchronously so dropping a split-admission future immediately
-        // after its first poll cannot cancel the admitted request.
-        queue_driver_event(&self, DriverEvent::Admission(request));
-        Ok(response)
-    }
-
-    pub(super) fn cancel_reservation(
-        &self,
-        scope: &ScopeCell,
-        slot: &SlotCell,
-        txn: &mut ObservationTxn<'_>,
-    ) {
-        let (definition, removed) = cancel_dynamic_reservation_parts(scope, self, slot, txn);
-        // The entry's drop completes its removal response; it must follow the
-        // member's terminal publication and isolated definition disposal.
-        txn.defer(move || dispose_definition_then(definition, move || drop(removed)));
-    }
-
     pub(super) fn signal_fused_cancel(
         &self,
         scope: &Arc<ScopeCell>,
@@ -405,20 +371,13 @@ impl DynamicControl {
         response
     }
 
-    fn close_admission_in(&self, _txn: &mut ObservationTxn<'_>) {
-        self.state
-            .lock()
-            .expect("dynamic-state mutex poisoned")
-            .close_admission(_txn);
-    }
-
     pub(super) fn close(
         &self,
         scope: &ScopeCell,
         txn: &mut ObservationTxn<'_>,
     ) -> HashMap<ChildId, DynamicEntry> {
-        self.close_admission_in(txn);
         let mut state = self.state.lock().expect("dynamic-state mutex poisoned");
+        state.close_admission(txn);
         let entries = state.take_entries(txn);
         drop(state);
         let mut retained = HashMap::new();
@@ -449,6 +408,43 @@ pub(crate) struct DynamicReservation {
     pub(crate) scope: Arc<ScopeCell>,
     pub(crate) slot: Arc<SlotCell>,
     pub(crate) control: Arc<DynamicControl>,
+}
+
+impl DynamicReservation {
+    /// Queues this reservation's admission on its control's event lane.
+    pub(crate) fn start_admission(
+        &self,
+        fused_cancel: Option<Latch>,
+    ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
+        if !runtime::is_available() {
+            return Err(ReserveError::NoRuntime);
+        }
+        let (sender, response) = runtime::oneshot();
+        let request = AdmissionRequest {
+            slot: Arc::clone(&self.slot),
+            fused_cancel,
+            response: Obligation::new(sender, |sender| {
+                let _ = sender.send(Err(LOST_ADMISSION_RESPONSE_ERROR));
+            }),
+        };
+        // Queue synchronously so dropping a split-admission future immediately
+        // after its first poll cannot cancel the admitted request.
+        queue_driver_event(&self.control, DriverEvent::Admission(request));
+        Ok(response)
+    }
+
+    /// Releases the reservation if it is still reserved; a no-op once the
+    /// entry was promoted by admission or removed.
+    pub(crate) fn cancel(&self) {
+        self.scope.with_observation_gate(|txn| {
+            let (definition, removed) =
+                cancel_dynamic_reservation_parts(&self.scope, &self.control, &self.slot, txn);
+            // The entry's drop completes its removal response; it must follow
+            // the member's terminal publication and isolated definition
+            // disposal.
+            txn.defer(move || dispose_definition_then(definition, move || drop(removed)));
+        });
+    }
 }
 
 pub(crate) fn reserve_dynamic(
@@ -497,14 +493,6 @@ pub(super) fn reserve_dynamic_in(
     })
 }
 
-pub(crate) fn start_admission(
-    control: Arc<DynamicControl>,
-    slot: Arc<SlotCell>,
-    fused_cancel: Option<Latch>,
-) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
-    control.start_admission(slot, fused_cancel)
-}
-
 pub(super) fn cancel_dynamic_reservation_parts(
     scope: &ScopeCell,
     control: &DynamicControl,
@@ -525,14 +513,6 @@ pub(super) fn cancel_dynamic_reservation_parts(
         .then(|| take_terminal_reservation(scope, slot, txn))
         .flatten();
     (definition, removed)
-}
-
-pub(crate) fn cancel_dynamic_reservation(
-    scope: &Arc<ScopeCell>,
-    control: &DynamicControl,
-    slot: &Arc<SlotCell>,
-) {
-    scope.with_observation_gate(|txn| control.cancel_reservation(scope, slot.as_ref(), txn));
 }
 
 pub(crate) fn signal_fused_cancel(
@@ -567,7 +547,10 @@ pub(crate) fn remove_dynamic(
 
 impl DynamicRoute for DynamicControl {
     fn close_admission(&self, txn: &mut ObservationTxn<'_>) {
-        self.close_admission_in(txn);
+        self.state
+            .lock()
+            .expect("dynamic-state mutex poisoned")
+            .close_admission(txn);
     }
 }
 

@@ -2,7 +2,7 @@ use crate::{
     ActorDef, ActorOnceDef, ActorRef, ChildId, Membership,
     cells::ReserveError,
     raw::{RawDef, RawOnceDef},
-    runtime,
+    runtime::{self, Latch},
     scope::{DynamicScopeRef, ScopeRef},
     task::{OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
 };
@@ -11,7 +11,7 @@ use super::{
     Admission, DynamicActorSlot, DynamicSubtreeSlot, DynamicTaskSlot, Removal, Subtree, SubtreeDef,
     SubtreeOnceDef,
     builders::dispose_rejected,
-    slots::{ActorKind, AdmissionOwnership, Definition, SubtreeKind, TaskKind, reserve_dynamic},
+    slots::{ActorKind, Definition, SubtreeKind, TaskKind, reserve_dynamic},
 };
 
 impl DynamicScopeRef {
@@ -21,7 +21,7 @@ impl DynamicScopeRef {
         definition: D,
     ) -> Admission<D::Handles> {
         let mut definition = runtime::Isolated::new(definition);
-        match reserve_dynamic::<D::Kind>(self, id, AdmissionOwnership::Fused) {
+        match reserve_dynamic::<D::Kind>(self, id, Some(Latch::default())) {
             Ok(slot) => slot.define(definition.take().expect("isolated definition is available")),
             Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
@@ -41,8 +41,7 @@ impl DynamicScopeRef {
         &self,
         id: impl Into<ChildId>,
     ) -> Result<DynamicActorSlot<M>, ReserveError> {
-        reserve_dynamic::<ActorKind<M>>(self, id, AdmissionOwnership::Split)
-            .map(|core| DynamicActorSlot { core })
+        reserve_dynamic::<ActorKind<M>>(self, id, None).map(|core| DynamicActorSlot { core })
     }
 
     /// Adds a restartable callback-oriented actor, resolving at admission.
@@ -92,8 +91,7 @@ impl DynamicScopeRef {
     /// and [`ReserveError::RemovalInProgress`] or [`ReserveError::DuplicateId`]
     /// when a same-id member is being removed or is resident.
     pub fn reserve_task(&self, id: impl Into<ChildId>) -> Result<DynamicTaskSlot, ReserveError> {
-        reserve_dynamic::<TaskKind>(self, id, AdmissionOwnership::Split)
-            .map(|core| DynamicTaskSlot { core })
+        reserve_dynamic::<TaskKind>(self, id, None).map(|core| DynamicTaskSlot { core })
     }
 
     /// Adds a restartable task, resolving at admission rather than startup.
@@ -124,8 +122,7 @@ impl DynamicScopeRef {
         &self,
         id: impl Into<ChildId>,
     ) -> Result<DynamicSubtreeSlot<T>, ReserveError> {
-        reserve_dynamic::<SubtreeKind<T>>(self, id, AdmissionOwnership::Split)
-            .map(|core| DynamicSubtreeSlot { core })
+        reserve_dynamic::<SubtreeKind<T>>(self, id, None).map(|core| DynamicSubtreeSlot { core })
     }
 
     /// Adds a restartable subtree, resolving at admission.

@@ -2,7 +2,6 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -13,8 +12,6 @@ use crate::{
 };
 
 use crate::driver::{LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR};
-
-use super::slots::AdmissionOwnership;
 
 /// Resolves a driver response that may have been lost.
 ///
@@ -68,20 +65,10 @@ struct PendingAdmission<H> {
 
 impl<H> PendingAdmission<H> {
     fn start(&self) -> Result<AdmissionWait, ReserveError> {
-        let response = crate::driver::start_admission(
-            Arc::clone(&self.reservation.control),
-            Arc::clone(&self.reservation.slot),
-            self.fused_cancel.clone(),
-        )?;
+        let response = self
+            .reservation
+            .start_admission(self.fused_cancel.clone())?;
         Ok(DisposingReceiver::new(response))
-    }
-
-    fn cancel_reservation(&self) {
-        crate::driver::cancel_dynamic_reservation(
-            &self.reservation.scope,
-            self.reservation.control.as_ref(),
-            &self.reservation.slot,
-        );
     }
 
     fn annul(&self) {
@@ -96,7 +83,7 @@ impl<H> PendingAdmission<H> {
             })
             .err()
         });
-        let cleanup_panic = crate::runtime::catch_panic(|| self.cancel_reservation()).err();
+        let cleanup_panic = crate::runtime::catch_panic(|| self.reservation.cancel()).err();
         crate::runtime::resume_preferred_panic(crate::runtime::UnwindPanics {
             primary: signal_panic,
             cleanup: cleanup_panic,
@@ -144,16 +131,13 @@ impl<H> Admission<H> {
     pub(super) fn new(
         reservation: DynamicReservation,
         handles: H,
-        ownership: AdmissionOwnership,
+        fused_cancel: Option<Latch>,
     ) -> Self {
         Self {
             state: AdmissionState::Unpolled(PendingAdmission {
                 reservation,
                 handles,
-                fused_cancel: match ownership {
-                    AdmissionOwnership::Split => None,
-                    AdmissionOwnership::Fused => Some(Latch::default()),
-                },
+                fused_cancel,
             }),
         }
     }
@@ -172,9 +156,11 @@ impl<H> Future for Admission<H> {
         let this = self.as_mut().get_mut();
         loop {
             match &mut this.state {
-                AdmissionState::Immediate(error) => {
-                    let error = error.clone();
-                    this.state = AdmissionState::Done;
+                AdmissionState::Immediate(_) => {
+                    let previous = std::mem::replace(&mut this.state, AdmissionState::Done);
+                    let AdmissionState::Immediate(error) = previous else {
+                        unreachable!("the matched admission state was replaced in place")
+                    };
                     return Poll::Ready(Err(error));
                 }
                 AdmissionState::Unpolled(pending) => {
@@ -184,7 +170,7 @@ impl<H> Future for Admission<H> {
                     let wait = match pending.start() {
                         Ok(wait) => wait,
                         Err(error) => {
-                            pending.cancel_reservation();
+                            pending.reservation.cancel();
                             this.state = AdmissionState::Done;
                             return Poll::Ready(Err(error));
                         }
@@ -296,10 +282,7 @@ mod tests {
     use crate::{ExitKind, TaskDef, test_support::SHUTDOWN_BUDGET};
 
     use super::{Admission, Removal};
-    use crate::{
-        TaskRef,
-        tree::{DynamicTree, slots::AdmissionOwnership},
-    };
+    use crate::{TaskRef, runtime::Latch, tree::DynamicTree};
 
     struct DropAdmissionAndPanic {
         admission: Mutex<Option<Admission<TaskRef>>>,
@@ -399,7 +382,7 @@ mod tests {
     #[crate::runtime::test]
     async fn queued_fused_drop_before_exit_dispatch_suppresses_restart_accounting() {
         crate::driver::exercise_queued_fused_drop_before_exit_dispatch(|reservation| {
-            Admission::new(reservation, (), AdmissionOwnership::Fused)
+            Admission::new(reservation, (), Some(Latch::default()))
         })
         .await;
     }

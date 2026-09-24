@@ -66,11 +66,10 @@ registered waker go to isolated disposal.
 ## Waking the actor
 
 Every accepting or binding transition queues a pulse. After unlock, the
-flush pulses the cell's `MailboxSignal` — the capability object's change
-signal, a watch channel in the Tokio adapter. The receiving incarnation
-holds a `MailboxReceiver<M>` (the mailbox `Arc`, its incarnation, and a
-signal watcher); the pulse is what makes its pending `changed()` future
-ready.
+flush pulses the cell's `Signal` — the adapter's change signal, a watch
+channel in the Tokio adapter. The receiving incarnation holds a
+`MailboxReceiver<M>` (the mailbox `Arc`, its incarnation, and a signal
+watcher); the pulse is what makes its pending `changed()` future ready.
 
 ## The receive loop
 
@@ -106,8 +105,8 @@ outlives the incarnation that started it.
 
 ## Request and reply
 
-`Reply<T>` wraps a one-shot sender minted from the mailbox's capability
-object. Its `send` consumes it; if the receiver is already gone, the
+`Reply<T>` wraps the adapter's typed one-shot sender, minted through the
+façade's runtime module. Its `send` consumes it; if the receiver is already gone, the
 value routes to isolated disposal rather than being dropped on the actor
 task. `ActorRef::call` builds the whole conversation under one deadline
 budget: constructing the message from the user's closure, waiting for

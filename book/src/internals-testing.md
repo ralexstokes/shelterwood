@@ -63,9 +63,9 @@ arrive within the window"). Those provocations are a floor, not a
 ceiling. Appendix C's acceptance scenarios get their own end-to-end
 files (`tests/acceptance_*.rs`).
 
-The hostile inputs are first-class fixtures: test-only `MailboxRuntime`
-implementations that panic in their pulse path, wakers that panic or
-re-enter, destructor-blocking actors. They exist because the lock rule's
+The hostile inputs are first-class fixtures: hostile wakers registered on
+the mailbox signal, wakers that panic or re-enter, destructor-blocking
+actors. They exist because the lock rule's
 whole premise is that user code misbehaves at framework-chosen moments —
 so the suite supplies user code that does.
 
@@ -97,9 +97,10 @@ A few conventions keep the suite honest as it grows:
 - **Examples are tests.** Every example ends in assertions and runs in
   CI (`just examples`), which is what lets the book quote them without
   a test lane of its own.
-- **The seam is provably substitutable.** The capability interface has
-  working test implementations inside the façade's own tests; a change
-  that breaks substitutability breaks them first.
+- **The runtime module is the one test seam.** In the façade's own test
+  builds, `crate::runtime` shadows the clock, detached disposal and the
+  change signal's pulse with thread-local hooks, so clock control and
+  effect-order tests need no hand-written runtime double.
 
 The full check list is the `ci` recipe in the `justfile` — format, both
 clippy passes, nextest plus doctests, examples, rustdoc with denied

@@ -875,14 +875,13 @@ impl ScopeRuntime {
             .as_ref()
             .is_some_and(|active| active.ladder.is_some())
         {
-            if let Some(active) = self
-                .children
-                .get_mut(key)
-                .and_then(|child| child.active.as_mut())
-                && forced.is_some()
-            {
-                active.forced_outcome = forced;
-            }
+            // A readiness timeout is the only forced stop, and it comes from
+            // a `Waiting` gate. Arming the ladder below leaves the gate
+            // `Ready` or `Disarmed`, neither of which can time out.
+            debug_assert!(
+                forced.is_none(),
+                "a readiness timeout cannot follow an armed stop ladder"
+            );
             return;
         }
         // Shutdown outranks queued readiness (§13). Disarm below without

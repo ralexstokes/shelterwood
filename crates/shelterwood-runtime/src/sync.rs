@@ -140,56 +140,12 @@ impl fmt::Debug for WaiterRegistry {
     }
 }
 
-#[derive(Debug)]
-pub struct Signal {
-    inner: WatchSender<()>,
-}
+/// A change signal: a watch channel whose only content is its version.
+pub type Signal = WatchSender<()>;
 
-impl Default for Signal {
-    fn default() -> Self {
-        Self { inner: watch(()).0 }
-    }
-}
+/// The receiving half of a [`Signal`].
+pub type SignalWatcher = WatchReceiver<()>;
 
-impl Clone for Signal {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl Signal {
-    pub fn pulse(&self) {
-        self.inner.pulse();
-    }
-
-    pub fn watcher(&self) -> SignalWatcher {
-        SignalWatcher {
-            inner: self.inner.watcher(),
-        }
-    }
-
-    /// The channel-wide waiter-registry length.
-    ///
-    /// This is deliberately not the endpoint count: `changed()` never clones
-    /// its receiver, so an endpoint probe cannot observe a registration a
-    /// cancelled wait failed to remove.
-    #[cfg(test)]
-    fn waiter_count(&self) -> usize {
-        self.inner.shared.waiters.len()
-    }
-}
-
-pub struct SignalWatcher {
-    inner: WatchReceiver<()>,
-}
-
-impl SignalWatcher {
-    pub async fn changed(&mut self) {
-        self.inner.changed().await;
-    }
-}
 /// A one-shot, multi-waiter signal backed by a contained waiter registry.
 ///
 /// The atomic provides a linearizable, idempotent transition and retains the
@@ -845,6 +801,12 @@ pub fn watch<T>(initial: T) -> (WatchSender<T>, WatchReceiver<T>) {
         },
         WatchReceiver { shared, seen: 0 },
     )
+}
+
+impl<T: Default> Default for WatchSender<T> {
+    fn default() -> Self {
+        watch(T::default()).0
+    }
 }
 
 impl<T> WatchSender<T> {
@@ -1635,20 +1597,23 @@ mod tests {
     fn quiet_signal_wait_cancellation_removes_waiter_registration() {
         let signal = Signal::default();
         let mut watcher = signal.watcher();
-        assert_eq!(signal.waiter_count(), 0);
+        // The channel-wide registry length, not the endpoint count: `changed()`
+        // never clones its receiver, so an endpoint probe cannot observe a
+        // registration a cancelled wait failed to remove.
+        assert_eq!(signal.shared.waiters.len(), 0);
 
         for _ in 0..10_000 {
             let mut changed = Box::pin(watcher.changed());
             let mut context = Context::from_waker(Waker::noop());
             assert!(changed.as_mut().poll(&mut context).is_pending());
             assert_eq!(
-                signal.waiter_count(),
+                signal.shared.waiters.len(),
                 1,
                 "a parked wait holds exactly one registration"
             );
             drop(changed);
             assert_eq!(
-                signal.waiter_count(),
+                signal.shared.waiters.len(),
                 0,
                 "cancelling the wait removes its registration"
             );

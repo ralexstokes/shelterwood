@@ -64,7 +64,7 @@ async fn assert_closed_lane_fails_closed(closed_control: bool) {
         scope
             .completion
             .as_ref()
-            .map(|completion| completion.reason.as_reason()),
+            .map(|completion| completion.reason.get()),
         Some(StopReason::ShutdownRequested)
     ));
     drop(scope);

@@ -32,10 +32,9 @@ use crate::{
     Cancellation, ChildId, DeadlineBudget, Exit, GracePhase, Incarnation, JitterSample, Readiness,
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     cells::{
-        LifecycleEventKind, MemberCell, MemberStage, MemberTransition, NotAdmittingCause,
-        ReserveError, ResidentProjection, Retained, RetainedStopReason, ScopeCell,
-        ScopeControlEvent, StartupDisposition, classify_exit_retaining,
-        reconcile_recorded_outcomes_retaining,
+        Guarded, LifecycleEventKind, MemberCell, MemberStage, MemberTransition, NotAdmittingCause,
+        ReserveError, ResidentProjection, RetainGuards, Retained, ScopeCell, ScopeControlEvent,
+        StartupDisposition, classify_exit_retaining, reconcile_recorded_outcomes_retaining,
     },
     deadline::Deadline,
     engine::{
@@ -82,7 +81,7 @@ use admission_control::RemovalResponses;
 
 pub(crate) struct SystemRun {
     pub(crate) root: Arc<ScopeCell>,
-    driver: Option<runtime::JoinHandle<RetainedStopReason>>,
+    driver: Option<runtime::JoinHandle<Guarded<StopReason>>>,
     // Taking the handle starts a cancellation-sensitive join. Keep its
     // completion separate so dropping a cancelled consuming API still requests
     // shutdown even though the in-flight future already moved the handle out.
@@ -238,8 +237,8 @@ impl SystemRun {
 }
 
 fn classify_retained_root_driver_join(
-    outcome: runtime::JoinOutcome<RetainedStopReason>,
-) -> Result<RetainedStopReason, Exit> {
+    outcome: runtime::JoinOutcome<Guarded<StopReason>>,
+) -> Result<Guarded<StopReason>, Exit> {
     let (join, cancellation) = match outcome {
         runtime::JoinOutcome::Ok { value } => return Ok(value),
         runtime::JoinOutcome::Panic { message } => (
@@ -283,8 +282,8 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
 
 fn monitor_root_driver(
     monitor_root: Arc<ScopeCell>,
-    driver: runtime::JoinHandle<RetainedStopReason>,
-) -> runtime::JoinHandle<RetainedStopReason> {
+    driver: runtime::JoinHandle<Guarded<StopReason>>,
+) -> runtime::JoinHandle<Guarded<StopReason>> {
     // Constructed before the future so it is an upvar of the `async move`
     // block rather than a local of its body: an `async` block owns its
     // captures from creation, so the fence retires even for a monitor task
@@ -293,14 +292,14 @@ fn monitor_root_driver(
     runtime::spawn(async move {
         match classify_retained_root_driver_join(runtime::join(driver).await) {
             Ok(reason) => {
-                let public_reason = reason.as_reason().clone();
+                let public_reason = reason.get().clone();
                 let exit = stop_reason_root_exit(&public_reason);
                 fence.publish(public_reason, exit);
                 reason
             }
             Err(exit) => {
                 fence.publish(StopReason::ShutdownRequested, exit);
-                RetainedStopReason::new(StopReason::ShutdownRequested)
+                Guarded::new(StopReason::ShutdownRequested)
             }
         }
     })
@@ -542,7 +541,7 @@ impl<T> IndexMut<ChildKey> for ChildResources<T> {
 }
 
 struct ScopeCompletion {
-    reason: RetainedStopReason,
+    reason: Guarded<StopReason>,
 }
 
 /// Runs the synchronous fail-closed scope epilogue.
@@ -623,7 +622,7 @@ impl Drop for ScopeRuntime {
         let completion = self.completion.take();
         let reason = completion
             .as_ref()
-            .map(|completion| completion.reason.as_reason().clone())
+            .map(|completion| completion.reason.get().clone())
             .or_else(|| self.supervisor.lifecycle().draining_reason().cloned())
             .unwrap_or(StopReason::ShutdownRequested);
         // Root membership terminality is join-gated: the monitor owns it on
@@ -740,7 +739,7 @@ impl ScopeRuntime {
     fn take_completion(&mut self) -> Option<StopReason> {
         let reason = self.finished.take()?;
         self.completion = Some(ScopeCompletion {
-            reason: RetainedStopReason::new(reason.clone()),
+            reason: Guarded::new(reason.clone()),
         });
         Some(reason)
     }
@@ -1124,7 +1123,7 @@ async fn run_nested_tree_with_epoch(
             // verdict it generalizes.
             epoch.lifecycle.begin_drain({
                 let reason = StopReason::StartupFailed(failure);
-                Retained::retain_stop_reason(&mut epoch.retained_exits, &reason);
+                reason.retain_guards(&mut epoch.retained_exits);
                 reason
             });
             let reason = epoch
@@ -1153,15 +1152,15 @@ async fn run_nested_tree_with_epoch(
     )
 }
 
-async fn run_scope(plan: ScopePlan, role: ScopeRole) -> RetainedStopReason {
+async fn run_scope(plan: ScopePlan, role: ScopeRole) -> Guarded<StopReason> {
     let root = Arc::clone(&plan.root);
     let Some(epoch) = ScopeEpochGuard::begin(&root) else {
         // Dropping the still-owned plan terminalizes every never-started
         // declaration and the root; no aliased driver epoch is created.
         drop(plan);
-        return RetainedStopReason::new(StopReason::NeverStarted);
+        return Guarded::new(StopReason::NeverStarted);
     };
-    RetainedStopReason::new(run_scope_incarnation(plan, role, epoch).await)
+    Guarded::new(run_scope_incarnation(plan, role, epoch).await)
 }
 
 /// Blocks the driver loop until one lane wakes it, returning `Some` only when
@@ -1169,7 +1168,7 @@ async fn run_scope(plan: ScopePlan, role: ScopeRole) -> RetainedStopReason {
 #[must_use = "a staged fail-closed completion must end the driver loop"]
 async fn wait_for_scope_wake(
     scope: &mut ScopeRuntime,
-    signal: &mut runtime::WatchReceiver<crate::cells::MemberRecord>,
+    signal: &mut runtime::WatchReceiver<crate::cells::Guarded<crate::cells::MemberRecord>>,
     event_receiver: &mut runtime::UnboundedMpscReceiver<DriverEvent>,
     dynamic_event_receiver: Option<&mut runtime::UnboundedMpscReceiver<DriverEvent>>,
     pending: &mut Vec<(ArbitrationClass, Pending)>,
@@ -1223,7 +1222,7 @@ async fn wait_for_scope_wake(
             // ScopeRuntime's contained epilogue.
             let reason = StopReason::ShutdownRequested;
             scope.completion = Some(ScopeCompletion {
-                reason: RetainedStopReason::new(reason.clone()),
+                reason: Guarded::new(reason.clone()),
             });
             return Some(reason);
         }

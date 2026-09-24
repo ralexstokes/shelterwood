@@ -15,7 +15,7 @@ use shelterwood_core::{
     policy::ScopeFlavor,
 };
 
-use super::{ObservationTxn, Retained};
+use super::{Guarded, ObservationTxn, RetainGuards, Retained};
 
 /// Number of lifecycle events retained independently for each subscriber.
 pub(crate) const LIFECYCLE_EVENT_CAPACITY: usize = 128;
@@ -78,97 +78,76 @@ pub struct LifecycleEvent {
     pub kind: LifecycleEventKind,
 }
 
+/// A lifecycle edge as the framework's broadcast rings hold it.
+///
+/// The kind is the only part that can own a user error, so it alone rides in
+/// a [`Guarded`] carrier: ring eviction releases the raw exit projection while
+/// a retained copy still protects its user error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RetainedLifecycleEvent {
-    // Keep the public event before its guards. Ring eviction therefore drops
-    // every raw exit projection while a retained copy still protects its user
-    // error, and only the guards' later drop submits destruction to isolated
-    // disposal. This is the same field-order argument as
-    // `RetainedScopeSnapshot` and `RetainedStopReason`.
-    event: LifecycleEvent,
-    guards: Arc<Vec<Retained<Exit>>>,
+    scope_path: Vec<ChildId>,
+    scope: Membership,
+    seq: LifecycleSeq,
+    kind: Guarded<LifecycleEventKind>,
 }
 
 impl RetainedLifecycleEvent {
-    /// Retention guards protecting every user error one lifecycle edge
-    /// carries.
-    ///
-    /// Split out of [`Self::new`] so a producer can mint the guards *before*
-    /// the fallible framework bookkeeping that decides whether the edge is
-    /// ever assembled. The single exhaustive `match` stays here either way.
-    pub(crate) fn retain_guards(kind: &LifecycleEventKind) -> Vec<Retained<Exit>> {
-        // Exhaustive with no wildcard arm on purpose: `LifecycleEventKind` is
-        // non-exhaustive for downstream crates but not here, so a new variant
-        // fails to compile until its retention is declared. A variant that
-        // carries an `Exit` and slipped through with no guard would let ring
-        // eviction drop a user error under the observation gate.
-        let mut guards = Vec::new();
-        match kind {
-            LifecycleEventKind::Exited { exit, .. } => {
-                Retained::retain_exit(&mut guards, exit);
-            }
-            LifecycleEventKind::ScopeState { state } => {
-                Retained::retain_scope_state(&mut guards, state);
-            }
-            LifecycleEventKind::Added { .. }
-            | LifecycleEventKind::Started { .. }
-            | LifecycleEventKind::Ready { .. }
-            | LifecycleEventKind::RestartScheduled { .. }
-            | LifecycleEventKind::Removed { .. } => {}
-        }
-        guards
-    }
-
-    fn new(event: LifecycleEvent) -> Self {
-        let guards = Self::retain_guards(&event.kind);
-        Self {
-            event,
-            guards: Arc::new(guards),
-        }
-    }
-
-    /// Assembles a leaf edge from a kind whose guards were already minted by
-    /// [`Self::retain_guards`].
-    pub(crate) fn from_parts(
+    /// Assembles a leaf edge from an already guarded kind.
+    pub(crate) fn new(
         scope: Membership,
         seq: LifecycleSeq,
-        kind: LifecycleEventKind,
-        guards: Vec<Retained<Exit>>,
+        kind: Guarded<LifecycleEventKind>,
     ) -> Self {
         Self {
-            event: LifecycleEvent {
-                scope_path: Vec::new(),
-                scope,
-                seq,
-                kind,
-            },
-            guards: Arc::new(guards),
+            scope_path: Vec::new(),
+            scope,
+            seq,
+            kind,
         }
     }
 
     /// Extends the scope path towards the subscribed ancestor.
     pub(crate) fn prepend_scope(&mut self, id: ChildId) {
-        self.event.scope_path.insert(0, id);
+        self.scope_path.insert(0, id);
     }
 
     fn into_public(self) -> LifecycleEvent {
-        let Self { event, guards } = self;
-        // The public event owns a raw clone corresponding to every guard, so
-        // retiring these copies inline is provably refcount-only. Unwrapping
-        // the guard allocation first matters: a broadcast receive is often the
-        // last owner, and letting the arc drop the guards would route a live
-        // user error through isolated disposal for nothing.
-        let guards = Arc::unwrap_or_clone(guards);
-        for guard in guards {
-            drop(guard.into_user_owned());
+        LifecycleEvent {
+            scope_path: self.scope_path,
+            scope: self.scope,
+            seq: self.seq,
+            kind: self.kind.into_user_owned(),
         }
-        event
     }
 }
 
 impl From<LifecycleEvent> for RetainedLifecycleEvent {
     fn from(event: LifecycleEvent) -> Self {
-        Self::new(event)
+        Self {
+            scope_path: event.scope_path,
+            scope: event.scope,
+            seq: event.seq,
+            kind: Guarded::new(event.kind),
+        }
+    }
+}
+
+// Exhaustive with no wildcard arm on purpose: `LifecycleEventKind` is
+// non-exhaustive for downstream crates but not here, so a new variant fails to
+// compile until its retention is declared. A variant that carries an `Exit`
+// and slipped through with no guard would let ring eviction drop a user error
+// under the observation gate.
+impl RetainGuards for LifecycleEventKind {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>) {
+        match self {
+            Self::Exited { exit, .. } => exit.retain_guards(guards),
+            Self::ScopeState { state } => state.retain_guards(guards),
+            Self::Added { .. }
+            | Self::Started { .. }
+            | Self::Ready { .. }
+            | Self::RestartScheduled { .. }
+            | Self::Removed { .. } => {}
+        }
     }
 }
 
@@ -371,44 +350,29 @@ impl ScopeSnapshot {
     }
 }
 
-/// A public projection plus retained copies of every exit it contains.
-///
-/// Field order is intentional: the public projection's `Arc` is released
-/// while the retained exits still prove that no user error can be destroyed
-/// inline. Each retained exit then transfers its failed payload to isolated
-/// disposal. A public `Arc` handed to a caller may outlive these guards, in
-/// which case that caller keeps ordinary last-drop semantics.
-#[derive(Clone, Debug)]
-pub(crate) struct RetainedScopeSnapshot {
-    snapshot: Arc<ScopeSnapshot>,
-    exits: Arc<Vec<Retained<Exit>>>,
-}
-
-impl RetainedScopeSnapshot {
-    pub(crate) fn new(snapshot: Arc<ScopeSnapshot>, exits: Vec<Retained<Exit>>) -> Self {
-        Self {
-            snapshot,
-            exits: Arc::new(exits),
+impl RetainGuards for ScopeSnapshot {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>) {
+        self.state.retain_guards(guards);
+        for child in self.children.iter() {
+            child.retain_guards(guards);
         }
     }
+}
 
-    fn public(&self) -> Arc<ScopeSnapshot> {
-        Arc::clone(&self.snapshot)
-    }
-
-    pub(crate) fn into_public(self, txn: &mut ObservationTxn<'_>) -> Arc<ScopeSnapshot> {
-        let (snapshot, exits) = self.into_parts();
-        // The public projection owns a raw clone corresponding to every
-        // guard. The transaction surrenders those framework-internal copies
-        // after unlock; the caller's eventual last drop keeps ordinary user
-        // semantics.
-        txn.surrender(exits);
-        snapshot
-    }
-
-    pub(crate) fn into_parts(self) -> (Arc<ScopeSnapshot>, Vec<Retained<Exit>>) {
-        let exits = Arc::unwrap_or_clone(self.exits);
-        (self.snapshot, exits)
+impl RetainGuards for ChildSnapshot {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>) {
+        match &self.state {
+            ChildState::Stopped { exit } | ChildState::StartupAborted { exit } => {
+                exit.retain_guards(guards);
+            }
+            ChildState::Admitted
+            | ChildState::Starting
+            | ChildState::Running
+            | ChildState::Stopping
+            | ChildState::Restarting => {}
+        }
+        self.last_exit.retain_guards(guards);
+        self.nested.retain_guards(guards);
     }
 }
 
@@ -434,14 +398,14 @@ impl SnapshotReceiver {
     /// observed.
     #[must_use]
     pub fn borrow_latest(&self) -> Arc<ScopeSnapshot> {
-        self.inner.borrow_cloned().snapshot.public()
+        Arc::clone(&self.inner.borrow_cloned().snapshot)
     }
 
     /// Borrows the newest snapshot and terminal flag from one retained state.
     #[must_use]
     pub(crate) fn borrow_latest_and_closed(&self) -> (Arc<ScopeSnapshot>, bool) {
         let state = self.inner.borrow_cloned();
-        (state.snapshot.public(), state.closed)
+        (Arc::clone(&state.snapshot), state.closed)
     }
 
     /// The hub's current generation.
@@ -462,7 +426,7 @@ impl SnapshotReceiver {
             let state = self.inner.borrow_and_update_cloned();
             if state.generation.current() != self.seen_generation {
                 self.seen_generation = state.generation.current();
-                return Ok(state.snapshot.public());
+                return Ok(Arc::clone(&state.snapshot));
             }
             if state.closed {
                 return Err(SnapshotClosed);
@@ -490,13 +454,13 @@ pub(crate) struct SnapshotHub {
 
 #[derive(Clone, Debug)]
 struct SnapshotHubState {
-    snapshot: RetainedScopeSnapshot,
+    snapshot: Guarded<Arc<ScopeSnapshot>>,
     generation: MonotonicCounter,
     closed: bool,
 }
 
 impl SnapshotHubState {
-    fn new(snapshot: RetainedScopeSnapshot, closed: bool) -> Self {
+    fn new(snapshot: Guarded<Arc<ScopeSnapshot>>, closed: bool) -> Self {
         Self {
             snapshot,
             generation: MonotonicCounter::new(),
@@ -520,7 +484,7 @@ struct SnapshotInstallPolicy {
 /// `false` re-asserts the flag it just read rather than clearing a closure.
 fn install_snapshot(
     sender: &runtime::WatchSender<SnapshotHubState>,
-    mut snapshot: Option<RetainedScopeSnapshot>,
+    mut snapshot: Option<Guarded<Arc<ScopeSnapshot>>>,
     closed: bool,
     policy: SnapshotInstallPolicy,
 ) -> Vec<Box<dyn FnOnce()>> {
@@ -572,27 +536,21 @@ fn install_snapshot(
 ///
 /// The producer is `FnMut` rather than `FnOnce` so that running it does not
 /// also destroy it: it captures an `Arc<ScopeCell>` whose release belongs
-/// after the gate is unlocked, like every other user-bearing drop. Its
-/// argument collects deduplicated retained-exit guards for structural
-/// surrender by the installing transaction. The transaction hands the whole
-/// spent publication to its effect list after each attempted install,
-/// including one that trips an invariant.
-type SnapshotProducer = dyn FnMut(&mut Vec<Retained<Exit>>) -> Option<RetainedScopeSnapshot>;
+/// after the gate is unlocked, like every other user-bearing drop. The
+/// transaction hands the whole spent publication to its effect list after
+/// each attempted install, including one that trips an invariant.
+type SnapshotProducer = dyn FnMut() -> Option<Guarded<Arc<ScopeSnapshot>>>;
 
 pub(crate) struct SnapshotProjection(Box<SnapshotProducer>);
 
 impl SnapshotProjection {
-    fn new(
-        build: impl FnOnce(&mut Vec<Retained<Exit>>) -> RetainedScopeSnapshot + 'static,
-    ) -> Self {
+    fn new(build: impl FnOnce() -> Guarded<Arc<ScopeSnapshot>> + 'static) -> Self {
         let mut build = Some(build);
-        Self(Box::new(move |surrendered| {
-            build.take().map(|build| build(surrendered))
-        }))
+        Self(Box::new(move || build.take().map(|build| build())))
     }
 
-    fn build(&mut self, surrendered: &mut Vec<Retained<Exit>>) -> RetainedScopeSnapshot {
-        (self.0)(surrendered).expect("a staged projection is built exactly once")
+    fn build(&mut self) -> Guarded<Arc<ScopeSnapshot>> {
+        (self.0)().expect("a staged projection is built exactly once")
     }
 }
 
@@ -661,10 +619,8 @@ impl SnapshotPublication {
     pub(crate) fn install(&mut self, txn: &mut ObservationTxn<'_>) {
         // A hub closed by an earlier transaction keeps the authoritative
         // terminal projection `close` installed; this cut is never built.
-        let mut surrendered = Vec::new();
-        let snapshot = (!self.sender.read_with(|state| state.closed))
-            .then(|| self.projection.build(&mut surrendered));
-        txn.surrender(surrendered);
+        let snapshot =
+            (!self.sender.read_with(|state| state.closed)).then(|| self.projection.build());
         for effect in install_snapshot(
             &self.sender,
             snapshot,
@@ -694,7 +650,7 @@ impl SnapshotHub {
     /// property of every caller rather than a convention.
     pub(crate) fn subscribe(
         &self,
-        initial: RetainedScopeSnapshot,
+        initial: Guarded<Arc<ScopeSnapshot>>,
         txn: &mut ObservationTxn<'_>,
     ) -> SnapshotReceiver {
         let mut initial = Some(initial);
@@ -744,7 +700,7 @@ impl SnapshotHub {
     pub(crate) fn publish(
         &self,
         txn: &mut ObservationTxn<'_>,
-        snapshot: impl FnOnce(&mut Vec<Retained<Exit>>) -> RetainedScopeSnapshot + 'static,
+        snapshot: impl FnOnce() -> Guarded<Arc<ScopeSnapshot>> + 'static,
     ) {
         let Some(sender) = self.sender.get() else {
             return;
@@ -770,24 +726,20 @@ impl SnapshotHub {
     pub(crate) fn close(
         &self,
         txn: &mut ObservationTxn<'_>,
-        final_snapshot: impl FnOnce(&mut Vec<Retained<Exit>>) -> RetainedScopeSnapshot + 'static,
+        final_snapshot: impl FnOnce() -> Guarded<Arc<ScopeSnapshot>> + 'static,
     ) {
         let mut final_snapshot = Some(final_snapshot);
         let mut initialized = false;
-        let mut surrendered = Vec::new();
         let sender = self.sender.get_or_init(|| {
             initialized = true;
             runtime::watch(SnapshotHubState::new(
                 final_snapshot
                     .take()
-                    .expect("final snapshot is built exactly once")(
-                    &mut surrendered
-                ),
+                    .expect("final snapshot is built exactly once")(),
                 true,
             ))
             .0
         });
-        txn.surrender(surrendered);
         if initialized {
             return;
         }
@@ -805,10 +757,10 @@ impl SnapshotHub {
         // this final one.
         txn.stage_snapshot(SnapshotPublication::closed(
             sender.clone(),
-            SnapshotProjection::new(move |surrendered| {
+            SnapshotProjection::new(move || {
                 final_snapshot
                     .take()
-                    .expect("final snapshot is built exactly once")(surrendered)
+                    .expect("final snapshot is built exactly once")()
             }),
         ));
     }
@@ -1047,10 +999,62 @@ mod tests {
     };
     use shelterwood_core::{ScopeState, StopReason};
 
-    use super::{LifecycleHub, LifecycleSeq, ObservationTxn, RetainedScopeSnapshot, SnapshotHub};
+    use super::{Guarded, LifecycleHub, LifecycleSeq, ObservationTxn, SnapshotHub};
 
-    fn snapshot(state: ScopeState) -> RetainedScopeSnapshot {
-        RetainedScopeSnapshot::new(
+    fn snapshot(state: ScopeState) -> Guarded<Arc<ScopeSnapshot>> {
+        Guarded::new(Arc::new(ScopeSnapshot {
+            state,
+            kind: ScopeFlavor::Dynamic,
+            strategy: None,
+            intensity: Intensity::default(),
+            total_restarts: TotalRestarts::ZERO,
+            lifecycle_seq: LifecycleSeq::new(0),
+            children: Arc::from([]),
+        }))
+    }
+
+    /// A guarded cut derives its guards by walking the public projection, so
+    /// every exit-bearing position must be reached: scope state, a child's
+    /// terminal state and last exit, and a nested scope's cut.
+    #[test]
+    fn a_guarded_snapshot_isolates_every_exit_it_projects() {
+        use shelterwood_core::{
+            RestartCount, RestartPolicy, Retention, StartupFailure, StartupFailureCause,
+            engine::MembershipStatus,
+        };
+
+        use super::{ChildSnapshot, ChildState};
+        use crate::cells::test_support::ThreadProbe;
+
+        let retiring_thread = std::thread::current().id();
+        let mut identity = ScopeIdentity::new();
+        let mut probes = Vec::new();
+        let mut failed = || {
+            let (dropped, observed) = mpsc::sync_channel(1);
+            probes.push(observed);
+            Exit::failed(
+                ExitError::from(ThreadProbe(dropped)),
+                Cancellation::NotObserved,
+            )
+        };
+        let membership = identity
+            .mint_membership(&ChildId::from("trigger"))
+            .membership();
+        let mut child = |id: &str, state: ChildState, last_exit, nested| ChildSnapshot {
+            id: ChildId::from(id),
+            membership: identity.mint_membership(&ChildId::from(id)).membership(),
+            incarnation: None,
+            state,
+            last_exit,
+            membership_status: MembershipStatus::Active,
+            restart_count: RestartCount::ZERO,
+            restart_policy: RestartPolicy::default(),
+            retention: Retention::Retain,
+            restart_at: None,
+            nested,
+            scope_seq: None,
+        };
+        let cut = |state: ScopeState, children: Vec<ChildSnapshot>| {
             Arc::new(ScopeSnapshot {
                 state,
                 kind: ScopeFlavor::Dynamic,
@@ -1058,10 +1062,54 @@ mod tests {
                 intensity: Intensity::default(),
                 total_restarts: TotalRestarts::ZERO,
                 lifecycle_seq: LifecycleSeq::new(0),
-                children: Arc::from([]),
-            }),
-            Vec::new(),
-        )
+                children: children.into(),
+            })
+        };
+        let aborted = failed();
+        let nested = cut(
+            ScopeState::Running,
+            vec![child(
+                "inner",
+                ChildState::StartupAborted { exit: aborted },
+                None,
+                None,
+            )],
+        );
+        let stopped = failed();
+        let last = failed();
+        let startup = failed();
+        let root = cut(
+            ScopeState::Stopped {
+                reason: StopReason::StartupFailed(StartupFailure {
+                    cause: StartupFailureCause::Child {
+                        id: ChildId::from("trigger"),
+                        membership,
+                        exit: startup,
+                    },
+                }),
+            },
+            vec![
+                child(
+                    "leaf",
+                    ChildState::Stopped { exit: stopped },
+                    Some(last),
+                    None,
+                ),
+                child("scope", ChildState::Running, None, Some(nested)),
+            ],
+        );
+
+        drop(Guarded::new(root));
+
+        for observed in probes {
+            assert_ne!(
+                observed
+                    .recv_timeout(TEST_WAIT)
+                    .expect("every projected failure is disposed"),
+                retiring_thread,
+                "a guarded snapshot must isolate every exit it projects"
+            );
+        }
     }
 
     struct DropSignal(mpsc::SyncSender<()>);
@@ -1090,7 +1138,7 @@ mod tests {
     fn snapshot_projection_is_skipped_without_subscribers() {
         let hub = SnapshotHub::default();
         let mut txn = ObservationTxn::detached();
-        hub.publish(&mut txn, |_| {
+        hub.publish(&mut txn, || {
             panic!("projection must be lazy when no receiver exists")
         });
     }
@@ -1126,7 +1174,7 @@ mod tests {
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
                 let mut txn = ObservationTxn::detached();
-                hub.publish(&mut txn, |_| snapshot(ScopeState::Running));
+                hub.publish(&mut txn, || snapshot(ScopeState::Running));
                 mid_txn = Some(receiver.borrow_latest().state.clone());
                 panic!("inject transaction unwind");
             }))
@@ -1154,8 +1202,8 @@ mod tests {
             let effects = Arc::clone(&effects);
             move || {
                 let mut txn = ObservationTxn::detached();
-                failing.publish(&mut txn, |_| panic!("injected snapshot installation panic"));
-                succeeding.publish(&mut txn, |_| snapshot(ScopeState::Running));
+                failing.publish(&mut txn, || panic!("injected snapshot installation panic"));
+                succeeding.publish(&mut txn, || snapshot(ScopeState::Running));
                 txn.defer(move || {
                     effects.fetch_add(1, Ordering::SeqCst);
                 });
@@ -1193,7 +1241,7 @@ mod tests {
             ScopeState::Draining,
         ] {
             let builds = Arc::clone(&builds);
-            hub.publish(&mut txn, move |_| {
+            hub.publish(&mut txn, move || {
                 builds.fetch_add(1, Ordering::Relaxed);
                 snapshot(state)
             });
@@ -1222,7 +1270,7 @@ mod tests {
         drop(txn);
 
         let mut txn = ObservationTxn::detached();
-        hub.close(&mut txn, |_| {
+        hub.close(&mut txn, || {
             snapshot(ScopeState::Stopped {
                 reason: StopReason::Finished,
             })
@@ -1232,7 +1280,7 @@ mod tests {
             "the close is still staged, so the publication below is declined \
              by the transaction rather than by an installed terminal state"
         );
-        hub.publish(&mut txn, |_| {
+        hub.publish(&mut txn, || {
             panic!("publication after a staged close must remain lazy")
         });
         drop(txn);
@@ -1259,7 +1307,7 @@ mod tests {
         drop(txn);
 
         let mut txn = ObservationTxn::detached();
-        hub.publish(&mut txn, |_| snapshot(ScopeState::Running));
+        hub.publish(&mut txn, || snapshot(ScopeState::Running));
         drop(txn);
 
         assert_eq!(
@@ -1272,12 +1320,12 @@ mod tests {
         );
 
         let mut txn = ObservationTxn::detached();
-        hub.publish(&mut txn, |_| {
+        hub.publish(&mut txn, || {
             snapshot(ScopeState::Stopped {
                 reason: StopReason::Finished,
             })
         });
-        hub.close(&mut txn, |_| {
+        hub.close(&mut txn, || {
             snapshot(ScopeState::Stopped {
                 reason: StopReason::Finished,
             })
@@ -1296,7 +1344,7 @@ mod tests {
         ));
         assert!(snapshots.changed().await.is_err());
         let mut txn = ObservationTxn::detached();
-        hub.publish(&mut txn, |_| {
+        hub.publish(&mut txn, || {
             panic!("publication after close must remain lazy")
         });
         drop(txn);
@@ -1322,7 +1370,7 @@ mod tests {
     async fn receiverless_snapshot_close_installs_the_terminal_state() {
         let hub = SnapshotHub::default();
         let mut txn = ObservationTxn::detached();
-        hub.close(&mut txn, |_| {
+        hub.close(&mut txn, || {
             snapshot(ScopeState::Stopped {
                 reason: StopReason::NeverStarted,
             })
@@ -1350,7 +1398,7 @@ mod tests {
         drop(receiver);
 
         let mut txn = ObservationTxn::detached();
-        hub.close(&mut txn, |_| {
+        hub.close(&mut txn, || {
             snapshot(ScopeState::Stopped {
                 reason: StopReason::Finished,
             })
@@ -1381,7 +1429,7 @@ mod tests {
         drop(txn);
 
         let mut txn = ObservationTxn::detached();
-        hub.close(&mut txn, |_| {
+        hub.close(&mut txn, || {
             snapshot(ScopeState::Stopped {
                 reason: StopReason::Finished,
             })

@@ -300,7 +300,7 @@ async fn on_failure_restart_deadline_ahead_of_a_window_stop_constructs_nothing()
         "the due restart constructs no incarnation for a stopped window"
     );
     assert!(scope.children[key].restart_deadline.is_none());
-    let MemberStage::Terminal(exit) = scope.children[key].slot.member.record().stage else {
+    let MemberStage::Terminal(exit) = scope.children[key].slot.member.record().stage.clone() else {
         panic!("the construction site terminalizes the window member")
     };
     assert!(matches!(exit.kind(), ExitKind::Failed(_)));
@@ -621,7 +621,7 @@ async fn pre_spawn_stop_on_an_ordered_child_resolves_at_its_turn_without_constru
             reason: StopReason::NeverStarted
         }
     );
-    let Some(Err(StartupError::StartupFailed(failure))) = root.record().startup else {
+    let Some(Err(StartupError::StartupFailed(failure))) = root.record().startup.clone() else {
         panic!("the never-started initial member fails the scope's startup")
     };
     assert!(matches!(

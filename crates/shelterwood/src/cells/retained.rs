@@ -45,9 +45,10 @@ impl CarriesUserError for ExitResult {
 /// disposal, regardless of its current strong count: a count probe would race
 /// every other owner and could still leave one framework thread running the
 /// last user destructor inline. Taking the value back out is the only way to
-/// give it ordinary drop timing, and each value type names its own exit:
-/// `Retained<Exit>::into_user_owned` is deliberately narrower than the
-/// others.
+/// give it ordinary drop timing, and each value type names its own exit. A
+/// raw [`Exit`] leaves only through [`Guarded::into_user_owned`], so no
+/// driver-layer caller can extract one and a carrier crossing a driver seam
+/// stays a carrier.
 pub(crate) struct Retained<T: CarriesUserError>(Option<T>);
 
 impl<T: CarriesUserError> Retained<T> {
@@ -127,82 +128,201 @@ impl Retained<ExitResult> {
 impl Retained<Exit> {
     /// Hands the raw exit to a public/user-owned value.
     ///
+    /// Private to this module: its one caller is [`Guarded::into_user_owned`].
     /// Framework-internal copies must instead go through
     /// [`ObservationTxn::surrender`], which makes their pre-commit co-owner
     /// proof structural and releases them only after the observation gate.
-    /// `pub(in crate::cells)` is what keeps that structural: no driver-layer
-    /// caller can reach the raw exit at all, so a framework carrier crossing
-    /// a driver seam has to stay a carrier.
-    pub(super) fn into_user_owned(self) -> Exit {
+    fn into_user_owned(self) -> Exit {
         self.take()
     }
+}
 
-    pub(crate) fn retain_scope_state(exits: &mut Vec<Self>, state: &ScopeState) {
-        if let ScopeState::Stopped { reason } = state {
-            Self::retain_stop_reason(exits, reason);
+/// A framework value whose user errors a guard set can enumerate.
+///
+/// `retain_guards` adds a retained copy of every [`Exit`] the value owns,
+/// deduplicated by exit identity, so a [`Guarded`] value's guards are always
+/// a function of the value itself.
+pub(crate) trait RetainGuards {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>);
+}
+
+impl RetainGuards for Exit {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>) {
+        if !guards.iter().any(|retained| retained == self) {
+            guards.push(Retained::new(self.clone()));
+        }
+    }
+}
+
+impl<T: RetainGuards> RetainGuards for Option<T> {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>) {
+        if let Some(value) = self {
+            value.retain_guards(guards);
+        }
+    }
+}
+
+impl<T: RetainGuards> RetainGuards for Arc<T> {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>) {
+        T::retain_guards(self, guards);
+    }
+}
+
+impl RetainGuards for StartupFailure {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>) {
+        if let StartupFailureCause::Child { exit, .. } = &self.cause {
+            exit.retain_guards(guards);
+        }
+    }
+}
+
+impl RetainGuards for StopReason {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>) {
+        if let Self::StartupFailed(failure) = self {
+            failure.retain_guards(guards);
+        }
+    }
+}
+
+impl RetainGuards for ScopeState {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>) {
+        if let Self::Stopped { reason } = self {
+            reason.retain_guards(guards);
+        }
+    }
+}
+
+impl RetainGuards for Result<(), StartupError> {
+    fn retain_guards(&self, guards: &mut Vec<Retained<Exit>>) {
+        if let Err(StartupError::StartupFailed(failure)) = self {
+            failure.retain_guards(guards);
+        }
+    }
+}
+
+/// A raw framework value plus retained copies of every exit it owns.
+///
+/// Field order is the carrier's whole argument: drop glue releases the raw
+/// value while the guards still prove that none of its user errors can be
+/// destroyed inline, and only then do the guards transfer each failed payload
+/// to critical disposal. Clones share one guard allocation, so reading a
+/// guarded record is refcount traffic rather than one disposal job per exit.
+#[derive(Clone)]
+pub(crate) struct Guarded<T> {
+    value: T,
+    guards: Arc<Vec<Retained<Exit>>>,
+}
+
+impl<T: RetainGuards> Guarded<T> {
+    pub(crate) fn new(value: T) -> Self {
+        let mut guards = Vec::new();
+        value.retain_guards(&mut guards);
+        Self {
+            value,
+            guards: Arc::new(guards),
         }
     }
 
-    pub(crate) fn retain_startup_result(exits: &mut Vec<Self>, startup: &Result<(), StartupError>) {
-        if let Err(StartupError::StartupFailed(failure)) = startup {
-            Self::retain_startup_failure(exits, failure);
-        }
-    }
-
-    pub(crate) fn retain_stop_reason(exits: &mut Vec<Self>, reason: &StopReason) {
-        if let StopReason::StartupFailed(failure) = reason {
-            Self::retain_startup_failure(exits, failure);
-        }
-    }
-
-    fn retain_startup_failure(exits: &mut Vec<Self>, failure: &StartupFailure) {
-        if let StartupFailureCause::Child { exit, .. } = &failure.cause {
-            Self::retain_exit(exits, exit);
-        }
-    }
-
-    pub(crate) fn retain_exit(exits: &mut Vec<Self>, exit: &Exit) {
-        if !exits.iter().any(|retained| retained == exit) {
-            exits.push(Self::new(exit.clone()));
-        }
-    }
-
-    pub(crate) fn retain_owned(exits: &mut Vec<Self>, exit: Self, surrendered: &mut Vec<Self>) {
-        if exits.iter().any(|retained| retained == &exit) {
-            // An existing retained copy keeps the raw clone alive while it is
-            // released. Hand the duplicate to the surrounding observation
-            // transaction rather than submitting a duplicate disposal job.
-            surrendered.push(exit);
-        } else {
-            exits.push(exit);
-        }
-    }
-
-    /// Installs a freshly computed guard set into a shared record slot.
+    /// Mutates the value in place and re-derives its guards.
     ///
-    /// Records that hand out clones keep their guards behind one `Arc` so a
-    /// read costs refcount traffic rather than one disposal job per exit. An
-    /// unchanged guard set is therefore kept in place: the probe copies are
-    /// surrendered, because an equal retained copy — for
-    /// `ExitKind::Failed`, equality is `Arc::ptr_eq` — proves the payload
-    /// stays owned. A changed set displaces the old allocation, which may be
-    /// the last owner of a user error the record no longer holds, so its
-    /// retirement leaves with the transaction's post-unlock effects.
-    pub(super) fn install(
-        guards: &mut Arc<Vec<Self>>,
-        incoming: Vec<Self>,
+    /// The mutation runs while the previous guard set still covers every raw
+    /// value it overwrites, so those inline drops are refcount work. An
+    /// unchanged guard set stays in place and the fresh probe copies are
+    /// surrendered, because an equal retained copy — for `ExitKind::Failed`,
+    /// equality is `Arc::ptr_eq` — proves the payload stays owned. A changed
+    /// set displaces the old allocation, which may be the last owner of a user
+    /// error the value no longer holds, so it retires with the transaction's
+    /// post-unlock effects.
+    pub(super) fn update<R>(
+        &mut self,
         txn: &mut ObservationTxn<'_>,
-    ) {
-        if incoming.len() == guards.len()
+        update: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        let result = update(&mut self.value);
+        let mut incoming = Vec::new();
+        self.value.retain_guards(&mut incoming);
+        if incoming.len() == self.guards.len()
             && incoming
                 .iter()
-                .all(|incoming| guards.iter().any(|current| current == incoming))
+                .all(|incoming| self.guards.iter().any(|current| current == incoming))
         {
             txn.surrender(incoming);
-            return;
+        } else {
+            let displaced = std::mem::replace(&mut self.guards, Arc::new(incoming));
+            txn.defer(move || drop(displaced));
         }
-        let displaced = std::mem::replace(guards, Arc::new(incoming));
-        txn.defer(move || drop(displaced));
+        result
+    }
+}
+
+impl<T> Guarded<T> {
+    pub(crate) fn get(&self) -> &T {
+        &self.value
+    }
+
+    /// Hands the raw value to an owner that keeps it past `txn`'s commit.
+    ///
+    /// Returning the value out of the gate closure, or storing it in state
+    /// the gate protects, keeps a raw co-owner of every guarded exit alive
+    /// while the transaction surrenders the guards.
+    pub(super) fn release(self, txn: &mut ObservationTxn<'_>) -> T {
+        let Self { value, guards } = self;
+        txn.surrender(Arc::unwrap_or_clone(guards));
+        value
+    }
+
+    /// Hands the raw value to a user-owned destination outside any lock.
+    ///
+    /// The value owns a raw clone corresponding to every guard, so retiring
+    /// the guards inline is provably refcount-only. Unwrapping the allocation
+    /// first matters: the caller is often its last owner, and letting the
+    /// `Arc` drop the guards would route a live user error through critical
+    /// disposal for nothing.
+    pub(super) fn into_user_owned(self) -> T {
+        let Self { value, guards } = self;
+        for guard in Arc::unwrap_or_clone(guards) {
+            drop(guard.into_user_owned());
+        }
+        value
+    }
+
+    #[cfg(test)]
+    pub(crate) fn guard_count(&self) -> usize {
+        self.guards.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_guards_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.guards, &other.guards)
+    }
+}
+
+impl<T> std::ops::Deref for Guarded<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for Guarded<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.value.fmt(formatter)
+    }
+}
+
+// The guards are a function of the value, so the value decides equality.
+impl<T: PartialEq> PartialEq for Guarded<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl<T: Eq> Eq for Guarded<T> {}
+
+impl<T: RetainGuards> From<T> for Guarded<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
     }
 }
 
@@ -259,45 +379,6 @@ pub(crate) fn classify_exit_retaining(
     exit
 }
 
-/// A stop reason retained by driver state or a runtime completion.
-///
-/// Structured startup reasons recursively contain the triggering child's
-/// `Exit`. Keeping the public reason before its guards gives the same
-/// raw-projection-first retirement order as `RetainedScopeSnapshot`.
-#[derive(Clone, Debug)]
-pub(crate) struct RetainedStopReason {
-    reason: Option<StopReason>,
-    retained_exits: Vec<Retained<Exit>>,
-}
-
-impl RetainedStopReason {
-    pub(crate) fn new(reason: StopReason) -> Self {
-        let mut retained_exits = Vec::new();
-        Retained::retain_stop_reason(&mut retained_exits, &reason);
-        Self {
-            reason: Some(reason),
-            retained_exits,
-        }
-    }
-
-    pub(crate) fn as_reason(&self) -> &StopReason {
-        self.reason
-            .as_ref()
-            .expect("retained stop reason was already taken")
-    }
-
-    pub(crate) fn into_public(mut self) -> StopReason {
-        let reason = self
-            .reason
-            .take()
-            .expect("retained stop reason was already taken");
-        for exit in std::mem::take(&mut self.retained_exits) {
-            drop(exit.into_user_owned());
-        }
-        reason
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{sync::mpsc, time::Duration};
@@ -311,22 +392,22 @@ mod tests {
     };
 
     #[test]
-    fn retained_exit_install_keeps_an_equal_shared_guard_set_in_place() {
+    fn guarded_update_keeps_an_equal_shared_guard_set_in_place() {
         let retiring_thread = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
         let exit = Exit::failed(
             ExitError::from(ThreadProbe(dropped)),
             Cancellation::NotObserved,
         );
-        let mut guards = Arc::new(vec![Retained::new(exit.clone())]);
-        let original = Arc::clone(&guards);
+        let mut guarded = Guarded::new(Some(exit.clone()));
+        let original = guarded.clone();
 
         let mut txn = ObservationTxn::detached();
-        Retained::install(&mut guards, vec![Retained::new(exit.clone())], &mut txn);
+        guarded.update(&mut txn, |value| *value = Some(exit.clone()));
         drop(txn);
 
         assert!(
-            Arc::ptr_eq(&guards, &original),
+            guarded.shares_guards_with(&original),
             "an unchanged guard set keeps its shared allocation"
         );
         assert_eq!(
@@ -336,7 +417,7 @@ mod tests {
         );
         drop(exit);
         drop(original);
-        drop(guards);
+        drop(guarded);
         assert_ne!(
             observed
                 .recv_timeout(TEST_WAIT)
@@ -346,24 +427,25 @@ mod tests {
     }
 
     #[test]
-    fn retained_exit_install_retires_a_changed_last_owned_set_after_commit() {
+    fn guarded_update_retires_a_changed_last_owned_set_after_commit() {
         let retiring_thread = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
-        let mut guards = Arc::new(vec![Retained::new(Exit::failed(
+        let mut guarded = Guarded::new(Some(Exit::failed(
             ExitError::from(ThreadProbe(dropped)),
             Cancellation::NotObserved,
-        ))]);
-        let original = Arc::downgrade(&guards);
+        )));
+        let original = Arc::downgrade(&guarded.guards);
 
         let mut txn = ObservationTxn::detached();
-        Retained::install(
-            &mut guards,
-            vec![Retained::new(Exit::completed(Cancellation::NotObserved))],
-            &mut txn,
-        );
-        assert!(matches!(guards[0].get().kind(), ExitKind::Completed));
+        guarded.update(&mut txn, |value| {
+            *value = Some(Exit::completed(Cancellation::NotObserved));
+        });
+        assert!(matches!(
+            guarded.guards[0].get().kind(),
+            ExitKind::Completed
+        ));
         // P3 #14: the displaced set may own the last copy of a user error the
-        // record no longer holds, so it leaves with the transaction's
+        // value no longer holds, so it leaves with the transaction's
         // post-unlock effects rather than inside the critical section.
         assert!(
             original.upgrade().is_some(),
@@ -495,13 +577,13 @@ mod tests {
     }
 
     #[test]
-    fn retained_stop_reason_isolates_its_nested_exit() {
+    fn guarded_stop_reason_isolates_its_nested_exit() {
         let retiring_thread = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
         let id = ChildId::from("worker");
         let mut identity = ScopeIdentity::new();
         let member = MemberCell::new(identity.mint_membership(&id));
-        let retained = RetainedStopReason::new(StopReason::StartupFailed(StartupFailure {
+        let retained = Guarded::new(StopReason::StartupFailed(StartupFailure {
             cause: StartupFailureCause::Child {
                 id,
                 membership: member.membership(),

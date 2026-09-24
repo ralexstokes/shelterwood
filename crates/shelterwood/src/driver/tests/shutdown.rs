@@ -34,7 +34,7 @@ async fn runtime_teardown_finishes_the_cancelled_root_driver() {
     assert!(matches!(
         monitored,
         crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok { ref value })
-            if value.as_reason() == &StopReason::ShutdownRequested
+            if value.get() == &StopReason::ShutdownRequested
     ));
     assert!(
         wakes.load(Ordering::SeqCst) > 0,
@@ -130,7 +130,7 @@ async fn runtime_teardown_keeps_the_exit_published_ahead_of_factory_disposal() {
         driver,
         crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Cancelled)
     ));
-    let MemberStage::Terminal(recorded) = published.stage else {
+    let MemberStage::Terminal(recorded) = published.stage.clone() else {
         panic!("the exit must publish before the factory's destruction completes")
     };
     let crate::runtime::Timeout::Completed(terminal) = before_teardown else {
@@ -139,7 +139,7 @@ async fn runtime_teardown_keeps_the_exit_published_ahead_of_factory_disposal() {
     let crate::runtime::Timeout::Completed(lifecycle) = lifecycle else {
         panic!("the published exit's lifecycle event was not observed")
     };
-    let MemberStage::Terminal(kept) = after_teardown.stage else {
+    let MemberStage::Terminal(kept) = after_teardown.stage.clone() else {
         panic!("driver teardown must keep the membership terminal")
     };
     for exit in [&terminal, &lifecycle, &recorded, &kept] {

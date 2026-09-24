@@ -26,8 +26,8 @@ use shelterwood_core::{
 use crate::cells::observe::{LifecycleEventKind, LifecycleHub, SnapshotHub};
 
 use super::{
-    MemberCell, MemberRecord, MemberStage, MemberTransition, ObservationGate, ObservationTxn,
-    Retained, RetainedStopReason, StartupDisposition,
+    Guarded, MemberCell, MemberRecord, MemberStage, MemberTransition, ObservationGate,
+    ObservationTxn, Retained, StartupDisposition,
 };
 
 /// Crate-private close-admission hook retained by a restart-stable scope cell.
@@ -255,7 +255,7 @@ pub(crate) enum ScopeControlEvent {
 /// member-record watch is intentionally also the driver's wake bus.
 struct ScopeObservation {
     config: Mutex<ObservationConfig>,
-    record: runtime::WatchSender<ScopeRecord>,
+    record: runtime::WatchSender<Guarded<ScopeRecord>>,
     // Removal paths move residents into transaction effects before emitting
     // their `Removed` edges. A projection can be the last member/mailbox
     // owner, so neither this mutex nor the observation gate may retire one.
@@ -350,12 +350,11 @@ impl ScopeCell {
         flavor: ScopeFlavor,
         child_identity: ScopeIdentity,
     ) -> Arc<Self> {
-        let (record, _) = runtime::watch(ScopeRecord {
+        let (record, _) = runtime::watch(Guarded::new(ScopeRecord {
             state: ScopeState::Unstarted,
             startup: None,
             total_restarts: TotalRestarts::ZERO,
-            retained_exits: Arc::new(Vec::new()),
-        });
+        }));
         Arc::new_cyclic(|me| Self {
             member,
             flavor,
@@ -712,6 +711,7 @@ impl ScopeCell {
             !matches!(state, ScopeState::Stopped { .. }),
             "terminal scope state is published through publish_stopped_locked"
         );
+        let startup = Guarded::new(startup);
         self.with_observation_gate(|txn| {
             self.set_startup_locked(startup, txn);
             self.set_state_locked(state, &[], txn);
@@ -732,17 +732,12 @@ impl ScopeCell {
         terminal_disposals: &[Arc<MemberCell>],
     ) {
         assert!(matches!(state, ScopeState::Draining));
-        // Keep the failed startup's user error owned across the foreign-gate
-        // diagnostic below. The raw startup local is declared after these
-        // guards so unwind releases it first; the guard then transfers final
-        // destruction to critical disposal rather than running it on this
-        // driver thread.
-        let mut retained_startup = Vec::new();
-        if let Some(startup) = &startup {
-            Retained::retain_startup_result(&mut retained_startup, startup);
-        }
+        // Keep the failed startup's user error guarded across the foreign-gate
+        // diagnostic below: if it fires, the carrier's drop glue transfers
+        // final destruction to critical disposal rather than running it on
+        // this driver thread.
+        let mut startup = startup.map(Guarded::new);
         let mut state = Some(state);
-        let mut startup = startup;
         let published = self.with_observation_gate(|txn| {
             if !terminal_disposals.iter().all(|member| {
                 self.current_observation_gate()
@@ -750,12 +745,8 @@ impl ScopeCell {
             }) {
                 return false;
             }
-            if let Some(startup) = startup.take()
-                && self.set_startup_locked(startup, txn)
-            {
-                // The record now owns the diagnostic guards' raw peer.
-                // Queue their surrender before this transaction commits.
-                txn.surrender(std::mem::take(&mut retained_startup));
+            if let Some(startup) = startup.take() {
+                self.set_startup_locked(startup, txn);
             }
             self.set_state_locked(
                 state
@@ -770,12 +761,6 @@ impl ScopeCell {
             published,
             "a drain entry may mark only a resident member on its observation gate"
         );
-        // Empty once the transaction surrendered them above. Otherwise a
-        // record that already held a startup result rejected this one, and the
-        // rejected raw result retired through the transaction's own guards —
-        // into isolated disposal, which is still running. These guards
-        // therefore retire through critical disposal too.
-        drop(retained_startup);
     }
 
     fn set_state_locked(
@@ -801,8 +786,7 @@ impl ScopeCell {
             route.close_admission(txn);
         }
         self.observation.record.modify_silently(|record| {
-            record.state = state.clone();
-            record.refresh_retained_exits(txn);
+            record.update(txn, |record| record.state = state.clone());
         });
         txn.pulse(&self.observation.record);
         txn.pulse(&self.member.record);
@@ -926,7 +910,7 @@ impl ScopeCell {
             // effect runs before any queued owner can enter disposal.
             wakes.surrender([exit_guard]);
             self.observation.record.modify_silently(|scope| {
-                scope.total_restarts = total_restarts;
+                scope.update(wakes, |scope| scope.total_restarts = total_restarts);
             });
             wakes.pulse(&self.observation.record);
             self.emit_locked(wakes, exited);
@@ -1076,46 +1060,33 @@ impl ScopeCell {
     }
 
     pub(crate) fn set_startup(&self, startup: Result<(), StartupError>) {
+        let startup = Guarded::new(startup);
         self.with_observation_gate(|txn| self.set_startup_locked(startup, txn));
     }
 
     /// Installs the startup result unless one is already recorded.
-    ///
-    /// Returns whether this call installed it. A caller holding its own
-    /// transient guards needs that verdict: only an installed result leaves an
-    /// equivalent retained copy in the record, which is what makes surrendering
-    /// those guards raw refcount traffic rather than a race with the isolated
-    /// disposal a rejected result starts here.
     fn set_startup_locked(
         &self,
-        startup: Result<(), StartupError>,
+        startup: Guarded<Result<(), StartupError>>,
         txn: &mut ObservationTxn<'_>,
-    ) -> bool {
-        let mut retained = Vec::new();
-        Retained::retain_startup_result(&mut retained, &startup);
-        let mut incoming = Some((startup, retained));
-        let mut published = false;
+    ) {
+        let mut rejected = None;
         self.observation.record.modify_silently(|record| {
-            if record.startup.is_none() {
-                let (startup, retained) = incoming
-                    .take()
-                    .expect("startup result is installed at most once");
-                record.startup = Some(startup);
-                record.refresh_retained_exits(txn);
-                // The record now owns an equivalent retained copy.
-                txn.surrender(retained);
-                published = true;
+            if record.startup.is_some() {
+                rejected = Some(startup);
+                return;
             }
+            // The record keeps the raw result, a co-owner of every exit the
+            // incoming guards cover, so those guards surrender.
+            let startup = startup.release(txn);
+            record.update(txn, |record| record.startup = Some(startup));
         });
-        // Tuple field order is intentional: a rejected raw startup result is
-        // released while its retained guards still exist, then those guards
-        // transfer failed destruction to isolated disposal.
-        txn.defer(move || drop(incoming));
-        if published {
+        if let Some(rejected) = rejected {
+            txn.defer(move || drop(rejected));
+        } else {
             txn.pulse(&self.member.record);
             txn.pulse(&self.observation.record);
         }
-        published
     }
 
     #[cfg(test)]
@@ -1153,10 +1124,11 @@ impl ScopeCell {
             // plus a settled projection as final without stranding a scope
             // that still owns a live incarnation.
             self.observation.record.modify_silently(|record| {
-                record.total_restarts = TotalRestarts::ZERO;
-                record.startup = None;
-                record.state = state.clone();
-                record.refresh_retained_exits(wakes);
+                record.update(wakes, |record| {
+                    record.total_restarts = TotalRestarts::ZERO;
+                    record.startup = None;
+                    record.state = state.clone();
+                });
             });
             // Hold epoch ownership through its observation projection. A
             // stale finish and a newer begin can no longer cross these two
@@ -1186,7 +1158,7 @@ impl ScopeCell {
     pub(crate) fn finish_incarnation(&self, epoch: Epoch, reason: StopReason) {
         self.finish_incarnation_with_terminal(
             epoch,
-            RetainedStopReason::new(reason),
+            Guarded::new(reason),
             None,
             ControlPoison::Reject,
         );
@@ -1197,7 +1169,7 @@ impl ScopeCell {
     pub(crate) fn finish_incarnation_ignoring_poison(&self, epoch: Epoch, reason: StopReason) {
         self.finish_incarnation_with_terminal(
             epoch,
-            RetainedStopReason::new(reason),
+            Guarded::new(reason),
             None,
             ControlPoison::Ignore,
         );
@@ -1217,7 +1189,7 @@ impl ScopeCell {
         let exit = exit.into();
         self.finish_incarnation_with_terminal(
             epoch,
-            RetainedStopReason::new(reason),
+            Guarded::new(reason),
             Some(exit),
             ControlPoison::Reject,
         );
@@ -1226,7 +1198,7 @@ impl ScopeCell {
     fn finish_incarnation_with_terminal(
         &self,
         epoch: Epoch,
-        reason: RetainedStopReason,
+        reason: Guarded<StopReason>,
         mut terminal_exit: Option<Retained<Exit>>,
         poison: ControlPoison,
     ) {
@@ -1273,7 +1245,7 @@ impl ScopeCell {
                 matches!(self.member.record().stage, MemberStage::Terminal(_));
             self.publish_stopped_locked(
                 wakes,
-                reason.as_reason().clone(),
+                reason.get().clone(),
                 terminal_exit.as_ref().map(|exit| exit.get().clone()),
                 Some(control),
             );
@@ -1284,7 +1256,7 @@ impl ScopeCell {
                 // closes observation only after publishing it.
                 self.close_observation_locked(wakes);
             }
-            drop(reason.into_public());
+            wakes.defer(move || drop(reason));
             if let Some(exit) = terminal_exit.take() {
                 wakes.surrender([exit]);
             }
@@ -1294,7 +1266,7 @@ impl ScopeCell {
     pub(crate) fn finish_live_root_incarnation(&self, reason: StopReason, exit: Exit) {
         // These wrappers precede the control lookup: a poisoned framework
         // mutex must not retire either user-bearing input on this thread.
-        let reason = RetainedStopReason::new(reason);
+        let reason = Guarded::new(reason);
         let exit = Retained::new(exit);
         let epoch = {
             let control = self.control.lock().expect("scope control mutex poisoned");
@@ -1306,12 +1278,12 @@ impl ScopeCell {
             self.with_observation_gate(move |wakes| {
                 self.publish_stopped_locked(
                     wakes,
-                    reason.as_reason().clone(),
+                    reason.get().clone(),
                     Some(exit.get().clone()),
                     None,
                 );
                 self.close_observation_locked(wakes);
-                drop(reason.into_public());
+                wakes.defer(move || drop(reason));
                 wakes.surrender([exit]);
             });
         }
@@ -1756,14 +1728,14 @@ impl ScopeCell {
         self.with_observation_gate(|txn| self.dynamic_route_in(txn))
     }
 
-    pub(crate) fn signal(&self) -> &runtime::WatchSender<MemberRecord> {
+    pub(crate) fn signal(&self) -> &runtime::WatchSender<Guarded<MemberRecord>> {
         &self.member.record
     }
 
     pub(crate) async fn wait_started(&self) -> Result<(), StartupError> {
         let mut watcher = self.observation.record.watcher();
         loop {
-            if let Some(result) = watcher.borrow_and_update_cloned().startup {
+            if let Some(result) = watcher.borrow_and_update_cloned().startup.clone() {
                 return result;
             }
             watcher.changed().await;
@@ -1778,8 +1750,8 @@ impl ScopeCell {
         // not proof that the scope record has already reached `Stopped`.
         let mut watcher = self.observation.record.watcher();
         loop {
-            match watcher.borrow_and_update_cloned().state {
-                ScopeState::Stopped { reason } => return reason,
+            match &watcher.borrow_and_update_cloned().state {
+                ScopeState::Stopped { reason } => return reason.clone(),
                 ScopeState::Unstarted => return StopReason::NeverStarted,
                 ScopeState::Starting
                 | ScopeState::Running
@@ -1833,9 +1805,7 @@ impl ScopeCell {
         epoch_owner: Option<MutexGuard<'_, ScopeControl>>,
     ) {
         let incoming = stop_reason_precedence(&reason);
-        let state = ScopeState::Stopped { reason };
-        let mut transient_retained = Vec::new();
-        Retained::retain_scope_state(&mut transient_retained, &state);
+        let state = Guarded::new(ScopeState::Stopped { reason });
         let mut published = false;
         self.observation.record.modify_silently(|record| {
             if let ScopeState::Stopped { reason: recorded } = &record.state
@@ -1843,11 +1813,12 @@ impl ScopeCell {
             {
                 return;
             }
-            if record.startup.is_none() {
-                record.startup = Some(Err(StartupError::ShutdownRequested));
-            }
-            record.state = state.clone();
-            record.refresh_retained_exits(wakes);
+            record.update(wakes, |record| {
+                if record.startup.is_none() {
+                    record.startup = Some(Err(StartupError::ShutdownRequested));
+                }
+                record.state = state.get().clone();
+            });
             published = true;
         });
         if let Some(exit) = terminal_exit {
@@ -1859,19 +1830,14 @@ impl ScopeCell {
         // `wait_started` must not observe terminal startup until the member
         // and incarnation-control planes are mutually consistent.
         if published {
-            // The record and lifecycle event now retain the raw projection.
-            // Surrender the transient guards without scheduling duplicate
-            // disposal jobs.
-            wakes.surrender(transient_retained);
+            // The record and lifecycle event now retain the raw projection,
+            // so the transient guards surrender rather than scheduling
+            // duplicate disposal jobs.
+            let state = state.release(wakes);
             wakes.pulse(&self.observation.record);
             self.emit_locked(wakes, LifecycleEventKind::ScopeState { state });
         } else {
-            // Release the rejected raw projection before its guards. This is
-            // the same field order used by retained framework state.
-            wakes.defer(move || {
-                drop(state);
-                drop(transient_retained);
-            });
+            wakes.defer(move || drop(state));
         }
     }
 
@@ -2940,7 +2906,7 @@ mod tests {
             checked
                 .send((
                     checking_root.has_resident_child(&checking_member),
-                    checking_member.record().stage,
+                    checking_member.record().stage.clone(),
                 ))
                 .expect("membership observation remains available");
         });

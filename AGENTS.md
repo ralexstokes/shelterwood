@@ -56,41 +56,31 @@ rests on:
 - **`Arc` traffic that cannot reach zero.** Cloning an `Arc` under a lock is
   refcount work; dropping one is only refcount work while another owner is
   provable. Prefer restructuring over the proof — the usual violation is a
-  drop that *looks* like refcount traffic. Resident
-  member records, scope records, lifecycle events, snapshot projections and
-  driver completions protect failed exits through `Retained<Exit>`. Every
-  `Retained<T: CarriesUserError>` drop transfers a value that owns a user
-  error to `runtime::dispose_critical`, whose every path —
-  exhausted thread creation, and a runtime torn down under an accepted
-  submission — keeps the job rather than destroying it inline. Records that
-  hand out clones (`MemberRecord`, `ScopeRecord`) keep their guards behind one
-  shared `Arc` placed after every raw projection, so a read is refcount
-  traffic and only the last clone submits disposal. A write that changes the
-  guard set defers the displaced allocation to the transaction: it can be the
-  last owner of a user error the record no longer holds. Scope state and startup
-  results need that protection too: a structured startup failure recursively
-  owns the triggering child's `Exit`. `Retained<RecordedOutcome>` is the same
-  carrier one step earlier: a *provisional* `RecordedOutcome` owns the same
-  type-erased application error before any verdict is selected, so the child
-  task's report cell and the driver's exit event carry it retained and the
-  losing half of every fold retires through critical disposal. Framework code
-  reaches those folds through `classify_exit_retaining` and
-  `reconcile_recorded_outcomes_retaining`; the raw `shelterwood-core` folds hand
-  both halves back and are for core's own tests.
-  `Retained<Exit>::into_user_owned` is deliberately narrower than surrender, and
-  `pub(in crate::cells)` is what keeps it narrow: no driver-layer caller can
-  extract a raw `Exit` from a carrier at all, so a carrier crossing a driver
-  seam stays a carrier. Its two remaining users are
-  `RetainedLifecycleEvent::into_public`, the one genuine hand-off to a
-  user-owned value, and `RetainedStopReason::into_public`, whose two call
-  sites release a framework copy beside an installed co-owner and therefore
-  rest on that co-owner proof rather than on construction. Every other
-  framework-internal raw refcount drop goes through `ObservationTxn::surrender`.
-  `Retained<ExitResult>` covers the raw incarnation's epilogue: the completed
-  callback result stays in that carrier across the fallible teardown epilogue,
-  so an epilogue panic transfers a failed result to critical disposal instead
-  of destroying its application error during the unwind. The normal path takes
-  the result back before returning it to the driver.
+  drop that *looks* like refcount traffic. Two carriers in
+  `cells/retained.rs` supply the proof for user errors:
+  - `Retained<T: CarriesUserError>` wraps a failed `Exit`, a provisional
+    `RecordedOutcome` or an incarnation's `ExitResult`. Its drop transfers a
+    value that owns a user error to `runtime::dispose_critical`, whose every
+    path — exhausted thread creation, and a runtime torn down under an
+    accepted submission — keeps the job rather than destroying it inline.
+    Framework folds go through `classify_exit_retaining` and
+    `reconcile_recorded_outcomes_retaining`, which retain the losing half;
+    `Retained<ExitResult>` holds a completed callback result across the raw
+    teardown epilogue.
+  - `Guarded<T: RetainGuards>` pairs a raw value with a shared `Arc` of
+    `Retained<Exit>` copies derived from that value: member and scope records,
+    lifecycle event kinds, snapshot cuts, stop reasons and transient startup
+    results. Its field order releases the raw value first, so a read clone is
+    refcount traffic and only the last clone submits disposal. `update`
+    re-derives the guards under the caller's transaction, surrendering an
+    unchanged set and deferring a displaced one, which can be the last owner
+    of a user error the value no longer holds.
+
+  Raw values leave a carrier only inside `crate::cells`: `Guarded::release`
+  surrenders the guards beside a co-owner that outlives the transaction, and
+  `Guarded::into_user_owned` is the one hand-off to a user-owned value, a
+  received lifecycle event. Every other framework-internal raw refcount drop
+  goes through `ObservationTxn::surrender`.
   `ScopeCell::clear_residents_locked`, `prune_child_locked` and
   `admit_child_locked` route `Arc<MemberCell>`s through
   `runtime::dispose_detached` after unlock: the last member owner can also be
@@ -203,8 +193,8 @@ lifecycle events and admission projections. Raw incarnation-owned values —
 async offload futures, continuations, timers and completions — instead
 follow SPEC §6.5's on-task contained funnel, because a destructor panic
 there is cleanup evidence that exit classification must fold in.
-Framework-retained `Exit` copies meet it through `Retained<Exit>`,
-including driver completions and pending terminal disposal; exits handed to
+Framework-retained `Exit` copies meet it through `Retained<Exit>` and
+`Guarded`, including driver completions and pending terminal disposal; exits handed to
 users keep ordinary drop timing. Its fail-safe under exhausted thread
 creation is an unreclaimed queued job — memory held for the life of the
 process, along with whatever the user error owns — which is the accepted

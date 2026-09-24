@@ -132,18 +132,6 @@ impl AdmissionInstall {
         }
     }
 
-    fn request(&self) -> &AdmissionRequest {
-        self.request
-            .as_ref()
-            .expect("an unfinished admission install owns its request")
-    }
-
-    fn request_mut(&mut self) -> &mut AdmissionRequest {
-        self.request
-            .as_mut()
-            .expect("an unfinished admission install owns its request")
-    }
-
     fn projection(&self) -> ResidentProjection {
         self.projection
             .as_ref()
@@ -837,7 +825,7 @@ impl ScopeRuntime {
         );
     }
 
-    fn handle_admission(&mut self, request: AdmissionRequest) {
+    fn handle_admission(&mut self, mut request: AdmissionRequest) {
         // A request travels only on the lane of the `DynamicControl` that
         // started it, and only the incarnation owning that control holds the
         // lane's receiver, so the request's control is this driver's own.
@@ -879,10 +867,18 @@ impl ScopeRuntime {
         // the mailbox. Keep that fallible work outside the control-plane lock
         // so driver teardown can still close reservations and removals.
         let child = ChildRuntime::from_plan(plan, &self.root);
+        // Read everything the locked section needs before either guard, so no
+        // structural unwrap runs under a lock. Only the child stays in the
+        // ledger across the gate: it must be owned there on unwind.
+        let slot = Arc::clone(&request.slot);
+        let membership = slot.member.membership();
+        let mut fused_cancel = request.fused_cancel.take();
         // Construct the ledger before either control-plane guard. On every
         // unwind its destructor therefore runs only after the dynamic-state
-        // mutex and `ObservationTxn` have both released their locks.
+        // mutex and `ObservationTxn` have both released their locks, and so
+        // do the locals above.
         let mut install = AdmissionInstall::new(&self.root, request, child);
+        let projection = install.projection();
         let root = Arc::clone(&self.root);
         let installed = root.with_observation_gate(|txn| {
             // The dynamic-state mutex rides inside the root gate here. This
@@ -894,25 +890,21 @@ impl ScopeRuntime {
             // gate under `state`. This is the install half of the admission
             // exemption in AGENTS.md.
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-            let slot = Arc::clone(&install.request().slot);
-            let membership = slot.member.membership();
             let reserved = state.entry_mut(slot.member.id()).filter(|entry| {
                 entry.slot.member.membership() == membership && entry.is_reserved()
             });
-            let ended = install
-                .request()
-                .fused_cancel
-                .as_ref()
-                .is_some_and(Latch::is_fired);
+            let ended = fused_cancel.as_ref().is_some_and(Latch::is_fired);
             match reserved {
                 Some(entry) if !ended => {
                     // The control-plane lock makes arena insertion and
                     // promotion one state transition: an exact remover sees
                     // either the reservation or a resident carrying its live
                     // arena key, never an unindexed admitted intermediate.
+                    // The ledger's one structural unwrap under a lock: the
+                    // child must stay ledger-owned until it enters the arena.
                     let key = self.insert_child(*install.take_child(), false);
-                    entry.promote(key, install.request_mut().fused_cancel.take(), txn);
-                    let admitted = root.admit_child_locked(install.projection(), txn);
+                    entry.promote(key, fused_cancel.take(), txn);
+                    let admitted = root.admit_child_locked(projection.clone(), txn);
                     Some((key, admitted))
                 }
                 reserved => {

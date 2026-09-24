@@ -11,65 +11,66 @@ use std::{
 
 use tokio::sync::{broadcast, oneshot};
 
+use shelterwood_core::identity::AtomicMonotonicCounter;
+
 use super::{PanicAccumulator, dispose_detached, waker_proxy::ProxiedPoll};
 
 /// A caller-waker registry whose lock protects only inert storage changes.
 ///
 /// Registration clones happen before entering the registry. Removal and
 /// draining only move wakers out; their vtables run after unlock, one behind
-/// each accumulator boundary. The opaque identity is retained by its waiter,
-/// so its `Arc` traffic under the lock cannot destroy even framework data.
+/// each accumulator boundary. A waiter's identity is a plain id minted by
+/// its registry.
+///
 /// Cancellation destroys a removed caller-waker clone inline on the thread
 /// dropping `LatchWait` or `WatchWait`: unlike the external-primitive proxy
 /// family, the registry owns the waker directly and has no foreign drop seam
-/// that requires detached retirement. That inherits the reply receiver's
-/// ruling rather than the proxy wrapper's — a slow caller-waker destructor
-/// stalls the abandoning waiter alone, and a hostile one is contained by the
+/// that requires detached retirement. A slow caller-waker destructor stalls
+/// the abandoning waiter alone, and a hostile one is contained by the
 /// accumulator above.
 #[derive(Default)]
 struct WaiterRegistry {
     waiters: Mutex<Vec<RegisteredWaker>>,
+    identities: AtomicMonotonicCounter,
 }
 
 struct RegisteredWaker {
-    identity: Arc<()>,
+    identity: u64,
     waker: Waker,
 }
 
 impl WaiterRegistry {
-    fn register(&self, identity: &Arc<()>, waker: Waker) -> Option<RegisteredWaker> {
+    fn mint_identity(&self) -> u64 {
+        self.identities.mint(Ordering::Relaxed, Ordering::Relaxed)
+    }
+
+    fn register(&self, identity: u64, waker: Waker) -> Option<RegisteredWaker> {
         let mut waiters = self
             .waiters
             .lock()
             .expect("waiter registry lock is never held across caller code");
         if let Some(index) = waiters
             .iter()
-            .position(|waiter| Arc::ptr_eq(&waiter.identity, identity))
+            .position(|waiter| waiter.identity == identity)
         {
             Some(std::mem::replace(
                 &mut waiters[index],
-                RegisteredWaker {
-                    identity: Arc::clone(identity),
-                    waker,
-                },
+                RegisteredWaker { identity, waker },
             ))
         } else {
-            waiters.push(RegisteredWaker {
-                identity: Arc::clone(identity),
-                waker,
-            });
+            waiters.push(RegisteredWaker { identity, waker });
             None
         }
     }
 
-    fn remove(&self, identity: &Arc<()>) -> Option<RegisteredWaker> {
+    fn remove(&self, identity: u64) -> Option<RegisteredWaker> {
         let mut waiters = self
             .waiters
             .lock()
             .expect("waiter registry lock is never held across caller code");
         waiters
             .iter()
-            .position(|waiter| Arc::ptr_eq(&waiter.identity, identity))
+            .position(|waiter| waiter.identity == identity)
             .map(|index| waiters.swap_remove(index))
     }
 
@@ -102,7 +103,7 @@ impl WaiterRegistry {
     /// hostile waker destructor cannot strand an already-published outcome.
     fn poll_registered<T>(
         &self,
-        identity: &Arc<()>,
+        identity: u64,
         context: &Context<'_>,
         mut ready: impl FnMut() -> Option<T>,
     ) -> Poll<T> {
@@ -140,56 +141,12 @@ impl fmt::Debug for WaiterRegistry {
     }
 }
 
-#[derive(Debug)]
-pub struct Signal {
-    inner: WatchSender<()>,
-}
+/// A change signal: a watch channel whose only content is its version.
+pub type Signal = WatchSender<()>;
 
-impl Default for Signal {
-    fn default() -> Self {
-        Self { inner: watch(()).0 }
-    }
-}
+/// The receiving half of a [`Signal`].
+pub type SignalWatcher = WatchReceiver<()>;
 
-impl Clone for Signal {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl Signal {
-    pub fn pulse(&self) {
-        self.inner.pulse();
-    }
-
-    pub fn watcher(&self) -> SignalWatcher {
-        SignalWatcher {
-            inner: self.inner.watcher(),
-        }
-    }
-
-    /// The channel-wide waiter-registry length.
-    ///
-    /// This is deliberately not the endpoint count: `changed()` never clones
-    /// its receiver, so an endpoint probe cannot observe a registration a
-    /// cancelled wait failed to remove.
-    #[cfg(test)]
-    fn waiter_count(&self) -> usize {
-        self.inner.shared.waiters.len()
-    }
-}
-
-pub struct SignalWatcher {
-    inner: WatchReceiver<()>,
-}
-
-impl SignalWatcher {
-    pub async fn changed(&mut self) {
-        self.inner.changed().await;
-    }
-}
 /// A one-shot, multi-waiter signal backed by a contained waiter registry.
 ///
 /// The atomic provides a linearizable, idempotent transition and retains the
@@ -257,7 +214,7 @@ impl Latch {
     pub fn fired(&self) -> LatchWait<'_> {
         LatchWait {
             latch: self,
-            identity: Arc::new(()),
+            identity: self.state.waiters.mint_identity(),
         }
     }
 }
@@ -266,7 +223,7 @@ impl Latch {
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct LatchWait<'a> {
     latch: &'a Latch,
-    identity: Arc<()>,
+    identity: u64,
 }
 
 impl Future for LatchWait<'_> {
@@ -277,7 +234,7 @@ impl Future for LatchWait<'_> {
         this.latch
             .state
             .waiters
-            .poll_registered(&this.identity, context, || {
+            .poll_registered(this.identity, context, || {
                 this.latch.is_fired().then_some(())
             })
     }
@@ -285,7 +242,7 @@ impl Future for LatchWait<'_> {
 
 impl Drop for LatchWait<'_> {
     fn drop(&mut self) {
-        let registered = self.latch.state.waiters.remove(&self.identity);
+        let registered = self.latch.state.waiters.remove(self.identity);
         WaiterRegistry::drop_registered([registered]);
     }
 }
@@ -656,6 +613,7 @@ impl<T> OneShotReceiver<T> {
         value
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn receive(self) -> Option<T> {
         self.assert_not_completed();
         self.channel.await.ok()
@@ -847,6 +805,12 @@ pub fn watch<T>(initial: T) -> (WatchSender<T>, WatchReceiver<T>) {
     )
 }
 
+impl<T: Default> Default for WatchSender<T> {
+    fn default() -> Self {
+        watch(T::default()).0
+    }
+}
+
 impl<T> WatchSender<T> {
     /// Whether both senders address the same watch channel.
     #[must_use]
@@ -928,14 +892,19 @@ enum WatchWaitOutcome {
 
 struct WatchWait<'a, T> {
     receiver: &'a mut WatchReceiver<T>,
-    identity: Arc<()>,
+    identity: u64,
 }
 
-impl<T> WatchWait<'_, T> {
+impl<'a, T> WatchWait<'a, T> {
+    fn new(receiver: &'a mut WatchReceiver<T>) -> Self {
+        let identity = receiver.shared.waiters.mint_identity();
+        Self { receiver, identity }
+    }
+
     fn poll(&mut self, context: &mut Context<'_>) -> Poll<WatchWaitOutcome> {
         let shared = &self.receiver.shared;
         let seen = &mut self.receiver.seen;
-        shared.waiters.poll_registered(&self.identity, context, || {
+        shared.waiters.poll_registered(self.identity, context, || {
             let version = shared.version.load(Ordering::Acquire);
             if version != *seen {
                 *seen = version;
@@ -951,7 +920,7 @@ impl<T> WatchWait<'_, T> {
 
 impl<T> Drop for WatchWait<'_, T> {
     fn drop(&mut self) {
-        let registered = self.receiver.shared.waiters.remove(&self.identity);
+        let registered = self.receiver.shared.waiters.remove(self.identity);
         WaiterRegistry::drop_registered([registered]);
     }
 }
@@ -999,19 +968,13 @@ impl<T> WatchReceiver<T> {
     /// intentionally ignores closure from becoming permanently always-ready.
     pub fn changed(&mut self) -> WatchChanged<'_, T> {
         WatchChanged {
-            wait: WatchWait {
-                receiver: self,
-                identity: Arc::new(()),
-            },
+            wait: WatchWait::new(self),
         }
     }
 
     pub fn changed_or_closed(&mut self) -> WatchChangedOrClosed<'_, T> {
         WatchChangedOrClosed {
-            wait: WatchWait {
-                receiver: self,
-                identity: Arc::new(()),
-            },
+            wait: WatchWait::new(self),
         }
     }
 }
@@ -1344,11 +1307,11 @@ mod tests {
         let first_drops = Arc::new(AtomicUsize::new(0));
         let second_drops = Arc::new(AtomicUsize::new(0));
         let first = RegisteredWaker {
-            identity: Arc::new(()),
+            identity: 1,
             waker: last_drop_panics_waker(FIRST, Arc::clone(&first_drops)),
         };
         let second = RegisteredWaker {
-            identity: Arc::new(()),
+            identity: 2,
             waker: last_drop_panics_waker(SECOND, Arc::clone(&second_drops)),
         };
 
@@ -1635,20 +1598,23 @@ mod tests {
     fn quiet_signal_wait_cancellation_removes_waiter_registration() {
         let signal = Signal::default();
         let mut watcher = signal.watcher();
-        assert_eq!(signal.waiter_count(), 0);
+        // The channel-wide registry length, not the endpoint count: `changed()`
+        // never clones its receiver, so an endpoint probe cannot observe a
+        // registration a cancelled wait failed to remove.
+        assert_eq!(signal.shared.waiters.len(), 0);
 
         for _ in 0..10_000 {
             let mut changed = Box::pin(watcher.changed());
             let mut context = Context::from_waker(Waker::noop());
             assert!(changed.as_mut().poll(&mut context).is_pending());
             assert_eq!(
-                signal.waiter_count(),
+                signal.shared.waiters.len(),
                 1,
                 "a parked wait holds exactly one registration"
             );
             drop(changed);
             assert_eq!(
-                signal.waiter_count(),
+                signal.shared.waiters.len(),
                 0,
                 "cancelling the wait removes its registration"
             );

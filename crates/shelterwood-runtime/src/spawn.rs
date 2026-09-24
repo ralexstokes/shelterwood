@@ -426,8 +426,7 @@ where
 /// The waker parked raw in Tokio's join trailer here is the polling
 /// executor's own, so its destruction stays framework traffic. A future that
 /// a public API caller polls supplies that caller's waker instead and must
-/// join through [`join_user_polled`] — reaching for this helper from a public
-/// seam is exactly the class #409 closed.
+/// join through [`join_user_polled`].
 pub async fn join<T>(handle: JoinHandle<T>) -> JoinOutcome<T> {
     let JoinHandle { inner } = handle;
     classify_join_result(inner.await)
@@ -483,6 +482,7 @@ fn classify_join_result<T>(result: Result<T, task::JoinError>) -> JoinOutcome<T>
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 pub async fn join_resuming<T>(handle: JoinHandle<T>) -> T {
     let JoinHandle { inner } = handle;
     match inner.await {
@@ -496,13 +496,9 @@ pub async fn join_resuming<T>(handle: JoinHandle<T>) -> T {
 }
 
 pub(super) fn contain_panic_payload(payload: PanicPayload) -> Option<String> {
-    let message = match catch_panic(|| panic_message(payload.as_ref())) {
-        Ok(message) => message,
-        Err(inspection_panic) => {
-            discard_panic(Some(inspection_panic));
-            None
-        }
-    };
+    // Inspection runs no user code: `downcast_ref` reads the compiler's
+    // `Any::type_id`, and copying a `str` only allocates.
+    let message = panic_message(payload.as_ref());
     // A custom panic payload is user-owned too. Its destructor may panic or
     // block, so retire it on the detached disposal lane before publishing
     // completion.

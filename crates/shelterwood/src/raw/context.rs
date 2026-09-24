@@ -1933,8 +1933,8 @@ mod tests {
     /// The chain the fix exists to protect, with a real task handle: the
     /// ledger keeps the entry while the completion wake is in flight, so
     /// teardown still owns the `ActorWork` it must join, and the caller's own
-    /// payload — not the task join's stringified panic — reaches the
-    /// post-join resource take.
+    /// payload — not the task join's stringified panic — is what the
+    /// cleanup slot holds after the join.
     ///
     /// Multi-threaded on purpose: the test thread blocks on the handshake
     /// while the offload task runs the hostile wake on a worker.
@@ -1991,7 +1991,7 @@ mod tests {
             .disposal
             .panic
             .take()
-            .expect("the caller wake panic reaches the post-join resource take");
+            .expect("the caller wake panic is in the cleanup slot after the join");
         assert_eq!(
             payload.downcast_ref::<OpaqueWakePanic>(),
             Some(&OpaqueWakePanic("joined finished wake panic")),

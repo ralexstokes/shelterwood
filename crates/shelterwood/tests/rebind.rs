@@ -440,6 +440,29 @@ async fn dropping_a_parked_send_in_the_rebind_window_withdraws_it() {
     system.shutdown(SHUTDOWN_BUDGET).await.expect("actor stops");
 }
 
+#[derive(Debug)]
+struct WindowMessage {
+    value: usize,
+    dropped: Option<Arc<AtomicUsize>>,
+}
+
+impl From<usize> for WindowMessage {
+    fn from(value: usize) -> Self {
+        Self {
+            value,
+            dropped: None,
+        }
+    }
+}
+
+impl Drop for WindowMessage {
+    fn drop(&mut self) {
+        if let Some(dropped) = &self.dropped {
+            dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// A restartable actor whose rebind window is held open by a fixed restart
 /// backoff under a paused clock, and whose replacement does not read until
 /// released.
@@ -457,7 +480,7 @@ struct WindowActor {
 }
 
 impl RawActor for WindowActor {
-    type Msg = usize;
+    type Msg = WindowMessage;
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
         if self.generation == 1 {
@@ -469,7 +492,7 @@ impl RawActor for WindowActor {
             self.deliveries
                 .lock()
                 .expect("deliveries mutex poisoned")
-                .push((self.generation, message));
+                .push((self.generation, message.value));
         }
         Ok(())
     }
@@ -523,13 +546,17 @@ impl WindowFixture {
 /// Fails the first incarnation and waits, without moving virtual time, until
 /// the membership is unbound: the rebind window proper, not the frozen intake
 /// that precedes it.
-async fn open_rebind_window(actor: &shelterwood::ActorRef<usize>, fail_first: &ReleaseGate) {
+async fn open_rebind_window(
+    scope: &shelterwood::ScopeRef,
+    actor: &shelterwood::ActorRef<WindowMessage>,
+    fail_first: &ReleaseGate,
+) {
     fail_first.release();
-    assert_eventually_frozen!(|| matches!(
-        actor.try_send(0),
-        Err(error) if error.kind == SendErrorKind::NotRunning
-            && error.incarnation_observed.is_none()
-    ))
+    // Observe without sending: a latest-mailbox probe could overwrite the
+    // old slot itself and conceal a failure to discard it during teardown.
+    assert_eventually_frozen!(|| scope
+        .child(actor.id().as_str())
+        .is_some_and(|child| matches!(child.state, shelterwood::ChildState::Restarting)))
     .await;
 }
 
@@ -540,7 +567,7 @@ fn resolve_in_order<F>(
     accepted: &mut Vec<Incarnation>,
 ) -> bool
 where
-    F: std::future::Future<Output = Result<Incarnation, shelterwood::SendError<usize>>>,
+    F: std::future::Future<Output = Result<Incarnation, shelterwood::SendError<WindowMessage>>>,
 {
     while let Some(send) = parked.first_mut() {
         match poll_once(send.as_mut()) {
@@ -572,9 +599,11 @@ async fn bind_promotes_senders_parked_in_the_rebind_window_in_arrival_order() {
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("first actor starts");
-    open_rebind_window(&actor, &fixture.fail_first).await;
+    open_rebind_window(&system.scope(), &actor, &fixture.fail_first).await;
 
-    let mut parked: Vec<_> = (10..14).map(|value| Box::pin(actor.send(value))).collect();
+    let mut parked: Vec<_> = (10..14)
+        .map(|value| Box::pin(actor.send(value.into())))
+        .collect();
     for send in &mut parked {
         assert!(poll_once(send.as_mut()).is_pending(), "unbound sends park");
     }
@@ -624,12 +653,24 @@ async fn latest_mailbox_accepts_senders_parked_across_a_restart_and_keeps_the_ne
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("first actor starts");
+    let old_drops = Arc::new(AtomicUsize::new(0));
     let first = actor
-        .try_send(1)
+        .try_send(WindowMessage {
+            value: 1,
+            dropped: Some(Arc::clone(&old_drops)),
+        })
         .expect("the first incarnation accepts into its slot");
-    open_rebind_window(&actor, &fixture.fail_first).await;
+    assert_eq!(old_drops.load(Ordering::SeqCst), 0);
+    open_rebind_window(&system.scope(), &actor, &fixture.fail_first).await;
+    // Disposal must happen before any new send or bind-time promotion could
+    // overwrite the slot. Keep the restart backoff frozen while waiting for
+    // the detached payload disposal.
+    assert_eventually_frozen!(|| old_drops.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(fixture.factories.load(Ordering::SeqCst), 1);
 
-    let mut parked: Vec<_> = (21..24).map(|value| Box::pin(actor.send(value))).collect();
+    let mut parked: Vec<_> = (21..24)
+        .map(|value| Box::pin(actor.send(value.into())))
+        .collect();
     for send in &mut parked {
         assert!(poll_once(send.as_mut()).is_pending(), "unbound sends park");
     }
@@ -656,9 +697,8 @@ async fn latest_mailbox_accepts_senders_parked_across_a_restart_and_keeps_the_ne
         .shutdown(Duration::from_secs(1))
         .await
         .expect("replacement stops");
-    // The complete history proves the first incarnation's slot did not cross
-    // the restart and that conflation destroyed the older parked values
-    // rather than delaying them.
+    // The complete history proves older parked values are not delivered
+    // later; the separate drop observation above covers the old slot.
     assert_eq!(
         fixture.deliveries(),
         [(2, 23)],
@@ -690,11 +730,11 @@ async fn bind_promotion_at_the_exact_deadline_resolves_send_timeout_successfully
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("first actor starts");
-    let first = actor.try_send(1).expect("first incarnation accepts");
-    open_rebind_window(&actor, &fixture.fail_first).await;
+    let first = actor.try_send(1.into()).expect("first incarnation accepts");
+    open_rebind_window(&system.scope(), &actor, &fixture.fail_first).await;
 
     let started = tokio::time::Instant::now();
-    let mut timed = Box::pin(actor.send_timeout(42, width));
+    let mut timed = Box::pin(actor.send_timeout(42.into(), width));
     assert!(poll_once(timed.as_mut()).is_pending(), "unbound send parks");
 
     advance_time(width).await;
@@ -702,7 +742,7 @@ async fn bind_promotion_at_the_exact_deadline_resolves_send_timeout_successfully
     // capacity-1 queue is full, holding the promoted message, and a probe is
     // refused and handed back without side effects.
     let mut bound = None;
-    assert_eventually_frozen!(|| match actor.try_send(0) {
+    assert_eventually_frozen!(|| match actor.try_send(0.into()) {
         Err(error) if error.kind == SendErrorKind::Full => {
             bound = error.incarnation_observed;
             true

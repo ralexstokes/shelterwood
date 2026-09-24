@@ -46,10 +46,7 @@ fn populated_state(
     let children = memberships
         .iter()
         .copied()
-        .map(|membership| {
-            supervisor::admit(&mut state, membership, true)
-                .expect("each benchmark membership is unique")
-        })
+        .map(|membership| supervisor::admit(&mut state, membership, true))
         .collect();
     (state, children)
 }

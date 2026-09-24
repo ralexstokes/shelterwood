@@ -1,14 +1,13 @@
 use std::{
     fmt,
-    sync::Arc,
     task::{Context, Poll},
 };
 
 use shelterwood_core::DeadlineBudget;
 
-use crate::mailbox::{
-    MailboxRuntime,
-    capability::{DisposingReceiver, OneShotClose, OneShotSender, dispose, oneshot},
+use crate::{
+    mailbox::capability::{DisposingReceiver, OneShotReceive},
+    runtime::{OneShotClose, OneShotReceiver, OneShotSender, dispose_detached, oneshot},
 };
 
 use super::{
@@ -24,7 +23,6 @@ use super::{
 /// isolated disposal.
 pub struct Reply<T> {
     sender: OneShotSender<T>,
-    runtime: Arc<dyn MailboxRuntime>,
 }
 
 impl<T> fmt::Debug for Reply<T> {
@@ -40,15 +38,12 @@ impl<T> fmt::Debug for Reply<T> {
 }
 
 impl<T: Send + 'static> Reply<T> {
-    pub(crate) fn channel(runtime: Arc<dyn MailboxRuntime>) -> (Self, ReplyReceiver<T>) {
-        let (sender, receiver) = oneshot(&runtime);
+    pub(crate) fn channel() -> (Self, ReplyReceiver<T>) {
+        let (sender, receiver) = oneshot();
         (
-            Self {
-                sender,
-                runtime: Arc::clone(&runtime),
-            },
+            Self { sender },
             ReplyReceiver {
-                receiver: DisposingReceiver::new(receiver, runtime),
+                receiver: DisposingReceiver::new(receiver),
             },
         )
     }
@@ -59,7 +54,7 @@ impl<T: Send + 'static> Reply<T> {
         // run a possibly blocking or panicking user destructor on the replying
         // actor; route the discard through isolated disposal instead.
         if let Err(unclaimed) = self.sender.send(value) {
-            dispose(&self.runtime, unclaimed);
+            dispose_detached(unclaimed);
         }
     }
 }
@@ -84,21 +79,19 @@ impl<T: Send + 'static> ReplyReceiver<T> {
     /// A zero budget does not observe an already-published response; it closes
     /// this receive capability and reports [`ReplyError::Timeout`].
     pub fn recv(self, deadline: impl Into<DeadlineBudget>) -> ReplyReceive<T> {
-        let runtime = self.receiver.runtime();
         ReplyReceive {
             deadlined: Deadlined::no_attempt(
                 ReplyOperation {
                     receiver: self.receiver,
                 },
                 deadline,
-                runtime,
             ),
         }
     }
 }
 
-pub(super) struct ReplyOperation<T> {
-    receiver: DisposingReceiver<T>,
+pub(super) struct ReplyOperation<T, R: OneShotReceive<T> = OneShotReceiver<T>> {
+    receiver: DisposingReceiver<T, R>,
 }
 
 pub(super) enum ReplyPoll<T> {
@@ -107,8 +100,8 @@ pub(super) enum ReplyPoll<T> {
     TimedOut,
 }
 
-pub(super) fn poll_reply<T: Send + 'static>(
-    receiver: &mut DisposingReceiver<T>,
+pub(super) fn poll_reply<T: Send + 'static, R: OneShotReceive<T>>(
+    receiver: &mut DisposingReceiver<T, R>,
     context: &mut Context<'_>,
     phase: DeadlinePhase,
 ) -> Poll<ReplyPoll<T>> {
@@ -127,7 +120,7 @@ pub(super) fn poll_reply<T: Send + 'static>(
     }
 }
 
-impl<T: Send + 'static> DeadlineOperation for ReplyOperation<T> {
+impl<T: Send + 'static, R: OneShotReceive<T>> DeadlineOperation for ReplyOperation<T, R> {
     type Output = Result<T, ReplyError>;
 
     fn poll_deadlined(
@@ -155,9 +148,8 @@ mod tests {
     use std::{
         future::Future,
         mem::ManuallyDrop,
-        pin::Pin,
         sync::{
-            Arc, Mutex,
+            Arc,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll, Wake, Waker},
@@ -165,34 +157,26 @@ mod tests {
     };
 
     use crate::{
-        mailbox::capability::{DisposingReceiver, OneShotClose, oneshot},
+        mailbox::capability::{DisposingReceiver, OneShotReceive},
+        runtime::OneShotClose,
         test_support::probe_waker,
     };
-    use shelterwood_core::{
-        ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
+
+    use super::{
+        super::{cell::tests::actor, deadline::Deadlined},
+        ReplyOperation, ReplyReceiver,
     };
 
-    use super::super::cell::tests::{actor, actor_for_with_runtime};
-
-    struct RejectingSender;
-
-    impl ErasedOneShotSender for RejectingSender {
-        fn send(self: Box<Self>, value: ErasedValue) -> Result<(), ErasedValue> {
-            Err(value)
-        }
-    }
-
+    /// A scripted receive edge: the ready, close, and arbitration outcomes the
+    /// adapter's one-shot produces only under races.
     struct SeamReceiver {
         pending_polls: usize,
-        value: Option<ErasedValue>,
+        value: Option<u8>,
         value_on_close: bool,
     }
 
-    impl ErasedOneShotReceiver for SeamReceiver {
-        fn poll_receive(
-            mut self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-        ) -> Poll<Option<ErasedValue>> {
+    impl OneShotReceive<u8> for SeamReceiver {
+        fn poll_receive(&mut self, _context: &mut Context<'_>) -> Poll<Option<u8>> {
             if self.pending_polls > 0 {
                 self.pending_polls -= 1;
                 Poll::Pending
@@ -201,22 +185,19 @@ mod tests {
             }
         }
 
-        fn close_and_poll_receive(
-            mut self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-        ) -> ErasedOneShotClose {
+        fn close_and_poll_receive(&mut self, _context: &mut Context<'_>) -> OneShotClose<u8> {
             if self.value_on_close {
                 self.value
                     .take()
-                    .map_or(ErasedOneShotClose::SenderClosed, ErasedOneShotClose::Value)
+                    .map_or(OneShotClose::SenderClosed, OneShotClose::Value)
             } else {
-                ErasedOneShotClose::Pending
+                OneShotClose::Pending
             }
         }
 
-        fn close(self: Pin<&mut Self>) {}
+        fn close(&mut self) {}
 
-        fn close_and_take(mut self: Pin<&mut Self>) -> Option<ErasedValue> {
+        fn close_and_take(&mut self) -> Option<u8> {
             self.value.take()
         }
     }
@@ -290,21 +271,18 @@ mod tests {
 
     #[crate::runtime::test]
     async fn ready_race_retires_the_reply_caller_waker_before_returning() {
-        let runtime = Arc::new(
-            crate::mailbox::capability::tests::TestRuntime::new().with_oneshot(|| {
-                (
-                    Box::new(RejectingSender),
-                    Box::pin(SeamReceiver {
-                        pending_polls: 1,
-                        value: Some(Box::new(7_u8)),
-                        value_on_close: false,
-                    }),
-                )
-            }),
-        );
-        let (_, actor) = actor_for_with_runtime::<()>(runtime);
-        let (_reply, receiver) = actor.reply_channel::<u8>();
-        let mut receive = Box::pin(receiver.recv(Duration::from_secs(1)));
+        // `ReplyReceiver::recv`'s shape over a scripted receiver: the deadline
+        // scaffold around one reply operation.
+        let mut receive = Box::pin(Deadlined::no_attempt(
+            ReplyOperation {
+                receiver: DisposingReceiver::new(SeamReceiver {
+                    pending_polls: 1,
+                    value: Some(7),
+                    value_on_close: false,
+                }),
+            },
+            Duration::from_secs(1),
+        ));
         let drops = Arc::new(AtomicUsize::new(0));
         let caller = ManuallyDrop::new(counted_drop_waker(Arc::clone(&drops)));
 
@@ -321,21 +299,11 @@ mod tests {
 
     #[test]
     fn timeout_arbitration_value_retires_the_reply_caller_waker_before_returning() {
-        let runtime = Arc::new(
-            crate::mailbox::capability::tests::TestRuntime::new().with_oneshot(|| {
-                (
-                    Box::new(RejectingSender),
-                    Box::pin(SeamReceiver {
-                        pending_polls: usize::MAX,
-                        value: Some(Box::new(9_u8)),
-                        value_on_close: true,
-                    }),
-                )
-            }),
-        );
-        let (_, inner) =
-            oneshot::<u8>(&(runtime.clone() as Arc<dyn crate::mailbox::MailboxRuntime>));
-        let mut receiver = DisposingReceiver::new(inner, runtime);
+        let mut receiver = DisposingReceiver::new(SeamReceiver {
+            pending_polls: usize::MAX,
+            value: Some(9),
+            value_on_close: true,
+        });
         let drops = Arc::new(AtomicUsize::new(0));
         let caller = ManuallyDrop::new(counted_drop_waker(Arc::clone(&drops)));
         let mut context = Context::from_waker(&caller);
@@ -355,21 +323,11 @@ mod tests {
 
     #[test]
     fn close_retires_the_reply_caller_waker_and_contains_a_hostile_destructor() {
-        let runtime = Arc::new(
-            crate::mailbox::capability::tests::TestRuntime::new().with_oneshot(|| {
-                (
-                    Box::new(RejectingSender),
-                    Box::pin(SeamReceiver {
-                        pending_polls: usize::MAX,
-                        value: None,
-                        value_on_close: false,
-                    }),
-                )
-            }),
-        );
-        let (_, inner) =
-            oneshot::<u8>(&(runtime.clone() as Arc<dyn crate::mailbox::MailboxRuntime>));
-        let mut receiver = DisposingReceiver::new(inner, runtime);
+        let mut receiver = DisposingReceiver::new(SeamReceiver {
+            pending_polls: usize::MAX,
+            value: None,
+            value_on_close: false,
+        });
         let drops = Arc::new(AtomicUsize::new(0));
         let caller = ManuallyDrop::new(hostile_drop_waker(Arc::clone(&drops)));
         let mut context = Context::from_waker(&caller);
@@ -393,26 +351,12 @@ mod tests {
 
     #[crate::runtime::test(start_paused = true)]
     async fn timeout_arbitration_waits_for_a_winning_send_to_publish() {
-        let publisher = Arc::new(Mutex::new(None));
-        let staged_publisher = Arc::clone(&publisher);
-        let runtime = Arc::new(
-            crate::mailbox::capability::tests::TestRuntime::new().with_oneshot(move || {
-                let (publisher, receiver) = crate::runtime::oneshot_sending_for_test();
-                let displaced = staged_publisher
-                    .lock()
-                    .expect("staged reply publisher mutex")
-                    .replace(publisher);
-                assert!(displaced.is_none(), "the test creates one reply channel");
-                (
-                    Box::new(RejectingSender),
-                    Box::pin(
-                        crate::mailbox::capability::tests::AdapterOneShotReceiver::new(receiver),
-                    ),
-                )
-            }),
-        );
-        let (_, actor) = actor_for_with_runtime::<()>(runtime.clone());
-        let (reply, receiver) = actor.reply_channel::<u8>();
+        // The adapter's own staged-send receiver, so the arbitration edge is
+        // the real one-shot's rather than a script.
+        let (publisher, receiver) = crate::runtime::oneshot_sending_for_test::<u8>();
+        let receiver = ReplyReceiver {
+            receiver: DisposingReceiver::new(receiver),
+        };
         let width = Duration::from_secs(1);
         let mut receive = Box::pin(receiver.recv(width));
         assert!(
@@ -432,11 +376,6 @@ mod tests {
                 .is_pending(),
             "OneShotClose::Pending defers the timeout verdict"
         );
-        let publisher = publisher
-            .lock()
-            .expect("staged reply publisher mutex")
-            .take()
-            .expect("reply channel installed its publisher");
         // Measured as a delta, not an absolute. The expired timer already
         // woke the *previous* poll's waker, and the waker proxy replays that
         // record into whichever caller registers next -- a spurious wake the
@@ -445,13 +384,12 @@ mod tests {
         // the deferred caller exactly once.
         let woken_before_publish = wakes.load(Ordering::SeqCst);
         publisher
-            .publish(Box::new(7_u8))
+            .publish(7)
             .unwrap_or_else(|_| panic!("the staged receiver remains live"));
         assert_eq!(wakes.load(Ordering::SeqCst), woken_before_publish + 1);
         assert!(matches!(
             receive.as_mut().poll(&mut Context::from_waker(&waker)),
             Poll::Ready(Ok(7))
         ));
-        drop(reply);
     }
 }

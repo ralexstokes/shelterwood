@@ -1,15 +1,14 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
 use shelterwood_core::DeadlineBudget;
 
 use crate::{
-    mailbox::{MailboxRuntime, ProxiedSleep},
-    runtime::PanicAccumulator,
+    mailbox::ProxiedSleep,
+    runtime::{self, PanicAccumulator},
 };
 
 /// Which of the two passes an operation is being polled in.
@@ -56,7 +55,6 @@ pub(super) trait DeadlineOperation {
 /// First-poll deadline capture shared by every public mailbox deadline future.
 pub(super) struct Deadlined<F> {
     pub(super) operation: F,
-    runtime: Arc<dyn MailboxRuntime>,
     budget_width: DeadlineBudget,
     budget: Option<crate::deadline::Deadline>,
     timer: Option<ProxiedSleep>,
@@ -67,14 +65,9 @@ pub(super) struct Deadlined<F> {
 impl<F> Deadlined<F> {
     /// Constructs the shared no-attempt deadline policy used by public
     /// mailbox operations.
-    pub(super) fn no_attempt(
-        operation: F,
-        budget_width: impl Into<DeadlineBudget>,
-        runtime: Arc<dyn MailboxRuntime>,
-    ) -> Self {
+    pub(super) fn no_attempt(operation: F, budget_width: impl Into<DeadlineBudget>) -> Self {
         Self {
             operation,
-            runtime,
             budget_width: budget_width.into(),
             budget: None,
             timer: None,
@@ -100,10 +93,10 @@ impl<F> Deadlined<F> {
             .instant()
             .is_none()
         {
-            // An unrepresentable deadline never arrives, and the capability
-            // answers it with `std::future::pending()` -- a future that
-            // resolves for nobody and wakes nobody. Registering a caller waker
-            // with it would allocate a proxy and dispatch the caller's `clone`
+            // An unrepresentable deadline never arrives, so no timer is armed
+            // for it: it waits like `std::future::pending()`, which resolves
+            // for nobody and wakes nobody. Registering a caller waker with
+            // such a wait would allocate a proxy and dispatch the caller's `clone`
             // vtable for a wake that cannot happen, and then dispatch its
             // `drop` vtable again at retirement. This is the documented
             // unbounded-wait idiom (the book's observation chapter), not an
@@ -148,13 +141,15 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
         if !this.started {
             this.started = true;
             let budget =
-                crate::deadline::Deadline::after(this.runtime.now(), this.budget_width.duration());
+                crate::deadline::Deadline::after(runtime::now(), this.budget_width.duration());
             this.budget = Some(budget);
             if !this.budget_width.is_zero()
                 && let Some(deadline) = budget.instant()
             {
-                let timer = this.runtime.sleep_until(Some(deadline));
-                this.timer = Some(ProxiedSleep::new(timer, Arc::clone(&this.runtime)));
+                this.timer = Some(ProxiedSleep::new(
+                    runtime::raw_sleep_until(deadline),
+                    runtime::dispose_waker,
+                ));
             }
         }
         // A zero budget short-circuits: the operation is never attempted, so
@@ -228,7 +223,7 @@ impl<F> Drop for Deadlined<F> {
     /// waker retires through the blocking disposal lane before the wheel entry
     /// is synchronously cancelled, so its destructor can neither hold the
     /// global time-driver mutex nor run in this drop glue. The accumulator
-    /// still protects capability submission and framework retirement during
+    /// still protects disposal submission and framework retirement during
     /// an existing unwind.
     ///
     /// This is the half of #398 ruling 3's venue split that keeps the lane:
@@ -369,7 +364,6 @@ mod tests {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
             width,
-            crate::mailbox::capability::tests::runtime(),
         ));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
@@ -389,7 +383,6 @@ mod tests {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             ReadyAfterParking::default(),
             width,
-            crate::mailbox::capability::tests::runtime(),
         ));
         let recorder = Arc::new(WakeRecorder::default());
         let waker = Waker::from(Arc::clone(&recorder));
@@ -430,7 +423,6 @@ mod tests {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             ImmediatelyReady,
             std::time::Duration::from_secs(1),
-            crate::mailbox::capability::tests::runtime(),
         ));
         let counter = Arc::new(CloneCounter::default());
         let waker = counting_waker(&counter);
@@ -450,21 +442,19 @@ mod tests {
     /// The test above never enters `poll_timer` at all -- its operation is
     /// ready on the first poll -- so the no-op probe it names goes untested
     /// there. Reaching the probe needs an operation that stays pending beside
-    /// a timer that is ready, which is what dating the capability clock into
-    /// the past arranges: the budget is captured from that stale `now`, so the
-    /// deadline it derives is already behind the real clock and
-    /// `sleep_until` resolves on its first poll.
+    /// a timer that is ready, which is what dating the façade's clock into
+    /// the past (a test-only thread-local override) arranges: the budget is
+    /// captured from that stale `now`, so the deadline it derives is already
+    /// behind the real clock and `sleep_until` resolves on its first poll.
     #[crate::runtime::test(start_paused = true)]
     async fn an_already_elapsed_timer_never_clones_the_caller_waker() {
         let stale = crate::runtime::now()
             .checked_sub(std::time::Duration::from_secs(60))
             .expect("the test clock is far enough past its origin to date a budget backwards");
-        let runtime =
-            Arc::new(crate::mailbox::capability::tests::TestRuntime::new().with_now(move || stale));
+        let _stale_clock = crate::runtime::hooks::override_now(move || stale);
         let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
             std::time::Duration::from_secs(1),
-            runtime,
         ));
         let counter = Arc::new(CloneCounter::default());
         let waker = counting_waker(&counter);
@@ -494,7 +484,6 @@ mod tests {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
             std::time::Duration::MAX,
-            crate::mailbox::capability::tests::runtime(),
         ));
         let counter = Arc::new(CloneCounter::default());
         let waker = counting_waker(&counter);
@@ -519,7 +508,6 @@ mod tests {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
             shelterwood_core::DeadlineBudget::ZERO,
-            crate::mailbox::capability::tests::runtime(),
         ));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);

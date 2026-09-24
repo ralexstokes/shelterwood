@@ -185,9 +185,7 @@ pub(super) fn insert_dynamic_fixture(
     let mut child = ChildRuntime::from_plan(plan, &root);
     prepare(&mut child);
     let key = root.with_observation_gate(|txn| {
-        let key = scope
-            .insert_child(child, false)
-            .unwrap_or_else(|_| panic!("the fixture child-key domain is available"));
+        let key = scope.insert_child(child, false);
         {
             let mut dynamic = control.state.lock().expect("dynamic-state mutex poisoned");
             let entry = dynamic

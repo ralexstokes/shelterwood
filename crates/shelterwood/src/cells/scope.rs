@@ -2193,7 +2193,7 @@ mod tests {
         let member = child_member(&root, "invalid");
         let mut incarnations = member.take_incarnation_counter();
         let incarnation = incarnations.mint();
-        let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
+        let mailbox = MailboxCell::new(member.id().clone());
         member.attach_mailbox(mailbox.clone());
         let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
         let mut effects = MailboxEffectQueue::default();
@@ -2242,10 +2242,7 @@ mod tests {
         let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
         let mut incarnations = nested.member.take_incarnation_counter();
         let incarnation = incarnations.mint();
-        let mailbox = MailboxCell::new(
-            nested.member.id().clone(),
-            crate::runtime::mailbox_runtime(),
-        );
+        let mailbox = MailboxCell::new(nested.member.id().clone());
         nested.member.attach_mailbox(mailbox.clone());
         let actor = actor_ref_from_parts(Arc::clone(&nested.member), Arc::clone(&mailbox));
         let mut effects = MailboxEffectQueue::default();
@@ -3412,7 +3409,7 @@ mod tests {
         let incarnation = incarnations.mint();
         let scope = ScopeCell::new(member, ScopeFlavor::Dynamic, ScopeIdentity::new());
         let gate = scope.observation_gate();
-        let mailbox = MailboxCell::<u8>::new(id, crate::runtime::mailbox_runtime());
+        let mailbox = MailboxCell::<u8>::new(id);
         let mut effects = MailboxEffectQueue::default();
         let token = MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest, &mut effects);
         MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
@@ -3449,7 +3446,7 @@ mod tests {
         let child = MemberCell::new(child_identity.mint_membership(&child_id));
         let mut incarnations = child.take_incarnation_counter();
         let incarnation = incarnations.mint();
-        let mailbox = MailboxCell::new(child_id, crate::runtime::mailbox_runtime());
+        let mailbox = MailboxCell::new(child_id);
         child.attach_mailbox(mailbox.clone());
         let actor = actor_ref_from_parts(Arc::clone(&child), Arc::clone(&mailbox));
         let mut effects = MailboxEffectQueue::default();
@@ -3517,7 +3514,7 @@ mod tests {
             let mut incarnations = child.take_incarnation_counter();
             let incarnation = incarnations.mint();
             counters.push(incarnations);
-            let mailbox = MailboxCell::new(child.id().clone(), crate::runtime::mailbox_runtime());
+            let mailbox = MailboxCell::new(child.id().clone());
             child.attach_mailbox(mailbox.clone());
             let actor = actor_ref_from_parts(Arc::clone(&child), Arc::clone(&mailbox));
             let mut effects = MailboxEffectQueue::default();

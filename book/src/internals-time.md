@@ -8,12 +8,12 @@ concurrent work whose completion re-enters its own loop.
 
 ## One clock
 
-The capability object installed per mailbox carries the clock: `now` and
-`sleep_until` on `MailboxRuntime`, implemented by the Tokio adapter over
-`tokio::time`. Because deadline futures and reply channels flow through
-the same object as the mailbox that minted them, virtual time in tests
-(the adapter's `advance`, under the `test-util` feature) reaches every
-timer in a system consistently — there is no second clock to drift.
+The façade's runtime module carries the clock: `now` and
+`raw_sleep_until`, implemented by the Tokio adapter over `tokio::time`.
+Because mailboxes, deadline futures, reply channels and the driver all
+call that one module, virtual time in tests (the adapter's `advance`,
+under the `test-util` feature) reaches every timer in a system
+consistently — there is no second clock to drift.
 
 Decision modules never call it. `StopLadder::advance(now)` and
 `schedule_restart(..., now, jitter)` take the instant as an argument, and

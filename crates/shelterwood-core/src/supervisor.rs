@@ -387,10 +387,7 @@ impl SupervisorState {
         }
     }
 
-    fn admit(&mut self, membership: Membership, initial: bool) -> Option<ChildKey> {
-        if self.child_keys.contains_key(&membership) {
-            return None;
-        }
+    fn admit(&mut self, membership: Membership, initial: bool) -> ChildKey {
         let child = ChildKey(self.keys.mint());
         let _ = self.children.insert(
             child,
@@ -405,15 +402,13 @@ impl SupervisorState {
                 spawned_once: false,
             },
         );
-        // No "one live membership maps to exactly one child key" assertion is
-        // written here any more: the `child_keys.contains_key` guard at the
-        // top of this function makes a displacing insert unwritable rather
-        // than merely unfired, which is the stronger form of the same claim.
-        self.child_keys.insert(membership, child);
+        // Every membership is minted once and admitted once (see [`admit`]),
+        // so this insert never displaces a live registration.
+        let _ = self.child_keys.insert(membership, child);
         if initial && self.flavor == ScopeFlavor::Ordered && self.next_ordered_start.is_none() {
             self.next_ordered_start = Some(child);
         }
-        Some(child)
+        child
     }
 
     fn settle_startup(&mut self, effects: &mut Vec<Effect>) {
@@ -757,12 +752,15 @@ pub fn step(state: &mut SupervisorState, event: Event, effects: &mut Vec<Effect>
 /// exploration walk is blind to that boundary by design because admission
 /// mints an unbounded sequence of keys, so the facade test
 /// `draining_scopes_reject_admission_and_treat_removal_as_absent` pins it.
-/// This structural operation rejects only a duplicate live membership.
-pub fn admit(
-    state: &mut SupervisorState,
-    membership: Membership,
-    initial: bool,
-) -> Option<ChildKey> {
+///
+/// Admission is infallible. A [`Membership`] exists only as a value minted
+/// once from its scope's monotonic identity counter, and the supported driver
+/// admits each minted membership once: an initial child's runtime moves out of
+/// its plan into the arena, and a dynamic child is admitted only from a
+/// reservation read `Reserved` under the dynamic-state lock that the same
+/// critical section promotes. Admitting a membership twice is outside this
+/// reducer's contract.
+pub fn admit(state: &mut SupervisorState, membership: Membership, initial: bool) -> ChildKey {
     state.admit(membership, initial)
 }
 
@@ -812,10 +810,6 @@ mod tests {
                     .0
             })
             .collect()
-    }
-
-    fn admit(state: &mut SupervisorState, membership: Membership, initial: bool) -> ChildKey {
-        super::admit(state, membership, initial).expect("fixture admission mints one key")
     }
 
     #[test]
@@ -1324,14 +1318,11 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_admission_and_stale_events_are_total_noops() {
+    fn stale_events_after_terminalization_are_total_noops() {
         let membership = memberships(1)[0];
         let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::running());
         let child = admit(&mut state, membership, false);
         let mut effects = Vec::new();
-        assert_eq!(super::admit(&mut state, membership, false), None);
-        assert!(effects.is_empty());
-        assert_eq!(state.len(), 1);
 
         step(&mut state, Event::DisposalStarted { child }, &mut effects);
         step(&mut state, Event::Terminalized { child }, &mut effects);

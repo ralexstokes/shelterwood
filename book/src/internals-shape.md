@@ -20,13 +20,12 @@ The workspace has three implementation crates with a strict dependency
 direction, plus one checking tool:
 
 - **`shelterwood-core`** — runtime-independent supervision types,
-  capabilities, and state machines. Its only dependency is `thiserror`: no
+  waker proxies, and state machines. Its only dependency is `thiserror`: no
   async runtime, no adapter, nothing that can run user code behind its
   back. This is where the pure decision machinery lives (`engine.rs`,
   `supervisor.rs`, `exit.rs`, `policy.rs`), along with the identity types,
   panic-capture facilities, and the doc-hidden seams the other crates
-  consume (`capability.rs`, `waker.rs`, `waker_proxy.rs`,
-  `proxied_sleep.rs`).
+  consume (`waker.rs`, `waker_proxy.rs`, `proxied_sleep.rs`).
 - **`shelterwood-runtime`** — the Tokio adapter. It is the only crate in
   the workspace that names Tokio as a normal dependency, and it pins the
   exact release, because blocking-pool rejection ownership is verified
@@ -46,23 +45,23 @@ names the adapter. That graph — not convention — is what makes SPEC §1's
 The fourth workspace member, `tools/api-reachability`, is part of the
 enforcement story described at the end of this chapter.
 
-## The capability seam
+## The runtime seam
 
 The façade's mailboxes need runtime services — one-shot channels, change
-signals, timers, isolated disposal — without naming a runtime. The seam is
-`MailboxRuntime` in `crates/shelterwood-core/src/capability.rs`: a
-doc-hidden, type-erased trait whose five methods mint the sub-capabilities
-(`ErasedOneShotSender`/`ErasedOneShotReceiver`, `MailboxSignal` and its
-watcher, `dispose`, `now`/`sleep_until`).
+signals, timers, isolated disposal — without naming a runtime. They get
+them the way every other façade layer does: by static calls into the
+façade's private runtime module (`crates/shelterwood/src/runtime.rs`),
+which re-exports the adapter's typed `oneshot`, `Signal`,
+`dispose_detached`, `now` and `raw_sleep_until`. Nothing is installed per
+mailbox, so a mailbox, its reply channels, its deadline futures and its
+driver all share one clock and one disposal lane by construction.
 
-The adapter implements it once (`TokioMailboxRuntime` in
-`crates/shelterwood-runtime/src/mailbox.rs`) and exposes a single
-process-wide instance through `mailbox_runtime()`. The façade installs
-that object per mailbox at slot-attach time
-(`crates/shelterwood/src/tree/slots.rs`), and the same object then flows
-through reply channels and deadline futures, so virtual-time and disposal
-semantics cannot silently switch adapters mid-conversation. Type erasure
-is also why `ActorRef<M>` carries no runtime type parameter.
+That module is the build's executor selection. A second executor would be
+a second adapter crate exporting the same module surface, selected in
+that one file; it never adds a type parameter, which is why `ActorRef<M>`
+carries none. Core names a runtime service in exactly one place: the
+waker proxy family takes a plain `fn(Waker)` disposer, and the adapter
+supplies `dispose_waker`.
 
 Two one-line modules make the boundary auditable: the façade's
 `runtime.rs` (`pub(crate) use shelterwood_runtime::*` — "the only boundary
@@ -135,8 +134,8 @@ enforcement:
 - **`tools/check-external-consumer.sh`** compiles a real external crate
   against the façade, then runs negative compile probes that must fail
   with specific diagnostics — including one proving that every private
-  installation seam (`MailboxRuntime`, `MailboxControl`, `WakerProxy`,
-  `MemberCell`, and the rest of the family) is unimportable from outside.
+  installation seam (`MailboxControl`, `WakerProxy`, `MemberCell`, and
+  the rest of the family) is unimportable from outside.
 
 Together they state one argument in three parts: no public item reachably
 names a runtime type; the one un-walkable residue is structurally safe

@@ -1,6 +1,6 @@
-use std::{sync::Arc, task::Waker};
+use std::task::Waker;
 
-use crate::{MailboxRuntime, panic::PanicAccumulator};
+use crate::panic::PanicAccumulator;
 
 /// The only storage surface for a caller-owned waker.
 ///
@@ -22,12 +22,13 @@ pub struct WakerSlot(Option<Waker>);
 
 /// Post-unlock disposition for a waker leaving a [`WakerSlot`].
 ///
-/// See [`WakerSlot`]'s implementation boundary.
+/// `Run` is the one runtime-facing disposition: the adapter supplies a plain
+/// disposer function (its detached disposal lane), so core names no runtime
+/// type. See [`WakerSlot`]'s implementation boundary.
 #[doc(hidden)]
 pub enum WakerAction {
     Wake,
     DropInline,
-    Dispose(Arc<dyn MailboxRuntime>),
     Run(fn(Waker)),
 }
 
@@ -78,9 +79,6 @@ impl WakerEffects {
             match action {
                 WakerAction::Wake => panics.run(|| waker.wake()),
                 WakerAction::DropInline => panics.run(|| drop(waker)),
-                WakerAction::Dispose(runtime) => {
-                    panics.run(|| runtime.dispose(Box::new(waker)));
-                }
                 WakerAction::Run(effect) => panics.run(|| effect(waker)),
             }
         }

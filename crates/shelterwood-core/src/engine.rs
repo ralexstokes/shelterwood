@@ -719,6 +719,26 @@ impl ScopeEpochs {
         }
     }
 
+    /// Marks the next unminted epoch finished without it ever running.
+    ///
+    /// A stop request accepted with no live incarnation targets exactly
+    /// that epoch (`request_target`). When the parent resolves such a
+    /// request without constructing an incarnation, vacating the target
+    /// settles every wait on it and makes the next `begin` mint the epoch
+    /// after it, whose request latch is therefore clear. Only the idle
+    /// plane's next epoch can be vacated; any other epoch is refused.
+    pub fn vacate(&mut self, epoch: Epoch) -> bool {
+        match *self {
+            Self::Idle { last_stopped } if Epoch::after(last_stopped) == epoch => {
+                *self = Self::Idle {
+                    last_stopped: Some(epoch),
+                };
+                true
+            }
+            Self::Idle { .. } | Self::Live { .. } => false,
+        }
+    }
+
     pub fn is_current(self, epoch: Epoch) -> bool {
         self.live_epoch() == Some(epoch)
     }
@@ -1941,6 +1961,34 @@ mod tests {
         assert_eq!(epochs.live_epoch(), None);
         assert!(epochs.finished(first));
         assert!(epochs.request_is_pending(unminted));
+    }
+
+    #[test]
+    fn vacating_the_pending_target_settles_it_and_advances_the_next_mint() {
+        let mut epochs = ScopeEpochs::default();
+        let first = epochs.request_target().epoch;
+        let second = first.successor();
+        assert!(!epochs.vacate(second), "only the next epoch can be vacated");
+        assert!(epochs.vacate(first));
+        assert!(epochs.finished(first), "a vacated target reads as settled");
+        assert!(!epochs.request_is_pending(first));
+        assert_eq!(
+            epochs.request_target(),
+            RequestTarget {
+                epoch: second,
+                pending_incarnation: true,
+            }
+        );
+        assert!(!epochs.vacate(first), "a vacated epoch cannot vacate twice");
+
+        let live = epochs.begin().expect("the plane stays idle after a vacate");
+        assert_eq!(live, second, "the next mint skips the vacated epoch");
+        assert!(!epochs.finished(live));
+        assert!(
+            !epochs.vacate(live.successor()),
+            "a live plane has no pending target to vacate"
+        );
+        assert_eq!(epochs.live_epoch(), Some(live));
     }
 
     #[test]

@@ -50,7 +50,7 @@ async fn successful_admission_never_parks_its_caller_waker_and_returns_the_exact
     };
     assert_eq!(admitted, expected, "admission returns its reserved handle");
 
-    assert_eq!(scope.remove_task(&admitted).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&admitted).await, RemoveOutcome::Removed);
     system
         .shutdown(SHUTDOWN_BUDGET)
         .await
@@ -71,7 +71,7 @@ async fn exact_removal_never_parks_its_caller_waker_and_preserves_its_outcomes()
         .add_task("proxied-removal", waiting_task())
         .await
         .expect("task is admitted");
-    let mut removal = Box::pin(scope.remove_task(&task));
+    let mut removal = Box::pin(scope.remove_exact(&task));
     let hostile = hostile_waker("injected admission/removal caller-waker drop panic");
 
     assert!(matches!(
@@ -94,12 +94,12 @@ async fn exact_removal_never_parks_its_caller_waker_and_preserves_its_outcomes()
         .await
         .expect("the removed id is reusable");
     assert_eq!(
-        scope.remove_task(&task).await,
+        scope.remove_exact(&task).await,
         RemoveOutcome::AlreadyAbsent,
         "a stale exact handle cannot remove a successor"
     );
     assert_eq!(
-        scope.remove_task(&replacement).await,
+        scope.remove_exact(&replacement).await,
         RemoveOutcome::Removed,
         "the exact successor handle remains authoritative"
     );

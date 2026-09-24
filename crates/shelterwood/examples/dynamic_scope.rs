@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Planned removal: keep the exact handle returned by admission and remove
     // that membership. A same-id successor admitted later is a distinct
     // membership this removal could never touch.
-    let outcome = scope.remove_actor(&counter).await;
+    let outcome = scope.remove_exact(&counter).await;
     assert_eq!(outcome, RemoveOutcome::Removed);
     // ANCHOR_END: remove
     assert!(scope.as_scope().snapshot().child("counter").is_none());

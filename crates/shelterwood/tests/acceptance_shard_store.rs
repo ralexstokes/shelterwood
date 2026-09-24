@@ -216,7 +216,7 @@ impl RouterActor {
         if let Some(previous) = previous
             && previous.scope.membership() != candidate.scope.membership()
         {
-            let outcome = self.0.ranges.remove_scope(&previous.scope).await;
+            let outcome = self.0.ranges.remove_exact(&previous.scope).await;
             if outcome != RemoveOutcome::Removed && outcome != RemoveOutcome::AlreadyAbsent {
                 return Err(ExitError::message("unexpected exact-retire outcome"));
             }
@@ -301,7 +301,7 @@ impl RouterActor {
                             "pre-commit abort found an unexpected directory route",
                         ));
                     }
-                    let _ = self.0.ranges.remove_scope(&candidate.scope).await;
+                    let _ = self.0.ranges.remove_exact(&candidate.scope).await;
                     self.0
                         .durable
                         .operations
@@ -741,7 +741,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
     let removal = tokio::spawn({
         let ranges = ranges.clone();
         let scope = scope.clone();
-        async move { ranges.remove_scope(&scope).await }
+        async move { ranges.remove_exact(&scope).await }
     });
     ranges
         .as_scope()

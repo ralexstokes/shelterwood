@@ -1209,7 +1209,7 @@ async fn runtime_dynamic_additions_never_join_aggregate_readiness() {
         .expect("aggregate readiness does not wait on the runtime addition")
         .expect("only the initial set gates aggregate readiness");
     assert_eq!(
-        scope.remove_task(&runtime_task).await,
+        scope.remove_exact(&runtime_task).await,
         shelterwood::RemoveOutcome::Removed
     );
     system.shutdown(SHUTDOWN_BUDGET).await.expect("root stops");

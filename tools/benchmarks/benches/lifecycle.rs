@@ -383,7 +383,7 @@ fn bench_dynamic_churn(c: &mut Criterion, runtime_name: &str, runtime: &Runtime)
                     // pins every cycle at five edges under both runtime
                     // configurations; see the README.
                     started.notified().await;
-                    let outcome = scope.remove_task(&task).await;
+                    let outcome = scope.remove_exact(&task).await;
                     // Promoted from `debug_assert_eq!`: `cargo bench` builds
                     // the release-derived `bench` profile, where a debug
                     // assertion is compiled out and this loop would have no

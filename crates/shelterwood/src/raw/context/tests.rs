@@ -614,7 +614,7 @@ fn ordinary_offload_completion_retains_a_finished_waiter_wake_panic() {
     );
 }
 
-/// The chain the fix exists to protect, with a real task handle: the
+/// The same chain with a real task handle: the
 /// ledger keeps the entry while the completion wake is in flight, so
 /// teardown still owns the `ActorWork` it must join, and the caller's own
 /// payload — not the task join's stringified panic — is what the
@@ -685,7 +685,7 @@ async fn a_pinned_completion_wake_panic_survives_the_offload_task_join() {
 
 /// `freeze` is the drain that normally empties the continuation queue, but
 /// it is not a guaranteed one: `Drop for RawResources` skips it once the
-/// incarnation is already frozen, and runs it under `catch_panic` so an
+/// incarnation is already frozen, and runs it under `PanicSlot::run` so an
 /// earlier cleanup step failing can cut it short. Either way the queue's
 /// own destructor must still route its payloads through the disposal
 /// funnel instead of letting them unwind out of incarnation cleanup.

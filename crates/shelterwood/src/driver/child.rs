@@ -1311,9 +1311,8 @@ impl ScopeRuntime {
             self.fail_startup(key, &exit);
         }
         // Both routes above are fallible, so the guard retires once, here, by
-        // falling out of scope whichever route ran. Issue #455 removed the
-        // escape hatch that let a driver-layer caller surrender a guard on a
-        // conventional co-owner proof, and the driver owns no observation
+        // falling out of scope whichever route ran. A driver-layer caller
+        // cannot surrender a guard, and the driver owns no observation
         // transaction to surrender into, so `Retained::drop` is the venue:
         // it retires a failed user error through critical disposal at the cost
         // of one blocking-pool job.

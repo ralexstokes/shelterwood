@@ -819,3 +819,67 @@ async fn stopping_raw_context_rejects_timers_and_offloads_with_payload_recovery(
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert!(checked.load(Ordering::SeqCst));
 }
+
+/// Panics from its destructor, which only the epilogue's resource freeze runs.
+struct PanickingTimerMessage;
+
+impl Drop for PanickingTimerMessage {
+    fn drop(&mut self) {
+        panic!("injected timer message destructor panic");
+    }
+}
+
+struct PanickingWake;
+
+impl std::task::Wake for PanickingWake {
+    fn wake(self: Arc<Self>) {
+        panic!("injected receive waker panic");
+    }
+}
+
+/// Leaves a hostile waker registered on its mailbox and a timer whose message
+/// panics on destruction, so the epilogue's mailbox freeze and its resource
+/// freeze both fail.
+struct CleanupRankActor;
+
+impl RawActor for CleanupRankActor {
+    type Msg = PanickingTimerMessage;
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        // Leak one pending receive so its waker stays registered on the
+        // mailbox signal the epilogue's freeze pulses. No timer is armed yet,
+        // so the leaked receive holds no sleep.
+        let mut receive = Box::pin(context.recv());
+        let waker = std::task::Waker::from(Arc::new(PanickingWake));
+        let polled = receive
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker));
+        assert!(polled.is_pending(), "an empty mailbox parks the receive");
+        std::mem::forget(receive);
+        if let Err(rejected) = context.set_timeout((), PanickingTimerMessage, Duration::MAX) {
+            std::mem::forget(rejected);
+            panic!("a live context accepts timers");
+        }
+        Ok(())
+    }
+}
+
+/// The epilogue ranks resource-freeze evidence ahead of a panic from the
+/// mailbox freeze's wake flush, although the mailbox freezes first.
+#[tokio::test]
+async fn resource_freeze_evidence_outranks_the_mailbox_freeze_wake() {
+    let mut tree = Tree::new();
+    tree.add_raw_once("cleanup-rank", RawOnceDef::new(CleanupRankActor))
+        .expect("valid raw actor");
+    let system = tree.spawn().expect("runtime is available");
+    let mut events = system.scope().subscribe_lifecycle();
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+
+    let panic_message = last_panic_message(&mut events, "cleanup-rank").await;
+    assert!(
+        panic_message
+            .as_deref()
+            .is_some_and(|message| message.contains("injected timer message destructor panic")),
+        "the resource freeze's destructor panic wins: {panic_message:?}"
+    );
+}

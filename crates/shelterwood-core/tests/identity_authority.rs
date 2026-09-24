@@ -49,7 +49,6 @@ fn provisional_membership_selects_its_minting_child_id() {
     let mut declaration = ScopeIdentity::new();
     let (declared, provisional, _) = declaration
         .mint_membership(&worker_id)
-        .expect("declaration membership available")
         .into_provisional_parts();
 
     let mut stable = ScopeIdentity::new();
@@ -58,16 +57,8 @@ fn provisional_membership_selects_its_minting_child_id() {
         MembershipReconciliation::Adopted
     ));
 
-    let worker_successor = stable
-        .mint_membership(&worker_id)
-        .expect("adopted worker lineage remains mintable")
-        .into_pair()
-        .0;
-    let other = stable
-        .mint_membership(&other_id)
-        .expect("unrelated child identity remains mintable")
-        .into_pair()
-        .0;
+    let worker_successor = stable.mint_membership(&worker_id).into_pair().0;
+    let other = stable.mint_membership(&other_id).into_pair().0;
 
     assert!(worker_successor.supersedes(declared));
     assert!(!other.supersedes(declared));

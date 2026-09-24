@@ -570,7 +570,17 @@ fn withdraw_send_with<M: Send + 'static>(
             let finish_panic = crate::runtime::catch_panic(|| withdrawal.finish()).err();
             crate::runtime::discard_panic(finish_panic);
         }
-        WithdrawalDisposition::Isolated => withdrawal.finish(),
+        WithdrawalDisposition::Isolated => {
+            // Isolation submits the waker to runtime disposal. If that
+            // submission panics, the recovered message must not unwind with
+            // it on this stack: submit it as well, then resume the first
+            // panic.
+            if let Err(panic) = crate::runtime::catch_panic(|| withdrawal.finish()) {
+                let disposal = crate::runtime::catch_panic(|| send.mailbox.dispose(result)).err();
+                crate::runtime::discard_panic(disposal);
+                crate::runtime::resume_panic(panic);
+            }
+        }
     }
     result
 }
@@ -1349,8 +1359,10 @@ mod tests {
         }
     }
 
+    /// Runtime whose first `panics` disposal submissions panic.
     struct PanickingDisposeRuntime {
         inner: Arc<dyn crate::mailbox::MailboxRuntime>,
+        panics: AtomicUsize,
     }
 
     impl crate::mailbox::MailboxRuntime for PanickingDisposeRuntime {
@@ -1367,8 +1379,15 @@ mod tests {
             self.inner.signal()
         }
 
-        fn dispose(&self, _value: Box<dyn Send + 'static>) {
-            panic!("injected isolated disposal submission panic");
+        fn dispose(&self, value: Box<dyn Send + 'static>) {
+            if self
+                .panics
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                panic!("injected isolated disposal submission panic");
+            }
+            self.inner.dispose(value);
         }
 
         fn now(&self) -> std::time::Instant {
@@ -1530,6 +1549,7 @@ mod tests {
     fn isolated_withdrawal_preserves_a_disposal_submission_diagnostic() {
         let runtime = Arc::new(PanickingDisposeRuntime {
             inner: crate::mailbox::capability::tests::runtime(),
+            panics: AtomicUsize::new(usize::MAX),
         });
         let (_mailbox, actor): (Arc<MailboxCell<u8>>, ActorRef<u8>) =
             actor_for_with_runtime(runtime);
@@ -1547,6 +1567,40 @@ mod tests {
         assert_eq!(
             panic.downcast_ref::<&'static str>().copied(),
             Some("injected isolated disposal submission panic")
+        );
+    }
+
+    #[test]
+    fn a_panicking_waker_disposal_submission_still_isolates_the_recovered_message() {
+        let runtime = Arc::new(PanickingDisposeRuntime {
+            inner: crate::mailbox::capability::tests::runtime(),
+            panics: AtomicUsize::new(1),
+        });
+        let (_mailbox, actor): (
+            Arc<MailboxCell<ThreadRecordingDrop>>,
+            ActorRef<ThreadRecordingDrop>,
+        ) = actor_for_with_runtime(runtime);
+        let message_thread = disposal_thread();
+        let mut send = Box::pin(actor.send(ThreadRecordingDrop(message_thread.clone())));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ =
+                super::withdraw_send_with(send.as_mut().get_mut(), WithdrawalDisposition::Isolated);
+        }))
+        .expect_err("the waker's disposal submission panic reaches the caller");
+        assert_eq!(
+            panic.downcast_ref::<&'static str>().copied(),
+            Some("injected isolated disposal submission panic")
+        );
+        assert_ne!(
+            await_disposal(&message_thread),
+            std::thread::current().id(),
+            "the recovered message is submitted rather than unwound on the caller"
         );
     }
 

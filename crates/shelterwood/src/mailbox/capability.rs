@@ -1,127 +1,77 @@
-use std::{
-    marker::PhantomData,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+//! Reply-channel receive state over the adapter's typed one-shot.
+//!
+//! The mailbox reaches the runtime through the façade's `crate::runtime`
+//! module like every other layer; this module only adds the reply seam's own
+//! caller-waker venue on top of the adapter's receiver.
 
-#[cfg(test)]
-use shelterwood_core::{BoxedSleep, MailboxSignal, MailboxSignalWatcher};
+use std::task::{Context, Poll};
+
 use shelterwood_core::{
-    ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue, MailboxRuntime,
     ProxiedPoll,
     waker::{WakerAction, WakerEffects},
 };
 
-use crate::runtime::PanicAccumulator;
+use crate::runtime::{OneShotClose, OneShotReceiver, PanicAccumulator, dispose_detached};
 
-fn downcast<T: Send + 'static>(value: ErasedValue) -> T {
-    *value
-        .downcast::<T>()
-        .unwrap_or_else(|_| panic!("mailbox runtime returned a mismatched one-shot value"))
+/// The receive edges a [`DisposingReceiver`] drives.
+///
+/// Production uses the adapter's typed [`OneShotReceiver`]. The parameter
+/// exists so this crate's tests can script the ready, close, and arbitration
+/// edges that `ProxiedPoll` retires on; it is resolved statically and is not a
+/// runtime seam.
+pub(crate) trait OneShotReceive<T> {
+    fn poll_receive(&mut self, context: &mut Context<'_>) -> Poll<Option<T>>;
+    fn close_and_poll_receive(&mut self, context: &mut Context<'_>) -> OneShotClose<T>;
+    fn close(&mut self);
+    fn close_and_take(&mut self) -> Option<T>;
 }
 
-pub(crate) struct OneShotSender<T> {
-    inner: Box<dyn ErasedOneShotSender>,
-    marker: PhantomData<fn(T)>,
-}
-
-pub(crate) struct OneShotReceiver<T> {
-    inner: Pin<Box<dyn ErasedOneShotReceiver>>,
-    marker: PhantomData<fn(T)>,
-}
-
-pub(crate) enum OneShotClose<T> {
-    Value(T),
-    SenderClosed,
-    Empty,
-    Pending,
-}
-
-pub(crate) fn oneshot<T: Send + 'static>(
-    runtime: &Arc<dyn MailboxRuntime>,
-) -> (OneShotSender<T>, OneShotReceiver<T>) {
-    let (sender, receiver) = runtime.oneshot();
-    (
-        OneShotSender {
-            inner: sender,
-            marker: PhantomData,
-        },
-        OneShotReceiver {
-            inner: receiver,
-            marker: PhantomData,
-        },
-    )
-}
-
-impl<T: Send + 'static> OneShotSender<T> {
-    pub(crate) fn send(self, value: T) -> Result<(), T> {
-        self.inner.send(Box::new(value)).map_err(downcast::<T>)
-    }
-}
-
-impl<T: Send + 'static> OneShotReceiver<T> {
-    pub(crate) fn poll_receive(&mut self, context: &mut Context<'_>) -> Poll<Option<T>> {
-        self.inner
-            .as_mut()
-            .poll_receive(context)
-            .map(|value| value.map(downcast::<T>))
+impl<T> OneShotReceive<T> for OneShotReceiver<T> {
+    fn poll_receive(&mut self, context: &mut Context<'_>) -> Poll<Option<T>> {
+        Self::poll_receive(self, context)
     }
 
-    pub(crate) fn close_and_poll_receive(&mut self, context: &mut Context<'_>) -> OneShotClose<T> {
-        match self.inner.as_mut().close_and_poll_receive(context) {
-            ErasedOneShotClose::Value(value) => OneShotClose::Value(downcast(value)),
-            ErasedOneShotClose::SenderClosed => OneShotClose::SenderClosed,
-            ErasedOneShotClose::Empty => OneShotClose::Empty,
-            ErasedOneShotClose::Pending => OneShotClose::Pending,
-        }
-    }
-}
-
-impl<T> OneShotReceiver<T> {
-    pub(crate) fn close(&mut self) {
-        self.inner.as_mut().close();
+    fn close_and_poll_receive(&mut self, context: &mut Context<'_>) -> OneShotClose<T> {
+        Self::close_and_poll_receive(self, context)
     }
 
-    fn close_and_take_erased(&mut self) -> Option<ErasedValue> {
-        self.inner.as_mut().close_and_take()
+    fn close(&mut self) {
+        Self::close(self);
     }
-}
 
-pub(crate) fn dispose_value<T: Send + 'static>(runtime: &dyn MailboxRuntime, value: T) {
-    runtime.dispose(Box::new(value));
-}
-
-pub(crate) fn dispose<T: Send + 'static>(runtime: &Arc<dyn MailboxRuntime>, value: T) {
-    dispose_value(runtime.as_ref(), value);
+    fn close_and_take(&mut self) -> Option<T> {
+        Self::close_and_take(self)
+    }
 }
 
 /// Receive state that keeps an unclaimed user value out of holder drop glue.
-pub(crate) struct DisposingReceiver<T> {
-    inner: Option<OneShotReceiver<T>>,
-    runtime: Arc<dyn MailboxRuntime>,
+///
+/// This differs from the adapter's `DisposingReceiver` in venue, not only in
+/// surface: cancellation here retires the caller waker inline (see the `Drop`
+/// implementation), while the adapter's wrapper hands it to the disposal lane.
+/// The disposal function is captured at construction, where `T: Send +
+/// 'static` holds, so the unbounded public holders need not repeat that bound.
+pub(crate) struct DisposingReceiver<T, R: OneShotReceive<T> = OneShotReceiver<T>> {
+    inner: Option<R>,
+    dispose: fn(T),
     reply_poll: ProxiedPoll,
 }
 
-impl<T: Send + 'static> DisposingReceiver<T> {
-    pub(crate) fn new(inner: OneShotReceiver<T>, runtime: Arc<dyn MailboxRuntime>) -> Self {
+impl<T: Send + 'static, R: OneShotReceive<T>> DisposingReceiver<T, R> {
+    pub(crate) fn new(inner: R) -> Self {
         Self {
             inner: Some(inner),
-            runtime,
+            dispose: dispose_detached::<T>,
             reply_poll: ProxiedPoll::new(),
         }
     }
 }
 
-impl<T> DisposingReceiver<T> {
-    fn inner_mut(&mut self) -> &mut OneShotReceiver<T> {
+impl<T, R: OneShotReceive<T>> DisposingReceiver<T, R> {
+    fn inner_mut(&mut self) -> &mut R {
         self.inner
             .as_mut()
             .expect("a live disposing receiver retains its channel")
-    }
-
-    pub(crate) fn runtime(&self) -> Arc<dyn MailboxRuntime> {
-        Arc::clone(&self.runtime)
     }
 
     pub(crate) fn close(&mut self) {
@@ -163,14 +113,14 @@ impl<T> DisposingReceiver<T> {
     }
 }
 
-impl<T: Send + 'static> DisposingReceiver<T> {
+impl<T: Send + 'static, R: OneShotReceive<T>> DisposingReceiver<T, R> {
     pub(crate) fn poll_receive(&mut self, context: &mut Context<'_>) -> Poll<Option<T>> {
-        // In pinned Tokio 1.53.1, `Receiver::poll` first obtains the result,
-        // then clears its `Inner`; the last `Inner::drop` calls
-        // `rx_task.drop_task` while that result can own the delivered value.
-        // Probe with a framework waker, then leave only the proxy registered
-        // across a pending return so Tokio never destroys a caller waker at
-        // that seam.
+        // The adapter's receiver documents the pinned Tokio 1.53.1 delivery
+        // seam: `Receiver::poll` obtains the result before its last
+        // `Inner::drop` calls `rx_task.drop_task`, while that result can own
+        // the delivered value. Probing with a framework waker and leaving only
+        // the proxy registered across a pending return keeps Tokio from ever
+        // destroying a caller waker there.
         // Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
         // A ready result may own a user value; `ProxiedPoll::poll` retires
         // the caller registration synchronously and contains any hostile
@@ -181,7 +131,7 @@ impl<T: Send + 'static> DisposingReceiver<T> {
                 .as_mut()
                 .expect("a live disposing receiver retains its channel"),
             context,
-            OneShotReceiver::poll_receive,
+            R::poll_receive,
             Poll::is_pending,
         )
     }
@@ -195,13 +145,13 @@ impl<T: Send + 'static> DisposingReceiver<T> {
                 .as_mut()
                 .expect("a live disposing receiver retains its channel"),
             context,
-            OneShotReceiver::close_and_poll_receive,
+            R::close_and_poll_receive,
             |result| matches!(result, OneShotClose::Pending),
         )
     }
 }
 
-impl<T> Drop for DisposingReceiver<T> {
+impl<T, R: OneShotReceive<T>> Drop for DisposingReceiver<T, R> {
     fn drop(&mut self) {
         let mut inner = self
             .inner
@@ -233,198 +183,16 @@ impl<T> Drop for DisposingReceiver<T> {
         // rather than through the isolated lane: accepted, because reaching
         // it requires a destructor that has already panicked, and the
         // alternative is retrying a step that just failed.
-        panics.run(|| value = inner.close_and_take_erased());
-        // `MailboxRuntime::dispose` is the non-critical lane: the Tokio
-        // adapter routes it through `dispose_detached`, which (unlike
-        // `dispose_critical`) finishes the value on this thread once task and
-        // native-thread creation are both exhausted. That inline destruction
-        // contains its own destructor panic, but the capability is a trait
-        // seam whose submission can still unwind, so it belongs inside the
-        // boundary too.
+        panics.run(|| value = inner.close_and_take());
+        // `dispose_detached` contains its own submission failures and cannot
+        // unwind; the boundary is the cheapest safe fallback, kept so this
+        // drop glue does not rest on that proof.
         panics.run(|| {
             if let Some(value) = value {
-                self.runtime.dispose(value);
+                (self.dispose)(value);
             }
         });
         panics.run(|| drop(inner));
         self.retire_reply_waker(&mut panics);
-    }
-}
-
-/// The capability object this crate's own tests run against.
-///
-/// The binding is built only as delegation to the same adapter primitives
-/// production uses: restating one-shot, signal, or clock semantics in a
-/// hand-written double would let a divergence from the adapter read as a
-/// passing test. The wrapper exists because focused mailbox tests need to
-/// replace one capability while every other operation keeps the real adapter.
-///
-/// These adapter-integration tests stay in the façade so core itself retains
-/// no dev-dependencies.
-#[cfg(test)]
-pub(crate) mod tests {
-    use std::{
-        future::Future,
-        pin::Pin,
-        sync::Arc,
-        task::{Context, Poll},
-        time::Instant,
-    };
-
-    use crate::runtime::{
-        OneShotClose, OneShotReceiver, OneShotSender, Signal, SignalWatcher, dispose_detached, now,
-        oneshot, raw_sleep_until,
-    };
-
-    use super::{
-        BoxedSleep, ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
-        MailboxRuntime, MailboxSignal, MailboxSignalWatcher,
-    };
-
-    type ErasedOneShot = (
-        Box<dyn ErasedOneShotSender>,
-        Pin<Box<dyn ErasedOneShotReceiver>>,
-    );
-
-    type OneShotHook = dyn Fn() -> ErasedOneShot + Send + Sync;
-    type NowHook = dyn Fn() -> Instant + Send + Sync;
-
-    /// The one mailbox runtime used by this crate's tests. Optional hooks let
-    /// a focused test control one capability while every other method keeps
-    /// using the real runtime adapter primitives below.
-    pub(crate) struct TestRuntime {
-        oneshot: Option<Box<OneShotHook>>,
-        now: Option<Box<NowHook>>,
-    }
-
-    impl TestRuntime {
-        pub(crate) fn new() -> Self {
-            Self {
-                oneshot: None,
-                now: None,
-            }
-        }
-
-        pub(crate) fn with_oneshot(
-            mut self,
-            oneshot: impl Fn() -> ErasedOneShot + Send + Sync + 'static,
-        ) -> Self {
-            self.oneshot = Some(Box::new(oneshot));
-            self
-        }
-
-        pub(crate) fn with_now(
-            mut self,
-            now: impl Fn() -> Instant + Send + Sync + 'static,
-        ) -> Self {
-            self.now = Some(Box::new(now));
-            self
-        }
-    }
-
-    impl MailboxRuntime for TestRuntime {
-        fn oneshot(
-            &self,
-        ) -> (
-            Box<dyn ErasedOneShotSender>,
-            Pin<Box<dyn ErasedOneShotReceiver>>,
-        ) {
-            if let Some(oneshot) = &self.oneshot {
-                return oneshot();
-            }
-            let (sender, receiver) = oneshot();
-            (
-                Box::new(AdapterOneShotSender(sender)),
-                Box::pin(AdapterOneShotReceiver(receiver)),
-            )
-        }
-
-        fn signal(&self) -> Arc<dyn MailboxSignal> {
-            Arc::new(AdapterSignal(Signal::default()))
-        }
-
-        fn dispose(&self, value: Box<dyn Send + 'static>) {
-            dispose_detached(value);
-        }
-
-        fn now(&self) -> Instant {
-            self.now.as_ref().map_or_else(now, |now| now())
-        }
-
-        fn sleep_until(&self, deadline: Option<Instant>) -> BoxedSleep {
-            deadline.map_or_else(
-                || Box::pin(std::future::pending()) as BoxedSleep,
-                raw_sleep_until,
-            )
-        }
-    }
-
-    struct AdapterOneShotSender(OneShotSender<ErasedValue>);
-
-    impl ErasedOneShotSender for AdapterOneShotSender {
-        fn send(self: Box<Self>, value: ErasedValue) -> Result<(), ErasedValue> {
-            self.0.send(value)
-        }
-    }
-
-    pub(crate) struct AdapterOneShotReceiver(OneShotReceiver<ErasedValue>);
-
-    impl AdapterOneShotReceiver {
-        pub(crate) fn new(receiver: OneShotReceiver<ErasedValue>) -> Self {
-            Self(receiver)
-        }
-    }
-
-    impl ErasedOneShotReceiver for AdapterOneShotReceiver {
-        fn poll_receive(
-            mut self: Pin<&mut Self>,
-            context: &mut Context<'_>,
-        ) -> Poll<Option<ErasedValue>> {
-            self.0.poll_receive(context)
-        }
-
-        fn close_and_poll_receive(
-            mut self: Pin<&mut Self>,
-            context: &mut Context<'_>,
-        ) -> ErasedOneShotClose {
-            match self.0.close_and_poll_receive(context) {
-                OneShotClose::Value(value) => ErasedOneShotClose::Value(value),
-                OneShotClose::SenderClosed => ErasedOneShotClose::SenderClosed,
-                OneShotClose::Empty => ErasedOneShotClose::Empty,
-                OneShotClose::Pending => ErasedOneShotClose::Pending,
-            }
-        }
-
-        fn close(mut self: Pin<&mut Self>) {
-            self.0.close();
-        }
-
-        fn close_and_take(mut self: Pin<&mut Self>) -> Option<ErasedValue> {
-            self.0.close_and_take()
-        }
-    }
-
-    struct AdapterSignal(Signal);
-
-    impl MailboxSignal for AdapterSignal {
-        fn pulse(&self) {
-            self.0.pulse();
-        }
-
-        fn watcher(&self) -> Box<dyn MailboxSignalWatcher> {
-            Box::new(AdapterSignalWatcher(self.0.watcher()))
-        }
-    }
-
-    struct AdapterSignalWatcher(SignalWatcher);
-
-    impl MailboxSignalWatcher for AdapterSignalWatcher {
-        fn changed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-            Box::pin(self.0.changed())
-        }
-    }
-
-    pub(crate) fn runtime() -> Arc<dyn MailboxRuntime> {
-        Arc::new(TestRuntime::new())
     }
 }

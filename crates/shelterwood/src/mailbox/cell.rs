@@ -6,18 +6,18 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
 };
 
 use crate::{
     identity::{AtomicMonotonicCounter, ChildId, Incarnation, MonotonicCounter},
     mailbox::{
         MailboxBindToken, MailboxClose, MailboxControl, MailboxDisposal, MailboxEffectQueue,
-        MailboxEffectSink, MailboxRuntime, MailboxSignal, MailboxSignalWatcher, MailboxTermination,
-        capability::{dispose, dispose_value},
+        MailboxEffectSink, MailboxTermination,
     },
     policy::ResolvedMailbox,
-    runtime::{PanicAccumulator, PanicPayload, resume_panic},
+    runtime::{
+        PanicAccumulator, PanicPayload, Signal, SignalWatcher, dispose_detached, resume_panic,
+    },
 };
 use shelterwood_core::waker::{WakerAction, WakerEffects, WakerSlot};
 
@@ -447,10 +447,12 @@ impl<M> MailboxEffectPayload<M> {
 /// `MailboxTxn` owns this sink beside the guard and drops the guard first.
 /// Locked transition code can only enqueue effects; pulse callbacks, waker
 /// vtables, payload destructors, and runtime disposal all run during flush.
-/// The sink borrows its mailbox rather than cloning the capability handles out
-/// of it: it never outlives the `MailboxTxn` that owns it, and every mailbox
+/// The sink borrows its mailbox rather than cloning the change signal out of
+/// it: it never outlives the `MailboxTxn` that owns it, and every mailbox
 /// transition — including the per-message receive path — would otherwise pay
-/// two atomic refcount pairs to restate what the transaction already holds.
+/// refcount traffic to restate what the transaction already holds. Only a
+/// flush deferred into a wider framework sink, which outlives the borrow,
+/// clones the signal handle.
 struct MailboxEffects<'a, 's, M: Send + 'static> {
     cell: &'a MailboxCell<M>,
     external: Option<&'s mut dyn MailboxEffectSink>,
@@ -505,25 +507,16 @@ impl<M: Send + 'static> Drop for MailboxEffects<'_, '_, M> {
         if self.payload.is_empty() {
             return;
         }
-        let batch = MailboxEffectBatch {
-            changed: Arc::clone(&self.cell.changed),
-            runtime: Arc::clone(&self.cell.runtime),
-            payload: std::mem::take(&mut self.payload),
-        };
+        let payload = std::mem::take(&mut self.payload);
         if let Some(external) = self.external.take() {
+            let changed = self.cell.changed.clone();
             external.defer_mailbox_effect(Box::new(move || {
-                batch.flush();
+                payload.flush(&changed);
             }));
             return;
         }
-        batch.flush();
+        payload.flush(&self.cell.changed);
     }
-}
-
-struct MailboxEffectBatch<M> {
-    changed: Arc<dyn MailboxSignal>,
-    runtime: Arc<dyn MailboxRuntime>,
-    payload: MailboxEffectPayload<M>,
 }
 
 /// A received message, held outside the transaction that dequeued it.
@@ -533,26 +526,21 @@ struct MailboxEffectBatch<M> {
 /// payload in the post-unlock flush — drops the transaction first and then
 /// submits the message for detached disposal instead of destroying it on the
 /// receiving caller's stack.
-struct ReturnedMessage<'a, M: Send + 'static> {
+struct ReturnedMessage<M: Send + 'static> {
     value: Option<M>,
-    runtime: &'a Arc<dyn MailboxRuntime>,
 }
 
-impl<M: Send + 'static> Drop for ReturnedMessage<'_, M> {
+impl<M: Send + 'static> Drop for ReturnedMessage<M> {
     fn drop(&mut self) {
         if let Some(value) = self.value.take() {
-            dispose(self.runtime, value);
+            dispose_detached(value);
         }
     }
 }
 
-impl<M: Send + 'static> MailboxEffectBatch<M> {
-    fn flush(self) {
-        let Self {
-            changed,
-            runtime,
-            mut payload,
-        } = self;
+impl<M: Send + 'static> MailboxEffectPayload<M> {
+    fn flush(self, changed: &Signal) {
+        let mut payload = self;
         let mut panics = PanicAccumulator::default();
         if payload.pulse {
             panics.run(|| changed.pulse());
@@ -562,12 +550,7 @@ impl<M: Send + 'static> MailboxEffectBatch<M> {
         // not race ahead of disposal submission.
         if payload.isolate_displaced && !payload.displaced.is_empty() {
             let isolated = std::mem::take(&mut payload.displaced);
-            panics.run(|| {
-                dispose_value(
-                    runtime.as_ref(),
-                    MailboxPayload::unread(isolated.into(), None),
-                );
-            });
+            panics.run(|| dispose_detached(MailboxPayload::unread(isolated.into(), None)));
         }
         payload.wakers.flush(&mut panics);
         if !payload.isolate_displaced {
@@ -750,8 +733,7 @@ impl<M> Drop for MailboxPayload<M> {
 }
 
 struct MailboxTeardown<M: Send + 'static> {
-    runtime: Arc<dyn MailboxRuntime>,
-    changed: Option<Arc<dyn MailboxSignal>>,
+    changed: Option<Signal>,
     payload: Option<MailboxPayload<M>>,
     termination: Option<Termination<M>>,
 }
@@ -786,7 +768,7 @@ impl<M: Send + 'static> MailboxTermination for MailboxTeardown<M> {
             .map(|payload| Box::new(payload) as MailboxDisposal)
             .expect("mailbox teardown retains its payload until finish");
         if let Some(panic) = panic {
-            self.runtime.dispose(payload);
+            dispose_detached(payload);
             resume_panic(panic);
         }
         payload
@@ -798,7 +780,7 @@ impl<M: Send + 'static> Drop for MailboxTeardown<M> {
         let mut panics = PanicAccumulator::default();
         panics.record(self.finish_framework());
         if let Some(payload) = self.payload.take() {
-            dispose(&self.runtime, payload);
+            dispose_detached(payload);
         }
     }
 }
@@ -812,8 +794,7 @@ pub(crate) struct MailboxCell<M> {
     pub(super) actor_id: ChildId,
     pub(super) state: Mutex<MailboxState<M>>,
     accepted: AtomicMonotonicCounter,
-    runtime: Arc<dyn MailboxRuntime>,
-    changed: Arc<dyn MailboxSignal>,
+    changed: Signal,
 }
 
 impl<M> fmt::Debug for MailboxCell<M> {
@@ -826,10 +807,7 @@ impl<M> fmt::Debug for MailboxCell<M> {
 }
 
 impl<M: Send + 'static> MailboxCell<M> {
-    // Only the façade can pair a mailbox with the runtime capability object
-    // selected by its private adapter.
-    pub(crate) fn new(actor_id: ChildId, runtime: Arc<dyn MailboxRuntime>) -> Arc<Self> {
-        let changed = runtime.signal();
+    pub(crate) fn new(actor_id: ChildId) -> Arc<Self> {
         Arc::new(Self {
             actor_id,
             state: Mutex::new(MailboxState {
@@ -842,8 +820,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                 latest: None,
             }),
             accepted: AtomicMonotonicCounter::new(),
-            runtime,
-            changed,
+            changed: Signal::default(),
         })
     }
 
@@ -904,10 +881,7 @@ impl<M: Send + 'static> MailboxCell<M> {
     fn receive(&self, incarnation: Incarnation, mode: ReceiveMode) -> Option<M> {
         // Declared before the transaction so it drops after it: see
         // `ReturnedMessage`.
-        let mut returned = ReturnedMessage {
-            value: None,
-            runtime: &self.runtime,
-        };
+        let mut returned = ReturnedMessage { value: None };
         let mut transaction = MailboxTxn::new(self);
         let (binding, live) = match transaction.phase {
             Phase::Bound(binding) if binding.incarnation == incarnation => (binding, true),
@@ -943,26 +917,12 @@ impl<M: Send + 'static> MailboxCell<M> {
             .observation()
     }
 
-    fn watcher(&self) -> Box<dyn MailboxSignalWatcher> {
+    fn watcher(&self) -> SignalWatcher {
         self.changed.watcher()
     }
 
     fn accepted_sequence(&self) -> AcceptedSequence {
         AcceptedSequence(self.accepted.load(Ordering::Acquire))
-    }
-}
-
-impl<M> MailboxCell<M> {
-    pub(super) fn runtime(&self) -> Arc<dyn MailboxRuntime> {
-        Arc::clone(&self.runtime)
-    }
-
-    pub(super) fn now(&self) -> Instant {
-        self.runtime.now()
-    }
-
-    pub(super) fn dispose<T: Send + 'static>(&self, value: T) {
-        dispose_value(self.runtime.as_ref(), value);
     }
 }
 
@@ -1021,9 +981,7 @@ impl<M: Send + 'static> MailboxCell<M> {
             // Acceptance and termination took the waker in the critical
             // section that published their outcome, so this is normally
             // empty for them.
-            state
-                .waker
-                .take(disposition.action(&self.runtime), &mut waker_effects);
+            state.waker.take(disposition.action(), &mut waker_effects);
             (outcome, state.registration.take())
         };
         // Promotion clears a registration under this lock before it leaves
@@ -1142,10 +1100,9 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         transaction.effects.pulse();
         let disposal = Box::new(payload) as MailboxDisposal;
         // The close result outlives this transaction's effect flush at every
-        // caller, so it carries the disposal capability that isolates the
-        // unread payload if that flush unwinds.
-        let runtime = Arc::clone(&transaction.effects.cell.runtime);
-        transaction.finish(Some(MailboxClose::new(token, disposal, runtime)))
+        // caller, so its drop isolates the unread payload if that flush
+        // unwinds.
+        transaction.finish(Some(MailboxClose::new(token, disposal)))
     }
 
     fn prepare_termination(
@@ -1169,8 +1126,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             final_incarnation,
         };
         let teardown = Some(Box::new(MailboxTeardown {
-            runtime: Arc::clone(&self.runtime),
-            changed: Some(Arc::clone(&self.changed)),
+            changed: Some(self.changed.clone()),
             payload: Some(payload),
             termination: Some(termination),
         }) as Box<dyn MailboxTermination>);
@@ -1262,10 +1218,10 @@ pub(super) enum WithdrawalDisposition {
 }
 
 impl WithdrawalDisposition {
-    fn action(self, runtime: &Arc<dyn MailboxRuntime>) -> WakerAction {
+    fn action(self) -> WakerAction {
         match self {
             Self::Inline => WakerAction::DropInline,
-            Self::Isolated => WakerAction::Dispose(Arc::clone(runtime)),
+            Self::Isolated => WakerAction::Run(crate::runtime::dispose_waker),
         }
     }
 }
@@ -1310,7 +1266,7 @@ pub(super) enum WithdrawalOutcome<M> {
 pub(crate) struct MailboxReceiver<M> {
     mailbox: Arc<MailboxCell<M>>,
     incarnation: Incarnation,
-    watcher: Box<dyn MailboxSignalWatcher>,
+    watcher: SignalWatcher,
 }
 
 impl<M: Send + 'static> MailboxReceiver<M> {

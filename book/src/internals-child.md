@@ -15,8 +15,7 @@ a shared `BuilderCore` (`plan.rs`). Reserving or adding a child mints its
 `Membership` immediately from the parent's scope identity and creates a
 `SlotCell` — which is why cyclic wiring works: `ActorRef` handles exist
 at declaration time, before anything runs. Attaching an actor definition
-is also the moment its `MailboxCell<M>` is created and paired with the
-runtime capability object (`tree/slots.rs`).
+is also the moment its `MailboxCell<M>` is created (`tree/slots.rs`).
 
 `Tree::spawn` first checks that a runtime is ambient (else
 `BuildError::NoRuntime`), then *lowers* the declaration:

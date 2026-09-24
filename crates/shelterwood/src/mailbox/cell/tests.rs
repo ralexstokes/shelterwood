@@ -4,16 +4,17 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         mpsc,
     },
     task::{Context, Poll, Wake, Waker},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::{
     mailbox::{ActorRef, ChildId, Incarnation, MailboxControl, MailboxReceiver, SendErrorKind},
     policy::{ResolvedDefaults, ResolvedMailbox},
+    runtime::SignalWatcher,
     test_support::{mint_actor_incarnation, mint_actor_membership},
 };
 
@@ -85,101 +86,30 @@ enum BindEffectEvent {
     SenderWoken,
 }
 
-struct BindOrderingRuntime {
-    inner: Arc<dyn crate::mailbox::MailboxRuntime>,
-    events: Arc<Mutex<Vec<BindEffectEvent>>>,
-}
+/// A waker whose `wake` panics, registered on a mailbox's change signal so
+/// the next pulse genuinely unwinds out of the adapter's `wake_all`.
+struct PulsePanicWake;
 
-impl crate::mailbox::MailboxRuntime for BindOrderingRuntime {
-    fn oneshot(
-        &self,
-    ) -> (
-        Box<dyn shelterwood_core::ErasedOneShotSender>,
-        Pin<Box<dyn shelterwood_core::ErasedOneShotReceiver>>,
-    ) {
-        self.inner.oneshot()
-    }
-
-    fn signal(&self) -> Arc<dyn crate::mailbox::MailboxSignal> {
-        Arc::new(BindOrderingSignal {
-            inner: self.inner.signal(),
-            events: Arc::clone(&self.events),
-        })
-    }
-
-    fn dispose(&self, value: Box<dyn Send + 'static>) {
-        self.events
-            .lock()
-            .expect("bind effect recorder mutex")
-            .push(BindEffectEvent::DisposalSubmitted);
-        self.inner.dispose(value);
-    }
-
-    fn now(&self) -> Instant {
-        self.inner.now()
-    }
-
-    fn sleep_until(&self, deadline: Option<Instant>) -> shelterwood_core::BoxedSleep {
-        self.inner.sleep_until(deadline)
+impl Wake for PulsePanicWake {
+    fn wake(self: Arc<Self>) {
+        panic!("injected mailbox pulse panic");
     }
 }
 
-/// Runtime whose change signal panics once armed, so a mailbox effect
-/// flush can be made to unwind on demand.
-struct PanickingPulseRuntime {
-    inner: Arc<dyn crate::mailbox::MailboxRuntime>,
-    armed: Arc<AtomicBool>,
-    disposals: Arc<AtomicUsize>,
-}
-
-impl crate::mailbox::MailboxRuntime for PanickingPulseRuntime {
-    fn oneshot(
-        &self,
-    ) -> (
-        Box<dyn shelterwood_core::ErasedOneShotSender>,
-        Pin<Box<dyn shelterwood_core::ErasedOneShotReceiver>>,
-    ) {
-        self.inner.oneshot()
-    }
-
-    fn signal(&self) -> Arc<dyn crate::mailbox::MailboxSignal> {
-        Arc::new(PanickingPulseSignal {
-            inner: self.inner.signal(),
-            armed: Arc::clone(&self.armed),
-        })
-    }
-
-    fn dispose(&self, value: Box<dyn Send + 'static>) {
-        self.disposals.fetch_add(1, Ordering::SeqCst);
-        self.inner.dispose(value);
-    }
-
-    fn now(&self) -> Instant {
-        self.inner.now()
-    }
-
-    fn sleep_until(&self, deadline: Option<Instant>) -> shelterwood_core::BoxedSleep {
-        self.inner.sleep_until(deadline)
-    }
-}
-
-struct PanickingPulseSignal {
-    inner: Arc<dyn crate::mailbox::MailboxSignal>,
-    armed: Arc<AtomicBool>,
-}
-
-impl crate::mailbox::MailboxSignal for PanickingPulseSignal {
-    fn pulse(&self) {
-        assert!(
-            !self.armed.load(Ordering::SeqCst),
-            "injected mailbox pulse panic"
-        );
-        self.inner.pulse();
-    }
-
-    fn watcher(&self) -> Box<dyn crate::mailbox::MailboxSignalWatcher> {
-        self.inner.watcher()
-    }
+/// Parks a hostile waker on `watcher`'s change signal. The returned wait must
+/// stay alive across the pulse it arms; the pulse wakes every waiter and then
+/// resumes the hostile waker's panic, as a raw actor polling `recv` with its
+/// own waker would make it.
+fn arm_pulse_panic(watcher: &mut SignalWatcher) -> Pin<Box<impl Future<Output = ()> + '_>> {
+    let mut changed = Box::pin(watcher.changed());
+    let hostile = Waker::from(Arc::new(PulsePanicWake));
+    assert!(
+        changed
+            .as_mut()
+            .poll(&mut Context::from_waker(&hostile))
+            .is_pending()
+    );
+    changed
 }
 
 /// User message recording the thread its destructor ran on.
@@ -193,23 +123,30 @@ impl Drop for ThreadRecordingMessage {
     }
 }
 
-struct BindOrderingSignal {
-    inner: Arc<dyn crate::mailbox::MailboxSignal>,
-    events: Arc<Mutex<Vec<BindEffectEvent>>>,
-}
-
-impl crate::mailbox::MailboxSignal for BindOrderingSignal {
-    fn pulse(&self) {
-        self.events
-            .lock()
-            .expect("bind effect recorder mutex")
-            .push(BindEffectEvent::SignalPulsed);
-        self.inner.pulse();
-    }
-
-    fn watcher(&self) -> Box<dyn crate::mailbox::MailboxSignalWatcher> {
-        self.inner.watcher()
-    }
+/// Records this thread's signal pulses and disposal submissions into `events`
+/// until the returned guards drop.
+fn record_bind_effects(
+    events: &Arc<Mutex<Vec<BindEffectEvent>>>,
+) -> (
+    crate::runtime::hooks::HookGuard,
+    crate::runtime::hooks::HookGuard,
+) {
+    let pulses = Arc::clone(events);
+    let disposals = Arc::clone(events);
+    (
+        crate::runtime::hooks::record_pulses(move || {
+            pulses
+                .lock()
+                .expect("bind effect recorder mutex")
+                .push(BindEffectEvent::SignalPulsed);
+        }),
+        crate::runtime::hooks::record_disposals(move || {
+            disposals
+                .lock()
+                .expect("bind effect recorder mutex")
+                .push(BindEffectEvent::DisposalSubmitted);
+        }),
+    )
 }
 
 struct BindOrderingWake(Arc<Mutex<Vec<BindEffectEvent>>>);
@@ -269,21 +206,15 @@ impl Drop for ReentrantPanicDrop {
     }
 }
 
-pub(crate) fn actor_for_with_runtime<M: Send + 'static>(
-    runtime: Arc<dyn crate::mailbox::MailboxRuntime>,
-) -> (Arc<MailboxCell<M>>, ActorRef<M>) {
+pub(crate) fn actor_for<M: Send + 'static>() -> (Arc<MailboxCell<M>>, ActorRef<M>) {
     let id = ChildId::from("actor");
     let identity = crate::identity::ScopeIdentity::new().mint_membership(&id);
     let member = crate::cells::MemberCell::new(identity);
-    let mailbox = MailboxCell::new(id, runtime);
+    let mailbox = MailboxCell::new(id);
     (
         Arc::clone(&mailbox),
         crate::mailbox::actor_ref_from_parts(member, mailbox),
     )
-}
-
-pub(crate) fn actor_for<M: Send + 'static>() -> (Arc<MailboxCell<M>>, ActorRef<M>) {
-    actor_for_with_runtime(crate::mailbox::capability::tests::runtime())
 }
 
 pub(crate) fn actor() -> (Arc<MailboxCell<u8>>, ActorRef<u8>) {
@@ -354,10 +285,7 @@ impl Drop for TrackedMessage {
 fn freeze_and_close_preserve_waiters_payloads_and_incarnation_boundaries() {
     let drops = Arc::new(AtomicUsize::new(0));
     let (first, second) = two_incarnations();
-    let mailbox = MailboxCell::new(
-        ChildId::from("actor"),
-        crate::mailbox::capability::tests::runtime(),
-    );
+    let mailbox = MailboxCell::new(ChildId::from("actor"));
     let token = configure(
         &mailbox,
         ResolvedMailbox::Queue(std::num::NonZeroUsize::new(1).expect("non-zero queue capacity")),
@@ -458,10 +386,7 @@ fn freeze_and_close_preserve_waiters_payloads_and_incarnation_boundaries() {
     assert!(close(&mailbox, second).is_none());
 
     let latest_drops = Arc::new(AtomicUsize::new(0));
-    let latest = MailboxCell::new(
-        ChildId::from("latest"),
-        crate::mailbox::capability::tests::runtime(),
-    );
+    let latest = MailboxCell::new(ChildId::from("latest"));
     let latest_token = configure(&latest, ResolvedMailbox::Latest);
     bind(&latest, latest_token, first);
     assert!(matches!(
@@ -569,14 +494,12 @@ fn termination_that_wins_before_withdrawal_reports_the_terminal_outcome() {
 
 #[test]
 fn termination_finish_completes_waiters_and_isolates_payload_after_signal_panic() {
-    let armed = Arc::new(AtomicBool::new(false));
     let disposals = Arc::new(AtomicUsize::new(0));
-    let runtime = Arc::new(PanickingPulseRuntime {
-        inner: crate::mailbox::capability::tests::runtime(),
-        armed: Arc::clone(&armed),
-        disposals: Arc::clone(&disposals),
+    let recorded = Arc::clone(&disposals);
+    let _disposals = crate::runtime::hooks::record_disposals(move || {
+        recorded.fetch_add(1, Ordering::SeqCst);
     });
-    let (mailbox, actor) = actor_for_with_runtime(runtime);
+    let (mailbox, actor) = actor();
     let (incarnation, _) = two_incarnations();
     let token = configure(
         &mailbox,
@@ -592,7 +515,8 @@ fn termination_finish_completes_waiters_and_isolates_payload_after_signal_panic(
     park_with(&mut third, &waker);
 
     let teardown = prepare_termination(&mailbox).expect("the mailbox prepares termination");
-    armed.store(true, Ordering::SeqCst);
+    let mut watcher = mailbox.watcher();
+    let _armed = arm_pulse_panic(&mut watcher);
     let panic = catch_unwind(AssertUnwindSafe(move || {
         let _ = teardown.finish();
     }))
@@ -715,10 +639,7 @@ fn live_latest_displacement_drops_after_unlock_and_replacement_visibility() {
 
 #[test]
 fn latest_displacement_contains_a_panicking_payload_destructor() {
-    let mailbox = MailboxCell::new(
-        ChildId::from("actor"),
-        crate::mailbox::capability::tests::runtime(),
-    );
+    let mailbox = MailboxCell::new(ChildId::from("actor"));
     let token = configure(&mailbox, ResolvedMailbox::Latest);
     let incarnation = mint_actor_incarnation();
     bind(&mailbox, token, incarnation);
@@ -1134,11 +1055,8 @@ fn promotion_wakes_every_sender_when_multiple_wakers_panic() {
 #[test]
 fn bind_submits_displaced_payloads_for_disposal_before_waking_senders() {
     let events = Arc::new(Mutex::new(Vec::new()));
-    let runtime = Arc::new(BindOrderingRuntime {
-        inner: crate::mailbox::capability::tests::runtime(),
-        events: Arc::clone(&events),
-    });
-    let mailbox = MailboxCell::new(ChildId::from("actor"), runtime);
+    let (_pulses, _disposals) = record_bind_effects(&events);
+    let mailbox = MailboxCell::new(ChildId::from("actor"));
     let token = configure(&mailbox, ResolvedMailbox::Latest);
 
     let first = match mailbox.submit(1) {
@@ -1308,13 +1226,7 @@ fn waiter_queue_preserves_fifo_across_removal() {
 
 #[test]
 fn a_panicking_close_flush_isolates_the_unread_payload() {
-    let armed = Arc::new(AtomicBool::new(false));
-    let runtime = Arc::new(PanickingPulseRuntime {
-        inner: crate::mailbox::capability::tests::runtime(),
-        armed: Arc::clone(&armed),
-        disposals: Arc::new(AtomicUsize::new(0)),
-    });
-    let mailbox = MailboxCell::new(ChildId::from("actor"), runtime);
+    let mailbox = MailboxCell::new(ChildId::from("actor"));
     let token = configure(&mailbox, ResolvedMailbox::Latest);
     let incarnation = mint_actor_incarnation();
     bind(&mailbox, token, incarnation);
@@ -1323,7 +1235,8 @@ fn a_panicking_close_flush_isolates_the_unread_payload() {
         mailbox.submit(ThreadRecordingMessage(Some(dropped))),
         super::Submission::Accepted(_)
     ));
-    armed.store(true, Ordering::SeqCst);
+    let mut watcher = mailbox.watcher();
+    let _armed = arm_pulse_panic(&mut watcher);
 
     // The driver shape: the close result is a live local across the
     // effects flush, which wakes registered wakers synchronously and can
@@ -1398,11 +1311,8 @@ fn a_panicking_receive_flush_isolates_the_received_message() {
 #[test]
 fn receiving_does_not_pulse_the_receivers_own_change_signal() {
     let events = Arc::new(Mutex::new(Vec::new()));
-    let runtime = Arc::new(BindOrderingRuntime {
-        inner: crate::mailbox::capability::tests::runtime(),
-        events: Arc::clone(&events),
-    });
-    let (mailbox, actor) = actor_for_with_runtime::<u8>(runtime);
+    let (_pulses, _disposals) = record_bind_effects(&events);
+    let (mailbox, actor) = actor();
     let token = configure(
         &mailbox,
         ResolvedMailbox::Queue(std::num::NonZeroUsize::new(1).expect("non-zero queue capacity")),

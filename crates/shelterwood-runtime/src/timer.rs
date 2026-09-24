@@ -5,7 +5,7 @@ use tokio::time;
 pub use shelterwood_core::BoxedSleep;
 use shelterwood_core::{ProxiedSleep, deadline::Deadline};
 
-use crate::mailbox_runtime;
+use crate::dispose_waker;
 
 /// Advances a paused test clock, keeping timer control in this module.
 #[cfg(any(test, feature = "test-util"))]
@@ -54,7 +54,7 @@ pub async fn sleep_until_std(deadline: std::time::Instant) {
 }
 
 fn proxied_sleep_until(deadline: std::time::Instant) -> ProxiedSleep {
-    ProxiedSleep::new(raw_sleep_until(deadline), mailbox_runtime())
+    ProxiedSleep::new(raw_sleep_until(deadline), dispose_waker)
 }
 
 /// Raw timer capability supplied to the façade mailbox module.

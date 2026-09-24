@@ -56,20 +56,15 @@ fi
 # Match each seam in the E0432 header (`unresolved imports ...`), not the
 # per-span "no `X` in the root" labels: rustc caps rendered span labels, so
 # a list this long leaves later names labelless while the header stays
-# complete. The trailing backtick keeps prefixes distinct (e.g.
-# `MailboxSignal` vs `MailboxSignalWatcher`).
+# complete. The trailing backtick keeps a seam from matching a longer name
+# that shares its prefix.
 for seam in \
+    BoxedSleep \
     DynamicRoute \
-    ErasedOneShotClose \
-    ErasedOneShotReceiver \
-    ErasedOneShotSender \
     MailboxCell \
     MailboxControl \
     MailboxEffectQueue \
     MailboxEffectSink \
-    MailboxRuntime \
-    MailboxSignal \
-    MailboxSignalWatcher \
     MailboxTermination \
     MemberCell \
     ParentCancellationToken \

@@ -35,10 +35,7 @@ mod tests {
         let waker = ManuallyDrop::new(thread_drop_waker(dropped_tx));
         let mut context = Context::from_waker(&waker);
         let raw: BoxedSleep = Box::pin(std::future::pending());
-        let mut timer = Box::pin(ProxiedSleep::new(
-            raw,
-            crate::mailbox::capability::tests::runtime(),
-        ));
+        let mut timer = Box::pin(ProxiedSleep::new(raw, crate::runtime::dispose_waker));
 
         assert!(timer.as_mut().poll(&mut context).is_pending());
         drop(timer);

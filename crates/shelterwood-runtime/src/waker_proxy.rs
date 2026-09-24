@@ -1,8 +1,8 @@
-use std::task::{Context, Waker};
+use std::task::Context;
 
 use shelterwood_core::ProxiedPoll as CoreProxiedPoll;
 
-use crate::{PanicAccumulator, discard_panic, dispose_detached};
+use crate::{PanicAccumulator, discard_panic, dispose_waker};
 
 /// Runtime-facing proxied-poll protocol for an external primitive.
 ///
@@ -61,8 +61,4 @@ impl Drop for ProxiedPoll {
         self.retire_detached(&mut panics);
         discard_panic(panics.take());
     }
-}
-
-fn dispose_waker(waker: Waker) {
-    dispose_detached(waker);
 }

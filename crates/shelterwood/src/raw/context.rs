@@ -425,6 +425,43 @@ impl<M> RawResources<M> {
         });
     }
 
+    fn batch(&self) -> &ReadyBatch {
+        self.ready_batch
+            .as_ref()
+            .expect("ready selection always owns an arbitration batch")
+    }
+
+    fn batch_mut(&mut self) -> &mut ReadyBatch {
+        self.ready_batch
+            .as_mut()
+            .expect("ready selection always owns an arbitration batch")
+    }
+
+    fn pop_continuation(&mut self, is_lead_slot: bool) -> Option<M> {
+        let batch = self
+            .ready_batch
+            .as_mut()
+            .expect("ready selection always owns an arbitration batch");
+        if (!is_lead_slot || !self.last_delivery_was_continuation)
+            && batch.continuation_is_eligible()
+            && let Some(message) = self.continuations.pop_front()
+        {
+            batch.record_continuation_delivery();
+            self.last_delivery_was_continuation = true;
+            return Some(message);
+        }
+        None
+    }
+
+    /// Pops the next offload completion inside the batch's captured prefix.
+    fn pop_batched_event(&mut self) -> Option<QueuedEvent<M>> {
+        let batch = self
+            .ready_batch
+            .as_mut()
+            .expect("ready selection always owns an arbitration batch");
+        self.events.pop_through(&mut batch.offloads_remaining)
+    }
+
     fn resume_pending_panic(&self) {
         // Reached from the actor's own receive path, never from cleanup. The
         // take is destructive, so containment here would drop the retained
@@ -1036,18 +1073,6 @@ impl<M: Send + 'static> RawContext<M> {
             || self.resources.events.watermark() > 0
     }
 
-    fn pop_continuation(&mut self, batch: &mut ReadyBatch, is_lead_slot: bool) -> Option<M> {
-        if (!is_lead_slot || !self.resources.last_delivery_was_continuation)
-            && batch.continuation_is_eligible()
-            && let Some(message) = self.resources.continuations.pop_front()
-        {
-            batch.record_continuation_delivery();
-            self.resources.last_delivery_was_continuation = true;
-            return Some(message);
-        }
-        None
-    }
-
     /// Selects one live-incarnation input without awaiting.
     ///
     /// Every selection runs through one bounded arbitration batch. Steady
@@ -1092,6 +1117,9 @@ impl<M: Send + 'static> RawContext<M> {
         message
     }
 
+    /// The batch stays installed in `resources` for the whole selection, so
+    /// when user code unwinds out of a step, the next caught receive sees the
+    /// same cutoffs and any not-yet-committed timer armings.
     fn select_ready(&mut self) -> Option<M> {
         // A permanently busy actor never reaches `wait_for_event`; reclaim at
         // its other guaranteed re-entry point so completed task handles do not
@@ -1101,58 +1129,34 @@ impl<M: Send + 'static> RawContext<M> {
         loop {
             self.resources.resume_pending_panic();
             self.begin_ready_batch();
-            let mut batch = self
-                .resources
-                .ready_batch
-                .take()
-                .expect("ready selection always owns an arbitration batch");
-            if let Some(message) = self.pop_continuation(&mut batch, true) {
-                self.resources.ready_batch = Some(batch);
+            if let Some(message) = self.resources.pop_continuation(true) {
                 return Some(message);
             }
 
+            let batch = self.resources.batch();
             if batch.mailbox_is_eligible() {
                 let cutoff = batch.mailbox_through;
-                let (restored, message) = self.with_ready_batch_installed(batch, |this| {
-                    let result = catch_panic(|| this.receiver.try_recv_live_through(cutoff));
-                    // Receive runs caller code only in its post-consumption
-                    // effects: a sender wake can panic after the selected
-                    // message has left the queue and been sent to disposal.
-                    // Spend that mailbox turn before resuming the panic, so
-                    // a caught wake cannot bypass offload fairness. Failures
-                    // before consumption are internal invariant/poison paths,
-                    // not recoverable user callbacks.
-                    if !matches!(result, Ok(None)) {
-                        this.resources
-                            .ready_batch
-                            .as_mut()
-                            .expect("mailbox selection keeps its ready batch installed")
-                            .record_mailbox_delivery();
-                        this.resources.last_delivery_was_continuation = false;
-                    }
-                    result.unwrap_or_else(|panic| runtime::resume_panic(panic))
-                });
-                batch = restored;
-                if let Some(message) = message {
-                    self.resources.ready_batch = Some(batch);
+                let result = catch_panic(|| self.receiver.try_recv_live_through(cutoff));
+                // Receive runs caller code only in its post-consumption
+                // effects: a sender wake can panic after the selected message
+                // has left the queue and been sent to disposal. Spend that
+                // mailbox turn before resuming the panic, so a caught wake
+                // cannot bypass offload fairness. Failures before consumption
+                // are internal invariant/poison paths, not recoverable user
+                // callbacks.
+                if !matches!(result, Ok(None)) {
+                    self.resources.batch_mut().record_mailbox_delivery();
+                    self.resources.last_delivery_was_continuation = false;
+                }
+                if let Some(message) = result.unwrap_or_else(|panic| runtime::resume_panic(panic)) {
                     return Some(message);
                 }
             }
 
-            if batch.offloads_remaining > 0 {
-                while let Some(event) = self
-                    .resources
-                    .events
-                    .pop_through(&mut batch.offloads_remaining)
-                {
-                    let (restored, message) = self
-                        .with_ready_batch_installed(batch, |this| this.materialize_event(event));
-                    batch = restored;
-                    if let Some(message) = message {
-                        self.resources.last_delivery_was_continuation = false;
-                        self.resources.ready_batch = Some(batch);
-                        return Some(message);
-                    }
+            while let Some(event) = self.resources.pop_batched_event() {
+                if let Some(message) = self.materialize_event(event) {
+                    self.resources.last_delivery_was_continuation = false;
+                    return Some(message);
                 }
             }
 
@@ -1162,6 +1166,7 @@ impl<M: Send + 'static> RawContext<M> {
             // so that work receives §6.1's mandatory fairness opportunity.
             // Fired batches deliberately retain their immutable cutoffs:
             // post-fire arrivals must not jump the already-fired timers.
+            let batch = self.resources.batch();
             if !batch.is_fired()
                 && self.resources.last_delivery_was_continuation
                 && self
@@ -1171,23 +1176,20 @@ impl<M: Send + 'static> RawContext<M> {
                 continue;
             }
 
-            if let Some(message) = self.pop_continuation(&mut batch, false) {
-                self.resources.ready_batch = Some(batch);
+            if let Some(message) = self.resources.pop_continuation(false) {
                 return Some(message);
             }
 
-            while let Some(arming) = batch.next_arming() {
-                let (restored, message) =
-                    self.with_ready_batch_installed(batch, |this| this.deliver_timer(arming));
-                batch = restored;
-                batch.commit_arming(arming);
+            while let Some(arming) = self.resources.batch().next_arming() {
+                let message = self.deliver_timer(arming);
+                self.resources.batch_mut().commit_arming(arming);
                 if let Some(message) = message {
                     self.resources.last_delivery_was_continuation = false;
-                    self.resources.ready_batch = Some(batch);
                     return Some(message);
                 }
             }
 
+            let batch = self.resources.batch();
             let mailbox_may_remain = batch.mailbox_budget_exhausted();
             let mailbox_cutoff = batch.mailbox_through;
             self.resources.ready_batch = None;
@@ -1202,25 +1204,6 @@ impl<M: Send + 'static> RawContext<M> {
             }
             return None;
         }
-    }
-
-    /// Runs a callback-capable selection step while the authoritative batch
-    /// remains installed. If user code unwinds, the next caught receive sees
-    /// the same cutoffs and any not-yet-committed timer armings.
-    fn with_ready_batch_installed<R>(
-        &mut self,
-        batch: ReadyBatch,
-        operation: impl FnOnce(&mut Self) -> R,
-    ) -> (ReadyBatch, R) {
-        assert!(self.resources.ready_batch.is_none());
-        self.resources.ready_batch = Some(batch);
-        let result = operation(self);
-        let batch = self
-            .resources
-            .ready_batch
-            .take()
-            .expect("callback-capable selection keeps its ready batch installed");
-        (batch, result)
     }
 
     fn materialize_event(&self, event: QueuedEvent<M>) -> Option<M> {

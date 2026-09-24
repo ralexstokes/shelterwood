@@ -116,8 +116,8 @@ impl<T> OneShotSending<T> {
 ///
 /// `OneShotSender::send` and the staged `OneShotSending::publish` differ only
 /// in how they enter the window — `send` wins it with a CAS from
-/// `ONESHOT_OPEN`, the test half is constructed inside it — so they share the
-/// tail rather than restating it.
+/// `ONESHOT_OPEN`, the test half is constructed inside it — so they share
+/// this tail.
 fn publish_oneshot<T>(channel: oneshot::Sender<T>, state: &AtomicU8, value: T) -> Result<(), T> {
     match channel.send(value) {
         Ok(()) => {
@@ -182,9 +182,6 @@ impl<T> Drop for OneShotSender<T> {
         // caller-supplied waker from the sender's drop glue. Surface that panic
         // to an ordinary dropper, but contain it during an existing unwind so
         // an unanswered reply cannot abort the process with a double panic.
-        // This accumulator is single-candidate by construction: dropping the
-        // channel is its only fallible step, so `keep_first_panic` precedence
-        // is exercised by the multi-waiter registry cleanup instead.
         let channel = self.channel.take();
         let mut panics = PanicAccumulator::default();
         panics.run(|| drop(channel));
@@ -310,7 +307,7 @@ impl<T> OneShotReceiver<T> {
 /// `Send + 'static` bounds hold, so unbounded holders can still route an
 /// unclaimed stored value through isolated disposal on drop.
 ///
-/// The erasure is load-bearing API design, not incidental: `Drop` must repeat
+/// The erasure is deliberate: `Drop` must repeat
 /// whatever bounds the struct declares, so bounding this type would push
 /// `T: Send + 'static` onto the definition of the public `OneShotTaskRef`
 /// wrapper that holds it and force downstream generic declarations to carry a

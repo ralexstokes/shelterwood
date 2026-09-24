@@ -15,8 +15,7 @@ pub(super) fn contain_panic_payload(payload: PanicPayload) -> Option<String> {
 
 /// Terminal, off-executor destruction for an opaque user panic payload.
 ///
-/// The wrapper is load-bearing, not ceremony: submitting a bare payload to
-/// [`dispose_detached`] closes a cycle. `DisposalJob::finish` contains a
+/// Submitting a bare payload to [`dispose_detached`] would close a cycle. `DisposalJob::finish` contains a
 /// destructor panic by calling [`contain_panic_payload`], which submits the
 /// replacement payload for detached disposal, whose destructor panics again.
 /// A self-regenerating payload — one whose `Drop` `panic_any`s a fresh copy
@@ -32,9 +31,8 @@ pub(super) fn contain_panic_payload(payload: PanicPayload) -> Option<String> {
 /// destroyed off the exit-publishing executor — while the disposal job
 /// itself never observes a panic to classify.
 ///
-/// Removing this wrapper reintroduces the unbounded spin; the regression is
-/// pinned by `blocking_panic_payload_does_not_stall_current_thread_exit_publication`'s
-/// sibling `a_self_regenerating_panic_payload_is_destroyed_a_bounded_number_of_times`.
+/// The façade's `a_self_regenerating_panic_payload_is_destroyed_a_bounded_number_of_times`
+/// pins the bound.
 struct DiscardedPanicPayload(Option<PanicPayload>);
 
 impl Drop for DiscardedPanicPayload {

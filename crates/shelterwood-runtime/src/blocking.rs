@@ -210,13 +210,12 @@ pub(crate) fn submit_blocking_job<J: BlockingPoolJob>(job: &Arc<J>) -> bool {
 /// the reference count — rerouting the latter would place already-empty jobs
 /// behind live ones.
 ///
-/// This pins Tokio 1.53.1's `spawn_task` shutdown path: a rejected closure is
-/// destroyed synchronously, before `spawn_blocking` returns. The workspace
-/// pins that exact release so an upgrade requires an explicit re-audit. A
-/// future Tokio that deferred that drop would leave the count at two and
-/// degrade fail-safe to the old inline behavior rather than misroute a live
-/// closure. The end-to-end regressions in this crate pin the behavior we rely
-/// on.
+/// This relies on Tokio 1.53.1's `spawn_task` shutdown path: a rejected
+/// closure is destroyed synchronously, before `spawn_blocking` returns. A
+/// Tokio that deferred that drop would leave the count at two, so the job
+/// would count as accepted and Tokio would destroy the closure itself: that
+/// fails safe, and never misroutes a live closure. The end-to-end regressions
+/// in this crate pin the behavior relied on.
 /// Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
 pub(crate) fn blocking_pool_accepted<J: BlockingPoolJob>(job: &Arc<J>) -> bool {
     Arc::strong_count(job) > 1 || !job.is_pending()

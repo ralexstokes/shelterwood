@@ -420,11 +420,11 @@ mod tests {
     }
 
     /// Tokio's ready join result can own the task's opaque panic payload while
-    /// dropping the caller waker retained in the handle trailer. Combining a
-    /// panicking payload destructor with a panicking waker destructor used to
-    /// make that geometry abort the process. This test intentionally installs
-    /// both; nextest's process isolation turns a regression into this test's
-    /// failure rather than taking the whole suite with it.
+    /// dropping the caller waker retained in the handle trailer. A panicking
+    /// payload destructor plus a panicking waker destructor in that geometry
+    /// would abort the process, so this test installs both; nextest's process
+    /// isolation turns a regression into this test's failure rather than
+    /// taking the whole suite with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn user_polled_join_separates_hostile_waker_and_panic_payload_destruction() {
         let polling_thread = thread::current().id();

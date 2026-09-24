@@ -385,7 +385,9 @@ fn descendant<'a>(
     snapshot: &'a shelterwood::ScopeSnapshot,
     path: &[&str],
 ) -> &'a shelterwood::ChildSnapshot {
-    snapshot.descendant(path).expect("descendant is present")
+    snapshot
+        .descendant(path.iter().copied())
+        .expect("descendant is present")
 }
 
 fn event_is_restart_for(event: &LifecycleEvent, membership: Membership) -> bool {
@@ -565,7 +567,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .expect("incarnation-owned offload completes through the actor loop")
         .expect("tool actor is alive");
     assert_eq!(
-        tools.remove_actor(&tool).await,
+        tools.remove_exact(&tool).await,
         RemoveOutcome::Removed,
         "temporary children retire by exact handle"
     );
@@ -660,7 +662,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     }
     assert!(saw_control_restart && saw_tool_restart && saw_gateway_restart);
 
-    let removal = sessions.remove_scope(&session);
+    let removal = sessions.remove_exact(&session);
     tokio::time::timeout(POLL_TIMEOUT, stop_entered.recv())
         .await
         .expect("removal drives the control actor into on_stop")
@@ -841,7 +843,7 @@ async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight()
     // Eviction is removal of the session scope; the stream is cut off
     // mid-flight: senders now fail terminally and no value ever leaks.
     assert_eq!(
-        sessions.remove_scope(&session).await,
+        sessions.remove_exact(&session).await,
         RemoveOutcome::Removed
     );
     let error = stream

@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ANCHOR_END: wait_for_child
     // ANCHOR_END: observation
 
-    assert_eq!(scope.remove_task(&worker).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&worker).await, RemoveOutcome::Removed);
     system.shutdown(Duration::from_secs(5)).await?;
     println!("observed the admission through catch-up and a bounded wait");
     Ok(())

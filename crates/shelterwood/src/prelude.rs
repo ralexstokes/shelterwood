@@ -33,7 +33,11 @@
 //! [`crate::RemoveOutcome`], [`crate::ReserveError`], and
 //! [`crate::NotAdmittingCause`] — are deliberately ring 2 only. They are
 //! matched at a handful of call sites in programs that admit children at
-//! runtime, which is not the shape this module is sized for.
+//! runtime, which is not the shape this module is sized for. The same
+//! holds for [`crate::MemberHandle`], the sealed bound on
+//! [`DynamicScopeRef::remove_exact`](crate::DynamicScopeRef::remove_exact):
+//! a caller passes a handle it already holds and never writes the trait's
+//! name unless it is generic over handle kinds.
 //!
 //! # The `Context` collision
 //!

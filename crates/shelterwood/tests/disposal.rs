@@ -572,7 +572,7 @@ async fn wait_resolves_before_factory_release_while_removal_waits_for_it() {
         terminal.kind(),
         ExitKind::Failed(error) if error.to_string() == "final failure"
     ));
-    let mut removal = Box::pin(scope.remove_task(&task));
+    let mut removal = Box::pin(scope.remove_exact(&task));
     poll_pending(&mut removal).await;
 
     gate.release();
@@ -938,7 +938,7 @@ async fn unadmitted_removal_completes_after_blocking_definition_disposal() {
             async { Ok(()) }
         }
     }));
-    let mut removal = Box::pin(scope.remove_task(&task));
+    let mut removal = Box::pin(scope.remove_exact(&task));
     wait_for_destructor(&gate).await;
     assert_disposed_off_current(&mut drops, "definition disposal reports its thread").await;
     assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
@@ -989,7 +989,7 @@ async fn restart_window_removal_publishes_terminality_before_factory_release() {
         .await
         .expect("task enters restart backoff");
 
-    let mut removal = Box::pin(scope.remove_task(&task));
+    let mut removal = Box::pin(scope.remove_exact(&task));
     poll_pending(&mut removal).await;
     wait_for_destructor(&gate).await;
     assert_disposed_off_current(&mut drops, "factory disposal reports its thread").await;
@@ -1030,7 +1030,7 @@ async fn unadmitted_removal_completes_when_the_panic_payload_destructor_panics()
     }));
 
     assert_eq!(
-        tokio::time::timeout(POLL_TIMEOUT, scope.remove_task(&task))
+        tokio::time::timeout(POLL_TIMEOUT, scope.remove_exact(&task))
             .await
             .expect("panic payload disposal publishes removal completion"),
         RemoveOutcome::Removed

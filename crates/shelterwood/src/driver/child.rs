@@ -1131,15 +1131,10 @@ impl ScopeRuntime {
             .get_mut(key)
             .expect("the exiting child remains registered");
 
-        let mode = if self.supervisor.lifecycle().is_draining() {
-            ScopeMode::Draining
-        } else {
-            ScopeMode::Running
-        };
         match dispatch_exit(
             exit.as_exit(),
             child.options.restart,
-            mode,
+            self.supervisor.lifecycle().is_draining(),
             membership_status,
         ) {
             ExitDispatch::Terminal => {

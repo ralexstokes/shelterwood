@@ -234,12 +234,6 @@ impl StopLadder {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScopeMode {
-    Running,
-    Draining,
-}
-
 /// Whether a child membership is active or undergoing planned removal.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MembershipStatus {
@@ -258,7 +252,7 @@ pub enum ExitDispatch {
 pub fn dispatch_exit(
     exit: &Exit,
     restart: RestartPolicy,
-    scope: ScopeMode,
+    scope_draining: bool,
     membership: MembershipStatus,
 ) -> ExitDispatch {
     // SPEC §8: `NeverStarted` is a membership fact, not an incarnation
@@ -272,7 +266,7 @@ pub fn dispatch_exit(
         !matches!(exit.kind(), ExitKind::NeverStarted),
         "NeverStarted is a membership outcome outside incarnation dispatch"
     );
-    if scope == ScopeMode::Draining || membership == MembershipStatus::Removing {
+    if scope_draining || membership == MembershipStatus::Removing {
         return ExitDispatch::Terminal;
     }
     if restart.should_restart(exit) {
@@ -1100,7 +1094,7 @@ mod tests {
     use super::{
         ArbitrationClass, ChildCompletionState, DeadlineQueue, Epoch, ExitDispatch, IncarnationRun,
         IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent, ReadinessGate,
-        RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode, ScopeState,
+        RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeState,
         StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
     };
 
@@ -1431,7 +1425,7 @@ mod tests {
                         restart_completed
                     };
                     assert_eq!(
-                        dispatch_exit(&exit, policy, ScopeMode::Running, MembershipStatus::Active),
+                        dispatch_exit(&exit, policy, false, MembershipStatus::Active),
                         if expected {
                             ExitDispatch::ScheduleRestart
                         } else {
@@ -1440,17 +1434,12 @@ mod tests {
                         "condition={condition:?}, kind={kind:?}, cancellation={cancellation:?}"
                     );
                     assert_eq!(
-                        dispatch_exit(&exit, policy, ScopeMode::Draining, MembershipStatus::Active),
+                        dispatch_exit(&exit, policy, true, MembershipStatus::Active),
                         ExitDispatch::Terminal,
                         "draining suppresses every restart"
                     );
                     assert_eq!(
-                        dispatch_exit(
-                            &exit,
-                            policy,
-                            ScopeMode::Running,
-                            MembershipStatus::Removing
-                        ),
+                        dispatch_exit(&exit, policy, false, MembershipStatus::Removing),
                         ExitDispatch::Terminal,
                         "planned removal suppresses every restart"
                     );
@@ -1466,7 +1455,7 @@ mod tests {
         let _ = dispatch_exit(
             &exit,
             RestartPolicy::new(RestartCondition::Always, Backoff::Immediate),
-            ScopeMode::Running,
+            false,
             MembershipStatus::Active,
         );
     }

@@ -41,7 +41,7 @@ use crate::{
     engine::{
         ArbitrationClass, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch, IncarnationRun,
         IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent, ReadinessGate,
-        RestartState, ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate, dispatch_exit,
+        RestartState, ScopeLifecycle, StopAction, StopLadder, arbitrate, dispatch_exit,
         schedule_restart,
     },
     exit::{

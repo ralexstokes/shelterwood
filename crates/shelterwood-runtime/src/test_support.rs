@@ -127,6 +127,7 @@ pub(crate) fn assert_blocking_pool_outcomes<
 /// workspace's exact Tokio pin makes that a supported test premise. An upgrade
 /// that starts discarding queued tasks must update this helper to fail before
 /// its bounded receives, and re-audit every rejection-path test that uses it.
+/// Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
 pub(crate) fn submit_during_blocking_pool_shutdown(task: impl FnOnce() + Send + 'static) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .max_blocking_threads(1)

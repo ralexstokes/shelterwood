@@ -923,6 +923,7 @@ mod tests {
     /// regression runs the user destructor inline, parking the host inside
     /// `shutdown_background` — which is precisely the mitigation the shutdown
     /// docs direct hosts to, so it must not be the thing that hangs.
+    /// Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
     #[test]
     fn embedder_runtime_teardown_isolates_a_task_held_value() {
         let runtime = tokio::runtime::Builder::new_current_thread()

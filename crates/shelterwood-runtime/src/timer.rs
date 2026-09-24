@@ -23,6 +23,7 @@ pub fn now() -> std::time::Instant {
 // which would otherwise make a valid but very distant std Instant fire early.
 // Rechecking the original absolute point after bounded slices preserves exact
 // never-early semantics without coupling this crate to that private constant.
+// Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
 const MAX_TIMER_SLICE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 fn next_timer_deadline(
@@ -179,6 +180,7 @@ mod tests {
         // Tokio 1.53 reserves the top three u64 millisecond ticks. The exact
         // value is test evidence only: production uses a small stable slice
         // rather than depending on tokio's private sentinel.
+        // Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
         let beyond_tokio_ticks = Duration::from_millis(u64::MAX - 2);
         let current = std::time::Instant::now();
         let Some(requested) = current.checked_add(beyond_tokio_ticks) else {

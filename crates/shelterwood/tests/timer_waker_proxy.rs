@@ -222,6 +222,7 @@ fn request_shutdown_and_wait_for_draining<F>(
 /// bounds the scheduler footprint on shared CI hosts; the relevant work is
 /// driven from two named native threads so a blocked worker cannot starve the
 /// assertion itself.
+/// Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
 #[test]
 fn blocking_timer_waker_retirement_does_not_stall_unrelated_timer_traffic() {
     let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -37,6 +37,7 @@ pub fn alive_task_count() -> usize {
 /// accessor is `tokio_unstable`-only), and provoking the panic would run the
 /// user's panic hook. `BuildError::NoRuntime` documents the requirement at
 /// the public surface instead.
+/// Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
 pub fn is_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }
@@ -349,6 +350,7 @@ pub(crate) fn submit_blocking_job<J: BlockingPoolJob>(job: &Arc<J>) -> bool {
 /// degrade fail-safe to the old inline behavior rather than misroute a live
 /// closure. The end-to-end regressions in this crate pin the behavior we rely
 /// on.
+/// Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
 pub(crate) fn blocking_pool_accepted<J: BlockingPoolJob>(job: &Arc<J>) -> bool {
     Arc::strong_count(job) > 1 || !job.is_pending()
 }
@@ -439,6 +441,8 @@ pub async fn join<T>(handle: JoinHandle<T>) -> JoinOutcome<T> {
 /// its opaque panic payload. Park only a stable framework proxy in Tokio,
 /// retire the real caller waker synchronously and with containment before the
 /// ready result crosses this boundary, then let the handle destroy the proxy.
+///
+/// Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
 ///
 /// The ordinary [`join`] remains the lower-cost path for framework-task
 /// venues, whose executor wakers are not supplied by a public caller.

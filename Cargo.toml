@@ -32,6 +32,41 @@ serde_json = "1.0.151"
 shelterwood-core = { path = "crates/shelterwood-core", version = "0.1.0" }
 shelterwood-runtime = { path = "crates/shelterwood-runtime", version = "0.1.0" }
 thiserror = "2.0.19"
-# Blocking-pool rejection ownership is verified against this exact Tokio
-# release. Any upgrade must re-audit and re-run the adapter regressions.
+# TOKIO PIN: RE-AUDIT THESE ON UPGRADE. The sites below rely on exact Tokio
+# behaviour, so the pin is `=` here and in tools/benchmarks/Cargo.toml (keep
+# the two in lockstep). Before bumping it, re-check each claim against the
+# new Tokio source and re-run its regressions; each site's own comment has
+# the full argument.
+#
+# shelterwood-runtime/src/spawn.rs
+#   - `blocking_pool_accepted`: a rejected `spawn_blocking` closure is dropped
+#     synchronously during pool shutdown, so sole ownership means rejection.
+#   - `join_user_polled`: the join trailer keeps the caller's raw waker past
+#     completion until the `JoinHandle` drops, hence the parked proxy.
+#   - `is_available`: no non-panicking probe for an enabled time driver.
+# shelterwood-runtime/src/sync.rs
+#   - `OneShotReceiver::completed`: `poll`/`try_recv` clear `Inner` on a
+#     terminal edge and a later `poll` panics; `close` alone does not.
+#   - `DisposingReceiver::poll_receive`: `Receiver::poll` takes the result
+#     before clearing `Inner`, whose drop runs `rx_task.drop_task`.
+# shelterwood/src/mailbox/capability.rs
+#   - `DisposingReceiver::{poll_receive, drop}`: the same oneshot delivery
+#     seam, plus `Inner::close` waking tx and dropping the rx waker.
+# shelterwood-runtime/src/timer.rs
+#   - `MAX_TIMER_SLICE` and its test: Tokio caps instants at `u64::MAX - 2`
+#     ms ticks; the test hard-codes that sentinel as evidence.
+# shelterwood-runtime/src/test_support.rs
+#   - `submit_during_blocking_pool_shutdown`: `shutdown_background` still
+#     runs a queued blocking task while it drains the pool.
+# shelterwood-runtime/src/disposal.rs
+#   - `embedder_runtime_teardown_isolates_a_task_held_value`: the blocking
+#     pool shuts down before live tasks are dropped.
+# shelterwood/tests/{reply,result}_delivery_waker_proxy.rs, timer_waker_proxy.rs
+# shelterwood/tests/admission_removal_waker_proxy.rs
+#   - Regressions for the proxies above; the timer one relies on
+#     `Handle::clear_entry` dropping a waker under the time-driver mutex.
+# shelterwood/tests/common/timing.rs
+#   - `assert_eventually{,_frozen}!`: a paused idle runtime auto-advances to
+#     the next timer, a yielding task keeps it from doing so, and a
+#     `spawn_blocking` task inhibits auto-advance (a native thread does not).
 tokio = { version = "=1.53.1", features = ["macros", "rt", "sync", "time"] }

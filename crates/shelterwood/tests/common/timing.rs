@@ -113,6 +113,11 @@ pub(crate) fn assert_eventually_predicate(
 /// time. It also asserts that virtual time did not move while it waited,
 /// which makes it a paused-clock-only helper.
 ///
+/// A `spawn_blocking` task also inhibits auto-advance while it runs, so a wait
+/// on Tokio's blocking pool is safe with either macro; a native thread is the
+/// exposure.
+/// Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
+///
 /// It is for paused-clock waits whose predicate needs task or thread progress
 /// but no timer. A predicate that needs a timer to fire must use
 /// `assert_eventually!`, or advance time explicitly first.

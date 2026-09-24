@@ -171,6 +171,7 @@ impl<T: Send + 'static> DisposingReceiver<T> {
         // Probe with a framework waker, then leave only the proxy registered
         // across a pending return so Tokio never destroys a caller waker at
         // that seam.
+        // Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
         // A ready result may own a user value; `ProxiedPoll::poll` retires
         // the caller registration synchronously and contains any hostile
         // destructor panic before returning it. See `retire_reply_waker` for
@@ -222,6 +223,8 @@ impl<T> Drop for DisposingReceiver<T> {
         // cancellation, is the abort-class seam, so the waker Tokio drops here
         // is now only ever a framework proxy clone. Cancellation inherits that
         // containment without retaining a special raw-waker path of its own.
+        //
+        // Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
         // Recovery runs first so an unclaimed value reaches isolated disposal
         // before the receiver -- and therefore before the waker clone it
         // registered -- is retired; a hostile waker destructor can neither

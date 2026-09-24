@@ -123,6 +123,7 @@ async fn successful_run_blocking_contains_completion_caller_waker_retirement() {
 /// raw caller waker while its ready frame owned this result, so unwinding that
 /// result aborted the process. Nextest's process-per-test isolation makes that
 /// SIGABRT a failure of this exact regression.
+/// Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn successful_run_blocking_cannot_double_panic_with_hostile_waker_and_value_drops() {
     drive_run_blocking_delivery(true).await;

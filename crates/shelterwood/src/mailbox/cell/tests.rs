@@ -385,11 +385,12 @@ fn freeze_and_close_preserve_waiters_payloads_and_incarnation_boundaries() {
 
     freeze(&mailbox, second);
     assert!(close(&mailbox, second).is_none());
-    assert!(matches!(
-        &mailbox.state.lock().expect("mailbox mutex poisoned").binding,
-        super::MailboxBinding::Bound(super::BoundState::Full { incarnation, waiters })
-            if *incarnation == first && waiters.len() == 1
-    ));
+    {
+        let state = mailbox.state.lock().expect("mailbox mutex poisoned");
+        assert_eq!(state.phase.observation(), Some(first));
+        assert!(matches!(state.phase, super::Phase::Bound(_)));
+        assert_eq!(state.waiters.len(), 1);
+    }
 
     freeze(&mailbox, first);
     let third_message = match mailbox.submit(TrackedMessage {
@@ -401,18 +402,20 @@ fn freeze_and_close_preserve_waiters_payloads_and_incarnation_boundaries() {
             panic!("frozen intake parks new messages")
         }
     };
-    assert!(matches!(
-        &mailbox.state.lock().expect("mailbox mutex poisoned").binding,
-        super::MailboxBinding::Frozen { incarnation, waiters }
-            if *incarnation == first && waiters.len() == 2
-    ));
+    {
+        let state = mailbox.state.lock().expect("mailbox mutex poisoned");
+        assert_eq!(state.phase.observation(), Some(first));
+        assert!(matches!(state.phase, super::Phase::Frozen(_)));
+        assert_eq!(state.waiters.len(), 2);
+    }
 
     let closed =
         close(&mailbox, first).expect("the matching close returns the unread queue payload");
-    assert!(matches!(
-        &mailbox.state.lock().expect("mailbox mutex poisoned").binding,
-        super::MailboxBinding::Unbound(waiters) if waiters.len() == 2
-    ));
+    {
+        let state = mailbox.state.lock().expect("mailbox mutex poisoned");
+        assert_eq!(state.phase, super::Phase::Unbound);
+        assert_eq!(state.waiters.len(), 2);
+    }
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     let (token, payload) = closed.into_parts();
     drop(payload);
@@ -615,216 +618,6 @@ fn termination_finish_completes_waiters_and_isolates_payload_after_signal_panic(
 }
 
 #[test]
-fn binding_replacement_preserves_a_live_waiter_identity_domain() {
-    let operation = super::SendOperation::new(1_u8);
-    let mut waiters = super::WaiterQueue::default();
-    waiters.park(&operation);
-    let mut state = super::MailboxState {
-        kind: None,
-        bind_permit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        binding: super::MailboxBinding::Unbound(waiters),
-        last_bound: None,
-        queue: std::collections::VecDeque::new(),
-        latest: None,
-    };
-
-    let rejected =
-        state.replace_binding(super::MailboxBinding::Unbound(super::WaiterQueue::default()));
-    assert!(rejected.is_err(), "a live waiter queue cannot be replaced");
-    assert!(matches!(
-        &state.binding,
-        super::MailboxBinding::Unbound(waiters) if waiters.len() == 1
-    ));
-}
-
-#[test]
-fn binding_replacement_invariant_panics_after_unlock() {
-    let mailbox = MailboxCell::new(
-        ChildId::from("actor"),
-        crate::mailbox::capability::tests::runtime(),
-    );
-    let operation = super::SendOperation::new(1_u8);
-    let mut waiters = super::WaiterQueue::default();
-    waiters.park(&operation);
-    mailbox.state.lock().expect("mailbox mutex healthy").binding =
-        super::MailboxBinding::Unbound(waiters);
-
-    let panic = catch_unwind(AssertUnwindSafe(|| {
-        let mut transaction = super::MailboxTxn::new(&mailbox);
-        transaction.bind_available(mint_actor_incarnation());
-        transaction.finish(())
-    }))
-    .expect_err("a live waiter identity domain refuses replacement");
-
-    assert_eq!(
-        panic.downcast_ref::<String>().map(String::as_str),
-        Some("mailbox binding replacement requires an empty waiter queue")
-    );
-    assert!(
-        mailbox.state.try_lock().is_ok(),
-        "the invariant resumes only after the mailbox guard is released"
-    );
-    assert!(matches!(
-        &mailbox.state.lock().expect("mailbox mutex remains healthy").binding,
-        super::MailboxBinding::Unbound(waiters) if waiters.len() == 1
-    ));
-}
-
-#[test]
-fn withdrawal_registration_invariant_disposes_messages_before_resuming() {
-    let mailbox = MailboxCell::new(
-        ChildId::from("actor"),
-        crate::mailbox::capability::tests::runtime(),
-    );
-    let (first_dropped, first_observed) = mpsc::channel();
-    let (second_dropped, second_observed) = mpsc::channel();
-    let first = match mailbox.submit(ThreadRecordingMessage(Some(first_dropped))) {
-        super::Submission::Parked(operation) => operation,
-        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
-            panic!("an unbound mailbox parks its first send")
-        }
-    };
-    let second = match mailbox.submit(ThreadRecordingMessage(Some(second_dropped))) {
-        super::Submission::Parked(operation) => operation,
-        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
-            panic!("an unbound mailbox parks its second send")
-        }
-    };
-    let second_registration = second
-        .state
-        .lock()
-        .expect("second operation mutex healthy")
-        .registration
-        .expect("the second operation is registered");
-    first
-        .state
-        .lock()
-        .expect("first operation mutex healthy")
-        .registration = Some(second_registration);
-    drop(second);
-    let caller = std::thread::current().id();
-
-    let panic = catch_unwind(AssertUnwindSafe(|| {
-        let _ = mailbox.withdraw(&first, super::WithdrawalDisposition::Inline);
-    }))
-    .expect_err("a registration cannot identify another operation");
-    assert_eq!(
-        panic.downcast_ref::<String>().map(String::as_str),
-        Some("a waiter registration must identify its send operation")
-    );
-    for observed in [first_observed, second_observed] {
-        assert_ne!(
-            observed
-                .recv_timeout(Duration::from_secs(5))
-                .expect("the invariant path submits every user message"),
-            caller,
-            "the framework panic cannot unwind a user message on its caller"
-        );
-    }
-    drop(
-        first
-            .state
-            .lock()
-            .expect("first operation mutex remains healthy"),
-    );
-    drop(mailbox.state.lock().expect("mailbox mutex remains healthy"));
-}
-
-/// `withdraw` is reached from `SendFuture`'s drop glue, so its invariant path
-/// can run on an already-unwinding stack. Raising there would be a double
-/// panic and a process abort -- exactly the outcome this lane exists to
-/// prevent -- so the diagnostic is contained and the withdrawal is handed back
-/// to its ordinary owner. Without the containment this test aborts the
-/// process rather than failing.
-#[test]
-fn withdrawal_registration_invariant_is_contained_during_an_unwind() {
-    struct WithdrawOnDrop<'a> {
-        mailbox: &'a MailboxCell<ThreadRecordingMessage>,
-        operation: Arc<super::SendOperation<ThreadRecordingMessage>>,
-    }
-
-    impl Drop for WithdrawOnDrop<'_> {
-        fn drop(&mut self) {
-            let mut withdrawal = self
-                .mailbox
-                .withdraw(&self.operation, super::WithdrawalDisposition::Isolated);
-            // The contained path returns the withdrawal intact, so its
-            // by-value message is still this caller's to retire.
-            match withdrawal.take_outcome() {
-                super::WithdrawalOutcome::Withdrawn { message, .. }
-                | super::WithdrawalOutcome::Terminated { message, .. } => {
-                    self.mailbox.dispose(message);
-                }
-                super::WithdrawalOutcome::Accepted(_) => {}
-            }
-        }
-    }
-
-    let mailbox = MailboxCell::new(
-        ChildId::from("actor"),
-        crate::mailbox::capability::tests::runtime(),
-    );
-    let (first_dropped, first_observed) = mpsc::channel();
-    let (second_dropped, second_observed) = mpsc::channel();
-    let first = match mailbox.submit(ThreadRecordingMessage(Some(first_dropped))) {
-        super::Submission::Parked(operation) => operation,
-        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
-            panic!("an unbound mailbox parks its first send")
-        }
-    };
-    let second = match mailbox.submit(ThreadRecordingMessage(Some(second_dropped))) {
-        super::Submission::Parked(operation) => operation,
-        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
-            panic!("an unbound mailbox parks its second send")
-        }
-    };
-    let second_registration = second
-        .state
-        .lock()
-        .expect("second operation mutex healthy")
-        .registration
-        .expect("the second operation is registered");
-    first
-        .state
-        .lock()
-        .expect("first operation mutex healthy")
-        .registration = Some(second_registration);
-    drop(second);
-    let caller = std::thread::current().id();
-
-    let panic = catch_unwind(AssertUnwindSafe(|| {
-        let _withdraw_on_drop = WithdrawOnDrop {
-            mailbox: &mailbox,
-            operation: Arc::clone(&first),
-        };
-        std::panic::panic_any("the caller's own unwind");
-    }))
-    .expect_err("the caller's unwind reaches its boundary");
-
-    assert_eq!(
-        panic.downcast_ref::<&str>().copied(),
-        Some("the caller's own unwind"),
-        "the contained invariant cannot replace the unwind already in flight"
-    );
-    for observed in [first_observed, second_observed] {
-        assert_ne!(
-            observed
-                .recv_timeout(Duration::from_secs(5))
-                .expect("every user message still leaves the caller"),
-            caller,
-            "containment does not strand a user message on the unwinding thread"
-        );
-    }
-    drop(
-        first
-            .state
-            .lock()
-            .expect("first operation mutex remains healthy"),
-    );
-    drop(mailbox.state.lock().expect("mailbox mutex remains healthy"));
-}
-
-#[test]
 fn receive_modes_pin_live_cutoffs_and_frozen_drain() {
     let (mailbox, actor) = actor();
     let token = configure(
@@ -966,57 +759,6 @@ fn latest_displacement_contains_a_panicking_payload_destructor() {
 }
 
 #[test]
-fn latest_incarnation_mismatch_uses_the_nonparking_post_unlock_path() {
-    let mailbox = MailboxCell::new(
-        ChildId::from("actor"),
-        crate::mailbox::capability::tests::runtime(),
-    );
-    let token = configure(&mailbox, ResolvedMailbox::Latest);
-    let (bound, mismatched) = two_incarnations();
-    bind(&mailbox, token, bound);
-    let (dropped, observed) = mpsc::channel();
-
-    let mut transaction = super::MailboxTxn::new(&mailbox);
-    let transition = {
-        let (state, effects) = transaction.parts();
-        super::accept_locked(
-            state,
-            mismatched,
-            ThreadRecordingMessage(Some(dropped)),
-            &mailbox.accepted,
-            effects,
-        )
-    };
-    let transition = transaction.finish(transition);
-    let super::AcceptTransition::IncarnationMismatch(message) = transition else {
-        panic!("a Latest mismatch must not use the queue-only Full transition");
-    };
-
-    let panic = catch_unwind(AssertUnwindSafe(|| {
-        super::reject_incarnation_mismatch(&mailbox.runtime, message);
-    }))
-    .expect_err("the invariant diagnostic reaches the caller");
-    assert_eq!(
-        panic.downcast_ref::<&'static str>().copied(),
-        Some("an accepting transition observes its own binding's incarnation")
-    );
-    let destructor_thread = observed
-        .recv_timeout(Duration::from_secs(5))
-        .expect("the rejected message reaches detached disposal");
-    assert_ne!(
-        destructor_thread,
-        std::thread::current().id(),
-        "the rejected user message is isolated before the diagnostic"
-    );
-    drop(
-        mailbox
-            .state
-            .lock()
-            .expect("the mismatch diagnostic does not poison the mailbox"),
-    );
-}
-
-#[test]
 fn bind_observes_waiters_that_remain_parked_beyond_capacity() {
     let (mailbox, _) = actor();
     let token = configure(
@@ -1058,82 +800,15 @@ fn bind_observes_waiters_that_remain_parked_beyond_capacity() {
 
 #[test]
 fn operation_invariant_panics_release_the_operation_guard() {
-    let withdrawn = super::SendOperation::new(1_u8);
-    withdrawn.state.lock().expect("operation state").outcome = super::OperationOutcome::Withdrawn;
-    assert!(catch_unwind(AssertUnwindSafe(|| withdrawn.poll(None, Waker::noop()))).is_err());
+    let retired = super::SendOperation::new(1_u8, None, None);
+    retired.state.lock().expect("operation state").outcome = super::OperationOutcome::Retired;
+    assert!(catch_unwind(AssertUnwindSafe(|| retired.poll(None, Waker::noop()))).is_err());
     drop(
-        withdrawn
+        retired
             .state
             .lock()
-            .expect("withdrawn poll panic occurs after unlock"),
+            .expect("retired poll panic occurs after unlock"),
     );
-
-    let missing = super::SendOperation::new(2_u8);
-    missing.state.lock().expect("operation state").outcome = super::OperationOutcome::Terminated {
-        message: None,
-        final_incarnation: None,
-    };
-    assert!(catch_unwind(AssertUnwindSafe(|| missing.poll(None, Waker::noop()))).is_err());
-    drop(
-        missing
-            .state
-            .lock()
-            .expect("terminal verdict panic occurs after unlock"),
-    );
-}
-
-#[test]
-fn withdrawal_invariant_panics_release_both_guards() {
-    let (mailbox, _) = actor();
-    let withdrawn = match mailbox.submit(1) {
-        super::Submission::Parked(operation) => operation,
-        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
-            panic!("an unbound mailbox parks the send")
-        }
-    };
-    mailbox
-        .withdraw(&withdrawn, super::WithdrawalDisposition::Inline)
-        .finish();
-
-    let missing_waiting = super::SendOperation::new(2_u8);
-    {
-        let mut state = missing_waiting.state.lock().expect("operation state");
-        state.outcome = super::OperationOutcome::Waiting {
-            message: None,
-            newest_observed: None,
-        };
-    }
-    let missing_terminal = super::SendOperation::new(3_u8);
-    {
-        let mut state = missing_terminal.state.lock().expect("operation state");
-        state.outcome = super::OperationOutcome::Terminated {
-            message: None,
-            final_incarnation: None,
-        };
-    }
-
-    for operation in [&withdrawn, &missing_waiting, &missing_terminal] {
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                mailbox
-                    .withdraw(operation, super::WithdrawalDisposition::Inline)
-                    .finish();
-            }))
-            .is_err()
-        );
-        drop(
-            operation
-                .state
-                .lock()
-                .expect("withdrawal verdict panic releases the operation guard"),
-        );
-        drop(
-            mailbox
-                .state
-                .lock()
-                .expect("withdrawal verdict panic releases the mailbox guard"),
-        );
-    }
 }
 
 #[test]
@@ -1173,10 +848,10 @@ fn bind_after_terminal_is_silently_ignored() {
     let teardown = prepare_termination(&mailbox).expect("the mailbox terminalizes");
 
     bind(&mailbox, token, mint_actor_incarnation());
-    assert!(matches!(
-        mailbox.state.lock().expect("mailbox state").binding,
-        super::MailboxBinding::Terminal(None)
-    ));
+    assert_eq!(
+        mailbox.state.lock().expect("mailbox state").phase,
+        super::Phase::Terminal(None)
+    );
     drop(teardown.finish());
 }
 
@@ -1226,8 +901,9 @@ fn bind_requires_the_prior_incarnation_to_close() {
             .state
             .lock()
             .expect("the prior-close guard panics after unlock")
-            .status(),
-        super::BindingStatus::Bound(first)
+            .phase
+            .observation(),
+        Some(first)
     );
 }
 
@@ -1275,45 +951,6 @@ fn repeated_configuration_tokens_share_one_consumable_permit() {
 }
 
 #[test]
-fn bound_waiters_exist_only_in_the_full_state() {
-    let (mailbox, _) = actor();
-    let token = configure(
-        &mailbox,
-        ResolvedMailbox::Queue(std::num::NonZeroUsize::new(1).expect("non-zero queue capacity")),
-    );
-    let incarnation = mint_actor_incarnation();
-    bind(&mailbox, token, incarnation);
-
-    assert!(matches!(
-        mailbox.submit(1),
-        super::Submission::Accepted(bound) if bound == incarnation
-    ));
-    let operation = match mailbox.submit(2) {
-        super::Submission::Parked(operation) => operation,
-        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
-            panic!("a sender parks behind the full queue")
-        }
-    };
-    assert!(matches!(
-        &mailbox.state.lock().expect("mailbox mutex poisoned").binding,
-        super::MailboxBinding::Bound(super::BoundState::Full { waiters, .. })
-            if !waiters.is_empty()
-    ));
-
-    let mut withdrawal = mailbox.withdraw(&operation, super::WithdrawalDisposition::Inline);
-    assert!(matches!(
-        withdrawal.take_outcome(),
-        super::WithdrawalOutcome::Withdrawn { message: 2, .. }
-    ));
-    withdrawal.finish();
-    assert!(matches!(
-        mailbox.state.lock().expect("mailbox mutex poisoned").binding,
-        super::MailboxBinding::Bound(super::BoundState::Available(bound))
-            if bound == incarnation
-    ));
-}
-
-#[test]
 fn receive_promotes_multiple_parked_senders_in_fifo_order() {
     let (mailbox, actor) = actor();
     let token = configure(
@@ -1342,11 +979,15 @@ fn receive_promotes_multiple_parked_senders_in_fifo_order() {
 
         let remaining = send_count - delivered - 1;
         if remaining > 0 {
-            assert!(matches!(
-                &mailbox.state.lock().expect("mailbox mutex poisoned").binding,
-                super::MailboxBinding::Bound(super::BoundState::Full { waiters, .. })
-                    if waiters.len() == remaining
-            ));
+            assert_eq!(
+                mailbox
+                    .state
+                    .lock()
+                    .expect("mailbox mutex poisoned")
+                    .waiters
+                    .len(),
+                remaining
+            );
         }
     }
 
@@ -1371,7 +1012,6 @@ fn cancelling_many_parked_sends_unlinks_one_registration_each() {
             .lock()
             .expect("mailbox mutex poisoned")
             .waiters()
-            .expect("an unbound mailbox owns its parked waiters")
             .len(),
         SENDS
     );
@@ -1392,9 +1032,7 @@ fn cancelling_many_parked_sends_unlinks_one_registration_each() {
     }
 
     let state = mailbox.state.lock().expect("mailbox mutex poisoned");
-    let waiters = state
-        .waiters()
-        .expect("an unbound mailbox retains its empty waiter queue");
+    let waiters = state.waiters();
     assert!(waiters.is_empty());
     assert_eq!(
         waiters.direct_removals, SENDS,
@@ -1451,12 +1089,7 @@ fn withdrawal_releases_its_waker_instead_of_destroying_it_under_the_locks() {
         .state
         .lock()
         .expect("hostile waker drop cannot poison the mailbox lock");
-    assert!(
-        state
-            .waiters()
-            .expect("an unbound mailbox retains its waiter queue")
-            .is_empty()
-    );
+    assert!(state.waiters().is_empty());
 }
 
 #[test]
@@ -1587,7 +1220,8 @@ fn cancellation_can_race_detached_terminal_teardown() {
             .lock()
             .expect("mailbox mutex remains healthy")
             .waiters()
-            .is_none()
+            .is_empty(),
+        "terminal teardown detaches every waiter"
     );
 }
 
@@ -1621,18 +1255,25 @@ async fn expired_timeout_can_race_detached_terminal_teardown() {
     assert_eq!(retry.incarnation_observed, None);
 }
 
+fn registration(operation: &super::SendOperation<u8>) -> super::WaiterId {
+    operation
+        .state
+        .lock()
+        .expect("operation state")
+        .registration
+        .expect("a parked operation is registered")
+}
+
 #[test]
 fn stale_waiter_id_cannot_unlink_a_later_registration() {
     let mut waiters = super::WaiterQueue::default();
-    let first = super::SendOperation::new(1_u8);
-    let first_id = waiters.push_back(Arc::clone(&first));
-    first.register(first_id);
+    let first = waiters.park(1_u8, None);
+    let first_id = registration(&first);
     let removed = waiters.remove(first_id).expect("first waiter is live");
-    removed.clear_registration(first_id);
+    removed.clear_registration();
 
-    let second = super::SendOperation::new(2_u8);
-    let second_id = waiters.push_back(Arc::clone(&second));
-    second.register(second_id);
+    let second = waiters.park(2_u8, None);
+    let second_id = registration(&second);
     assert_ne!(first_id, second_id, "waiter identities are never reused");
     assert!(
         waiters.remove(first_id).is_none(),
@@ -1642,29 +1283,25 @@ fn stale_waiter_id_cannot_unlink_a_later_registration() {
         .remove(second_id)
         .expect("second waiter remains live");
     assert!(Arc::ptr_eq(&removed, &second));
-    removed.clear_registration(second_id);
     assert!(waiters.is_empty());
 }
 
 #[test]
 fn waiter_queue_preserves_fifo_across_removal() {
     let mut waiters = super::WaiterQueue::default();
-    let first = super::SendOperation::new(1_u8);
-    let second = super::SendOperation::new(2_u8);
-    let third = super::SendOperation::new(3_u8);
-    let first_id = waiters.push_back(Arc::clone(&first));
-    let second_id = waiters.push_back(Arc::clone(&second));
-    let third_id = waiters.push_back(Arc::clone(&third));
+    let first = waiters.park(1_u8, None);
+    let second = waiters.park(2_u8, None);
+    let third = waiters.park(3_u8, None);
 
     assert!(Arc::ptr_eq(
-        &waiters.remove(second_id).expect("middle waiter is live"),
+        &waiters
+            .remove(registration(&second))
+            .expect("middle waiter is live"),
         &second
     ));
-    let (popped_first, operation) = waiters.pop_front().expect("head remains live");
-    assert_eq!(popped_first, first_id);
+    let operation = waiters.pop_front().expect("head remains live");
     assert!(Arc::ptr_eq(&operation, &first));
-    let (popped_third, operation) = waiters.pop_front().expect("tail remains live");
-    assert_eq!(popped_third, third_id);
+    let operation = waiters.pop_front().expect("tail remains live");
     assert!(Arc::ptr_eq(&operation, &third));
     assert!(waiters.is_empty());
 }
@@ -1710,4 +1347,91 @@ fn a_panicking_close_flush_isolates_the_unread_payload() {
         std::thread::current().id(),
         "an unwinding close flush must not destroy unread user messages on the caller's thread"
     );
+}
+
+#[test]
+fn a_panicking_receive_flush_isolates_the_received_message() {
+    let (mailbox, actor) = actor_for::<ThreadRecordingMessage>();
+    let token = configure(
+        &mailbox,
+        ResolvedMailbox::Queue(std::num::NonZeroUsize::new(1).expect("non-zero queue capacity")),
+    );
+    let incarnation = mint_actor_incarnation();
+    bind(&mailbox, token, incarnation);
+    let (dropped, observed) = mpsc::channel();
+    assert!(matches!(
+        actor.try_send(ThreadRecordingMessage(Some(dropped))),
+        Ok(bound) if bound == incarnation
+    ));
+    // Receiving promotes this sender, whose wake panics in the flush.
+    let mut parked = Box::pin(actor.send(ThreadRecordingMessage(None)));
+    let panicking = Waker::from(Arc::new(PanicWake));
+    assert!(
+        parked
+            .as_mut()
+            .poll(&mut Context::from_waker(&panicking))
+            .is_pending()
+    );
+    let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+
+    let panic = catch_unwind(AssertUnwindSafe(|| receiver.try_recv().is_some()))
+        .expect_err("the promoted sender's wake panic reaches the receiver");
+    assert_eq!(
+        panic.downcast_ref::<&'static str>().copied(),
+        Some("injected waker panic")
+    );
+    assert_ne!(
+        observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the received message reaches detached disposal"),
+        std::thread::current().id(),
+        "the unwind does not destroy the received message on the receiver's stack"
+    );
+    assert!(matches!(
+        parked
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(bound)) if bound == incarnation
+    ));
+}
+
+#[test]
+fn receiving_does_not_pulse_the_receivers_own_change_signal() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Arc::new(BindOrderingRuntime {
+        inner: crate::mailbox::capability::tests::runtime(),
+        events: Arc::clone(&events),
+    });
+    let (mailbox, actor) = actor_for_with_runtime::<u8>(runtime);
+    let token = configure(
+        &mailbox,
+        ResolvedMailbox::Queue(std::num::NonZeroUsize::new(1).expect("non-zero queue capacity")),
+    );
+    let incarnation = mint_actor_incarnation();
+    bind(&mailbox, token, incarnation);
+    assert!(matches!(actor.try_send(1), Ok(bound) if bound == incarnation));
+    let mut parked = Box::pin(actor.send(2));
+    park_with(&mut parked, Waker::noop());
+    let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+    events.lock().expect("effect recorder mutex").clear();
+
+    assert_eq!(receiver.try_recv(), Some(1));
+    assert_eq!(
+        receiver.try_recv(),
+        Some(2),
+        "receiving promoted the sender"
+    );
+    assert!(
+        !events
+            .lock()
+            .expect("effect recorder mutex")
+            .contains(&BindEffectEvent::SignalPulsed),
+        "neither a receipt nor its promotion pulses the change signal"
+    );
+    assert!(matches!(
+        parked
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(bound)) if bound == incarnation
+    ));
 }

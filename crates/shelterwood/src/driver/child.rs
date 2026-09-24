@@ -805,15 +805,12 @@ impl ScopeRuntime {
             );
         }
 
-        let mut readiness = ReadinessGate::new();
         let deadline = child
             .options
             .readiness_deadline()
             .and_then(|duration| Deadline::after(now, duration).instant());
-        let readiness_effect = readiness.step(ReadinessEvent::Configure {
-            readiness: child.options.readiness,
-            deadline,
-        });
+        let (readiness, readiness_effect) =
+            ReadinessGate::configure(child.options.readiness, deadline);
         let gated = readiness.needs_signal_watch();
 
         if construction_spent {

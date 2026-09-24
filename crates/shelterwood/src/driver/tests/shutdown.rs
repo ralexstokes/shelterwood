@@ -633,3 +633,81 @@ async fn unacknowledged_framework_abort_is_task_aborted_at_the_backstop() {
         "a framework driver that misses its acknowledgement is task-aborted at the backstop"
     );
 }
+
+/// SPEC §11's scope-level twin: a stop latched before the driver's first
+/// settlement is consumed ahead of it, so no initial child is constructed and
+/// the incarnation drains with every initial child `NeverStarted`.
+#[crate::runtime::test]
+async fn a_stop_latched_before_first_settlement_constructs_no_initial_child() {
+    let constructions = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    tree.add_task(
+        "task",
+        TaskDef::new({
+            let constructions = Arc::clone(&constructions);
+            move |_| {
+                constructions.fetch_add(1, Ordering::SeqCst);
+                future::pending::<crate::ExitResult>()
+            }
+        }),
+    )
+    .expect("valid task");
+    tree.add_subtree(
+        "nested",
+        SubtreeDef::factory({
+            let constructions = Arc::clone(&constructions);
+            move || {
+                constructions.fetch_add(1, Ordering::SeqCst);
+                pending_tree()
+            }
+        }),
+    )
+    .expect("valid subtree");
+    let plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let members: Vec<_> = plan
+        .children
+        .iter()
+        .map(|child| Arc::clone(&child.slot.member))
+        .collect();
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
+    assert_eq!(root.request_shutdown(), epoch.epoch());
+
+    let reason = crate::runtime::timeout(
+        Duration::from_secs(5),
+        run_scope_incarnation(plan, ScopeRole::Root, epoch),
+    )
+    .await;
+    let crate::runtime::Timeout::Completed(reason) = reason else {
+        panic!("the drained incarnation finishes")
+    };
+
+    assert_eq!(reason, StopReason::ShutdownRequested);
+    assert_eq!(
+        constructions.load(Ordering::SeqCst),
+        0,
+        "no initial child is constructed on the stop's behalf"
+    );
+    for member in &members {
+        let record = member.record();
+        assert!(
+            record.last_incarnation.is_none(),
+            "{:?} never spawned",
+            member.id()
+        );
+        let MemberStage::Terminal(exit) = &record.stage else {
+            panic!("drain entry terminalizes {:?}", member.id())
+        };
+        assert!(matches!(exit.kind(), ExitKind::NeverStarted));
+    }
+    assert_eq!(
+        root.record().state,
+        ScopeState::Stopped {
+            reason: StopReason::ShutdownRequested
+        }
+    );
+    assert_eq!(
+        root.record().startup,
+        Some(Err(StartupError::ShutdownRequested))
+    );
+}

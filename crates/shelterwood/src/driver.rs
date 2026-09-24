@@ -1501,7 +1501,19 @@ async fn run_scope_incarnation(
     plan.finish_transfer();
     scope.publish_initial_children();
 
+    // SPEC §11: a stop never constructs the incarnation it stops. A request
+    // latched before this first settlement is consumed ahead of it, so the
+    // incarnation enters `Draining` with its initial children still unspawned
+    // and drain entry terminalizes each as `NeverStarted`.
+    if root.take_shutdown_request(scope.epoch) {
+        scope.accept_shutdown_request();
+    }
     scope.settle_supervisor();
+    // That drain can finish the incarnation before any event exists to
+    // wake the loop below.
+    if let Some(reason) = scope.take_completion() {
+        return reason;
+    }
 
     let mut signal = root.signal().watcher();
     let mut pending = Vec::new();

@@ -68,7 +68,12 @@ async fn non_owners_are_quiet_and_an_empty_root_needs_its_owner() {
 async fn fire_and_forget_owner_drop_still_tears_down() {
     let mut tree = Tree::new();
     let task = tree.add_task("worker", waiting_task()).expect("valid task");
-    drop(tree.spawn().expect("runtime is available"));
+    let system = tree.spawn().expect("runtime is available");
+    // Let the worker start first: an owner drop latched before the driver's
+    // first settlement constructs nothing (SPEC §11), which is not the live
+    // teardown this test is about.
+    system.wait_started().await.expect("tree starts");
+    drop(system);
     let exit = tokio::time::timeout(POLL_TIMEOUT, task.wait())
         .await
         .expect("owner drop completes teardown");

@@ -75,8 +75,8 @@ impl ScopeCell {
         let (receiver, closed_consistent) = self.with_observation_gate(|wakes| {
             let initial = self.snapshot_locked();
             let receiver = self.observation.snapshots.subscribe(initial, wakes);
-            let closed_consistent = !self.observation.closed.load(Ordering::Acquire)
-                || receiver.borrow_latest_and_closed().1;
+            let closed_consistent =
+                !self.observation.lifecycle.is_closed() || receiver.borrow_latest_and_closed().1;
             (receiver, closed_consistent)
         });
         assert!(
@@ -87,17 +87,7 @@ impl ScopeCell {
     }
 
     pub(crate) fn subscribe_lifecycle(&self) -> LifecycleEvents {
-        let (events, closed_consistent) = self.with_observation_gate(|txn| {
-            let events = self.observation.lifecycle.subscribe(txn);
-            let closed_consistent = !self.observation.closed.load(Ordering::Acquire)
-                || self.observation.lifecycle.is_closed();
-            (events, closed_consistent)
-        });
-        assert!(
-            closed_consistent,
-            "closed lifecycle state is installed before later subscriptions"
-        );
-        events
+        self.with_observation_gate(|txn| self.observation.lifecycle.subscribe(txn))
     }
 
     fn snapshot_locked(&self) -> Guarded<Arc<ScopeSnapshot>> {
@@ -274,7 +264,7 @@ impl ScopeCell {
     pub(super) fn close_observation_locked(&self, wakes: &mut ObservationTxn<'_>) {
         #[cfg(debug_assertions)]
         wakes.debug_assert_gate(&self.current_observation_gate());
-        if self.observation.closed.load(Ordering::Acquire) {
+        if self.observation.lifecycle.is_closed() {
             return;
         }
         // Closure follows the final state/snapshot/event publication performed
@@ -283,10 +273,10 @@ impl ScopeCell {
         self.observation
             .snapshots
             .close(wakes, move || scope.snapshot_locked());
+        // Both hub closures are idempotent. The lifecycle hub's flag is the
+        // scope's closed marker, so closing it last leaves an unexpected panic
+        // retryable.
         self.observation.lifecycle.close(wakes);
-        // Both hub closures are idempotent. Set the aggregate marker last so
-        // an unexpected panic leaves the operation retryable.
-        self.observation.closed.store(true, Ordering::Release);
     }
 }
 

@@ -1,14 +1,11 @@
 use std::{
     any::Any,
     collections::VecDeque,
-    sync::{
-        Arc, Mutex, MutexGuard, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, MutexGuard, Weak},
 };
 
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::runtime;
 use shelterwood_core::{
@@ -264,7 +261,6 @@ struct ScopeObservation {
     lifecycle_seq: AtomicMonotonicCounter,
     lifecycle: LifecycleHub,
     snapshots: SnapshotHub,
-    closed: AtomicBool,
 }
 
 pub(crate) struct ScopeCell {
@@ -369,7 +365,6 @@ impl ScopeCell {
                 lifecycle_seq: AtomicMonotonicCounter::new(),
                 lifecycle: LifecycleHub::default(),
                 snapshots: SnapshotHub::default(),
-                closed: AtomicBool::new(false),
             },
             #[cfg(test)]
             ancestor_parent_reads: AtomicUsize::new(0),
@@ -1866,7 +1861,7 @@ impl ScopeCell {
     /// result.
     pub(crate) fn close_never_started_body(&self) {
         self.with_observation_gate(|txn| {
-            if self.observation.closed.load(Ordering::Acquire) {
+            if self.observation.lifecycle.is_closed() {
                 return;
             }
             if matches!(self.record().state, ScopeState::Unstarted) {
@@ -1884,7 +1879,7 @@ impl ScopeCell {
     }
 
     pub(crate) fn terminalize_never_started_locked(&self, txn: &mut ObservationTxn<'_>) {
-        if self.observation.closed.load(Ordering::Acquire) {
+        if self.observation.lifecycle.is_closed() {
             return;
         }
         self.member

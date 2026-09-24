@@ -173,14 +173,6 @@ impl AdmissionInstall {
     // obligation. Each claim has exactly one caller and follows the matching
     // take, so these stay diagnostics — and diagnostics under a lock the
     // codebase `.expect()`s are `debug_assert!`s, never panics.
-    fn restore_child(&mut self, child: Box<ChildRuntime>) {
-        debug_assert!(
-            self.child.is_none(),
-            "an admission install restores the runtime it took"
-        );
-        self.child = Some(child);
-    }
-
     fn claim_entry(&mut self, entry: DynamicEntry) {
         debug_assert!(
             self.entry.is_none(),
@@ -610,10 +602,6 @@ impl<T> ChildResources<T> {
         self.0.values()
     }
 
-    fn into_values(self) -> impl Iterator<Item = T> {
-        self.0.into_values()
-    }
-
     #[cfg(test)]
     fn len(&self) -> usize {
         self.0.len()
@@ -773,11 +761,7 @@ impl ScopeRuntime {
         let mut supervisor = SupervisorState::new(wiring.root.flavor, wiring.lifecycle);
         let mut children = ChildResources::default();
         for (expected, child) in wiring.children {
-            let Some(actual) =
-                supervisor_admit(&mut supervisor, child.slot.member.membership(), true)
-            else {
-                panic!("fixture admission produces one key")
-            };
+            let actual = supervisor_admit(&mut supervisor, child.slot.member.membership(), true);
             assert_eq!(actual, expected);
             let replaced = children.insert(actual, child);
             assert!(replaced.is_none(), "fixture child keys are unique");
@@ -904,19 +888,16 @@ impl ScopeRuntime {
         }
     }
 
-    pub(super) fn insert_child(
-        &mut self,
-        child: ChildRuntime,
-        initial: bool,
-    ) -> Result<ChildKey, Box<ChildRuntime>> {
-        let membership = child.slot.member.membership();
-        let Some(key) = supervisor_admit(&mut self.supervisor, membership, initial) else {
-            return Err(Box::new(child));
-        };
+    pub(super) fn insert_child(&mut self, child: ChildRuntime, initial: bool) -> ChildKey {
+        let key = supervisor_admit(
+            &mut self.supervisor,
+            child.slot.member.membership(),
+            initial,
+        );
         // `supervisor_admit` mints every key from this scope's monotonic
         // counter, which never repeats a value, so the insert cannot displace.
         let _ = self.children.insert(key, child);
-        Ok(key)
+        key
     }
 
     #[cfg(test)]
@@ -1044,26 +1025,7 @@ impl ScopeRuntime {
             // or a resident carrying its live arena key, never an unindexed
             // admitted intermediate.
             let child = install.take_child();
-            let key = match self.insert_child(*child, false) {
-                Ok(key) => key,
-                Err(child) => {
-                    // Keep the rejected runtime in the outer ledger across
-                    // locked terminalization. If publication panics, dropping
-                    // the runtime here could re-enter this observation gate
-                    // through its terminality obligation.
-                    install.restore_child(child);
-                    let slot = Arc::clone(install.slot());
-                    drop(state);
-                    slot.terminalize_never_started_locked(&root, txn);
-                    // The supervisor rejects only a membership it already
-                    // holds, and a reservation mints a fresh one.
-                    let id = install.slot().member.id().clone();
-                    return Err(AdmissionRejection {
-                        child: install.take_child(),
-                        error: ReserveError::DuplicateId(id),
-                    });
-                }
-            };
+            let key = self.insert_child(*child, false);
             install.record_key(key);
             install.promote_entry(txn);
             install.install_entry(&mut state, txn);
@@ -1451,32 +1413,11 @@ async fn run_scope_incarnation(
     // exactly one terminality owner for every child.
     let mut supervisor = SupervisorState::new(root.flavor, epoch.lifecycle());
     let mut children = ChildResources::default();
-    let mut rejected_child = None;
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
         let child = ChildRuntime::from_plan(child, &root);
-        let membership = child.slot.member.membership();
-        let Some(key) = supervisor_admit(&mut supervisor, membership, true) else {
-            rejected_child = Some(child);
-            break;
-        };
+        let key = supervisor_admit(&mut supervisor, child.slot.member.membership(), true);
         let _ = children.insert(key, child);
-    }
-    if let Some(child) = rejected_child {
-        // A plan's memberships are distinct, so the supervisor cannot reject
-        // one, but the total fallback still owns real user constructions.
-        // Join their terminality obligations on the ordinary path, let
-        // ScopePlan retire the suffix, and finish this epoch without a
-        // framework unwind. The verdict is
-        // `ShutdownRequested`, not `NeverStarted`: `begin_incarnation` already
-        // published `Starting`, and SPEC B.6's `NeverStarted` states that no
-        // scope incarnation ever began.
-        let mut rejected = children.into_values().collect::<Vec<_>>();
-        rejected.push(child);
-        runtime::dispose_all(rejected).fired().await;
-        drop(plan);
-        epoch.finish(StopReason::ShutdownRequested);
-        return StopReason::ShutdownRequested;
     }
     if let Some(control) = &dynamic {
         root.with_observation_gate(|txn| {

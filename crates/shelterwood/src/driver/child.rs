@@ -671,7 +671,7 @@ impl ScopeRuntime {
         let mut exit = Some(exit);
         let child = self
             .children
-            .get_mut(key)
+            .get_mut(&key)
             .expect("terminalized child remains registered");
         let member = Arc::clone(&child.slot.member);
         let changed = child.terminalize(
@@ -720,7 +720,7 @@ impl ScopeRuntime {
             self.reduce(SupervisorEvent::RemovalSampled { child: key });
             return;
         }
-        let Some(child) = self.children.get(key) else {
+        let Some(child) = self.children.get(&key) else {
             return;
         };
         if self.supervisor.lifecycle().is_draining()
@@ -734,7 +734,7 @@ impl ScopeRuntime {
         let restart_stopped = self.restarts_a_stopped_incarnation(key);
         let incarnation = self
             .children
-            .get_mut(key)
+            .get_mut(&key)
             .expect("the spawnable child remains registered")
             .incarnations
             .mint();
@@ -752,7 +752,7 @@ impl ScopeRuntime {
         }
         let child = self
             .children
-            .get_mut(key)
+            .get_mut(&key)
             .expect("the spawnable child remains registered");
         if let Some(deadline) = child.restart_deadline.take() {
             self.deadlines.cancel(deadline);
@@ -855,7 +855,7 @@ impl ScopeRuntime {
         });
         self.reduce(SupervisorEvent::Spawned { child: key });
         if let Some(effect) = readiness_effect {
-            // `progress_startup` already owns this ordered-startup loop. Do
+            // `settle_supervisor` already owns this ordered-startup loop. Do
             // not re-enter it synchronously for an immediate child.
             let _ = self.apply_readiness_effect(key, incarnation, effect);
         }
@@ -864,7 +864,7 @@ impl ScopeRuntime {
     }
 
     pub(super) fn begin_stop_child(&mut self, key: ChildKey, forced: Option<RecordedOutcome>) {
-        let Some(child) = self.children.get(key) else {
+        let Some(child) = self.children.get(&key) else {
             return;
         };
         if self.supervisor.joined(key) || self.supervisor.is_disposing(key) {
@@ -875,14 +875,13 @@ impl ScopeRuntime {
             .as_ref()
             .is_some_and(|active| active.ladder.is_some())
         {
-            if let Some(active) = self
-                .children
-                .get_mut(key)
-                .and_then(|child| child.active.as_mut())
-                && forced.is_some()
-            {
-                active.forced_outcome = forced;
-            }
+            // A readiness timeout is the only forced stop, and it comes from
+            // a `Waiting` gate. Arming the ladder below leaves the gate
+            // `Ready` or `Disarmed`, neither of which can time out.
+            debug_assert!(
+                forced.is_none(),
+                "a readiness timeout cannot follow an armed stop ladder"
+            );
             return;
         }
         // Shutdown outranks queued readiness (§13). Disarm below without
@@ -892,7 +891,7 @@ impl ScopeRuntime {
             self.reduce(SupervisorEvent::StopStarted { child: key });
             let child = self
                 .children
-                .get_mut(key)
+                .get_mut(&key)
                 .expect("the stopped child remains registered");
             let active = child
                 .active
@@ -939,7 +938,7 @@ impl ScopeRuntime {
     /// `NeverStarted`), then release through disposal. Hard shutdown still
     /// detaches that disposal through `hard_forced`.
     pub(super) fn terminate_inactive(&mut self, key: ChildKey, startup: StartupDisposition) {
-        let Some(child) = self.children.get_mut(key) else {
+        let Some(child) = self.children.get_mut(&key) else {
             return;
         };
         if let Some(deadline) = child.restart_deadline.take() {
@@ -951,7 +950,7 @@ impl ScopeRuntime {
     }
 
     pub(super) fn advance_ladder(&mut self, key: ChildKey, now: Instant) {
-        let Some(child) = self.children.get_mut(key) else {
+        let Some(child) = self.children.get_mut(&key) else {
             return;
         };
         let Some(active) = &mut child.active else {
@@ -1014,7 +1013,7 @@ impl ScopeRuntime {
     pub(super) fn handle_self_stop(&mut self, key: ChildKey, incarnation: Incarnation) {
         let ready_before_stop = self
             .children
-            .get(key)
+            .get(&key)
             .and_then(|child| child.active.as_ref())
             .is_some_and(|active| {
                 active.incarnation == incarnation && active.ready_signal.is_fired()
@@ -1031,7 +1030,7 @@ impl ScopeRuntime {
         }
         if self
             .children
-            .get(key)
+            .get(&key)
             .and_then(|child| child.active.as_ref())
             .is_some_and(|active| active.incarnation == incarnation)
         {
@@ -1050,7 +1049,7 @@ impl ScopeRuntime {
     ) {
         let readiness_effect = self
             .children
-            .get_mut(key)
+            .get_mut(&key)
             .and_then(|child| child.active.as_mut())
             .filter(|active| active.incarnation == incarnation)
             .and_then(|active| {
@@ -1065,10 +1064,10 @@ impl ScopeRuntime {
             // Match the natural signal-before-exit order: ordered startup may
             // advance, and a sole ready child completes aggregate startup
             // before its post-ready exit is classified.
-            self.progress_startup();
+            self.settle_supervisor();
         }
 
-        let Some(child) = self.children.get_mut(key) else {
+        let Some(child) = self.children.get_mut(&key) else {
             return;
         };
         let Some(mut active) = child.active.take() else {
@@ -1125,7 +1124,7 @@ impl ScopeRuntime {
         let startup = self.terminal_startup_disposition(key);
         let child = self
             .children
-            .get_mut(key)
+            .get_mut(&key)
             .expect("the exiting child remains registered");
 
         match dispatch_exit(
@@ -1216,7 +1215,7 @@ impl ScopeRuntime {
         // doomed incarnation ahead of a same-batch intensity trip.
         if let Some(target) = self
             .children
-            .get(key)
+            .get(&key)
             .and_then(|child| child.slot.scope.as_ref())
             .and_then(|scope| scope.pending_incarnation_shutdown())
         {
@@ -1261,7 +1260,7 @@ impl ScopeRuntime {
         if !self.supervisor.contains(key)
             || self.supervisor.is_disposing(key)
             || self.supervisor.joined(key)
-            || self.children.get(key).is_none()
+            || !self.children.contains_key(&key)
         {
             return;
         }
@@ -1312,9 +1311,8 @@ impl ScopeRuntime {
             self.fail_startup(key, &exit);
         }
         // Both routes above are fallible, so the guard retires once, here, by
-        // falling out of scope whichever route ran. Issue #455 removed the
-        // escape hatch that let a driver-layer caller surrender a guard on a
-        // conventional co-owner proof, and the driver owns no observation
+        // falling out of scope whichever route ran. A driver-layer caller
+        // cannot surrender a guard, and the driver owns no observation
         // transaction to surrender into, so `Retained::drop` is the venue:
         // it retires a failed user error through critical disposal at the cost
         // of one blocking-pool job.
@@ -1323,7 +1321,7 @@ impl ScopeRuntime {
         // Release edge. Startup routing can reenter teardown, so re-sample
         // the membership: a hard-force fallback may already have joined it,
         // and a joined remove-retained member may already be pruned.
-        let construction = match self.children.get_mut(key) {
+        let construction = match self.children.get_mut(&key) {
             Some(child) => child.construction.take(),
             None => return,
         };
@@ -1369,13 +1367,13 @@ impl ScopeRuntime {
     /// test. A completion for a membership that already joined — a hard
     /// force or driver teardown stopped waiting for it — is a no-op.
     pub(super) fn handle_construction_disposed(&mut self, key: ChildKey) {
-        if !self.supervisor.is_disposing(key) || self.children.get(key).is_none() {
+        if !self.supervisor.is_disposing(key) || !self.children.contains_key(&key) {
             return;
         }
         self.join_terminal(key);
         if self.supervisor.membership_status(key) == MembershipStatus::Removing {
             self.flush_supervisor_effects();
-        } else if self.children[key].options.retention == crate::Retention::Remove {
+        } else if self.children[&key].options.retention == crate::Retention::Remove {
             self.prune_terminal(key);
         }
     }

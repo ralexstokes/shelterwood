@@ -225,7 +225,7 @@ async fn latched_shutdown_upgrades_an_intensity_drain() {
     let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
 
     scope.spawn_child(key);
-    let active = scope.children[key]
+    let active = scope.children[&key]
         .active
         .as_ref()
         .expect("worker is active");
@@ -277,7 +277,7 @@ async fn force_upgrades_an_intensity_drain_to_shutdown_requested() {
     let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
 
     scope.spawn_child(key);
-    let active = scope.children[key]
+    let active = scope.children[&key]
         .active
         .as_ref()
         .expect("worker is active");
@@ -332,7 +332,7 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
     let incarnations = keys
         .iter()
         .map(|key| {
-            scope.children[*key]
+            scope.children[key]
                 .active
                 .as_ref()
                 .expect("child is active")
@@ -343,7 +343,7 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
     scope.force_all();
 
     for key in &keys {
-        let active = scope.children[*key]
+        let active = scope.children[key]
             .active
             .as_ref()
             .expect("forced child remains active through the tidy beat");
@@ -365,7 +365,7 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
     for (key, incarnation) in keys.iter().zip(incarnations) {
         scope.handle_ready(*key, incarnation);
         assert!(matches!(
-            scope.children[*key].slot.member.record().stage,
+            scope.children[key].slot.member.record().stage,
             MemberStage::Stopping
         ));
     }
@@ -373,7 +373,7 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
     let deadlines = keys
         .iter()
         .map(|key| {
-            scope.children[*key]
+            scope.children[key]
                 .active
                 .as_ref()
                 .and_then(|active| active.ladder)
@@ -384,7 +384,7 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
     scope.force_all();
     for (key, deadline) in keys.iter().zip(deadlines) {
         assert_eq!(
-            scope.children[*key]
+            scope.children[key]
                 .active
                 .as_ref()
                 .and_then(|active| active.ladder)
@@ -504,7 +504,7 @@ async fn nested_join_outcome(
 /// driver run unless the caller yields to it.
 fn force_nested_to_framework_abort(scope: &mut ScopeRuntime, key: ChildKey) -> Instant {
     fn ladder_deadline(scope: &ScopeRuntime, key: ChildKey, phase: &str) -> Instant {
-        scope.children[key]
+        scope.children[&key]
             .active
             .as_ref()
             .expect("the nested incarnation is active")
@@ -517,13 +517,13 @@ fn force_nested_to_framework_abort(scope: &mut ScopeRuntime, key: ChildKey) -> I
 
     scope.force_child(key);
     let escalated = ladder_deadline(scope, key, "escalation's tidy beat");
-    let active = scope.children[key].active.as_ref().expect("still active");
+    let active = scope.children[&key].active.as_ref().expect("still active");
     assert!(
         active.hard_abort_phase.is_none(),
         "force stops at escalation's tidy beat before any framework abort"
     );
     scope.advance_ladder(key, escalated);
-    let active = scope.children[key].active.as_ref().expect("still active");
+    let active = scope.children[&key].active.as_ref().expect("still active");
     assert!(
         active
             .framework_abort
@@ -549,7 +549,7 @@ async fn acknowledged_framework_abort_is_joined_not_task_aborted_at_the_backstop
     scope.spawn_child(key);
 
     let backstop = force_nested_to_framework_abort(&mut scope, key);
-    let ack = scope.children[key]
+    let ack = scope.children[&key]
         .active
         .as_ref()
         .expect("still active")
@@ -575,12 +575,17 @@ async fn acknowledged_framework_abort_is_joined_not_task_aborted_at_the_backstop
     // so even an abort of an otherwise completed driver stays observable.
     let (release, held) = crate::runtime::oneshot::<()>();
     let probe = crate::runtime::spawn(async move { held.receive().await });
-    let active = scope.children[key].active.as_mut().expect("still active");
+    let active = scope
+        .children
+        .get_mut(&key)
+        .and_then(|child| child.active.as_mut())
+        .expect("still active");
     let driver_abort = std::mem::replace(&mut active.abort_handle, probe.abort_handle());
     scope.advance_ladder(key, backstop);
-    scope.children[key]
-        .active
-        .as_mut()
+    scope
+        .children
+        .get_mut(&key)
+        .and_then(|child| child.active.as_mut())
         .expect("still active")
         .abort_handle = driver_abort;
     let _ = release.send(());
@@ -614,7 +619,7 @@ async fn unacknowledged_framework_abort_is_task_aborted_at_the_backstop() {
     // No yield between spawn and the backstop: the nested task is never
     // polled, so it cannot acknowledge.
     let backstop = force_nested_to_framework_abort(&mut scope, key);
-    let ack = scope.children[key]
+    let ack = scope.children[&key]
         .active
         .as_ref()
         .expect("still active")

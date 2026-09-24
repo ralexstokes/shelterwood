@@ -244,7 +244,7 @@ enum ReadyBatchPhase {
     // prefix. Steady-state continuations stay live so one queued by an
     // external handler retains `continue_with`'s next-message priority.
     Steady {
-        mailbox_budget: usize,
+        mailbox_delivered: bool,
     },
     // Fired batches drain the entire pre-fire mailbox prefix, constrain
     // continuations to their captured prefix, and retain every due arming
@@ -258,7 +258,9 @@ enum ReadyBatchPhase {
 impl ReadyBatch {
     fn steady(mailbox_through: AcceptedSequence, offloads_remaining: usize) -> Self {
         Self {
-            phase: ReadyBatchPhase::Steady { mailbox_budget: 1 },
+            phase: ReadyBatchPhase::Steady {
+                mailbox_delivered: false,
+            },
             mailbox_through,
             offloads_remaining,
         }
@@ -282,12 +284,17 @@ impl ReadyBatch {
     }
 
     fn mailbox_budget_exhausted(&self) -> bool {
-        matches!(self.phase, ReadyBatchPhase::Steady { mailbox_budget: 0 })
+        matches!(
+            self.phase,
+            ReadyBatchPhase::Steady {
+                mailbox_delivered: true
+            }
+        )
     }
 
     fn mailbox_is_eligible(&self) -> bool {
         match self.phase {
-            ReadyBatchPhase::Steady { mailbox_budget } => mailbox_budget > 0,
+            ReadyBatchPhase::Steady { mailbox_delivered } => !mailbox_delivered,
             ReadyBatchPhase::Fired { .. } => true,
         }
     }
@@ -318,9 +325,9 @@ impl ReadyBatch {
     }
 
     fn record_mailbox_delivery(&mut self) {
-        if let ReadyBatchPhase::Steady { mailbox_budget } = &mut self.phase {
-            assert!(*mailbox_budget > 0);
-            *mailbox_budget -= 1;
+        if let ReadyBatchPhase::Steady { mailbox_delivered } = &mut self.phase {
+            assert!(!*mailbox_delivered);
+            *mailbox_delivered = true;
         }
     }
 

@@ -90,24 +90,6 @@ impl From<DriverEvent> for Pending {
     }
 }
 
-/// Retains the item that ended a blocking wait. The driver then returns to
-/// its single collection site so this head is arbitrated with every other
-/// input that became eligible before the wake was observed.
-///
-/// The retained head keeps its own lane's FIFO position — it was that
-/// channel's head — but it sits ahead of the whole re-entered collection, so
-/// a woken *control* head precedes the primary lane the collection order
-/// otherwise puts first. `MembershipRemoval` is the only class both lanes
-/// produce (`Removal` and `SelfStop`), and neither ordering of that pair
-/// changes a verdict: readiness publication consults the removal sources at
-/// execution time rather than relying on arbitration position.
-pub(super) fn retain_woken_event(
-    event: DriverEvent,
-    pending: &mut Vec<(ArbitrationClass, Pending)>,
-) {
-    pending.push(Pending::from(event).classified());
-}
-
 /// The three unbounded lanes one driver wake collects from, in collection
 /// order.
 pub(super) struct EventLanes<'a> {
@@ -234,7 +216,7 @@ impl ScopeRuntime {
     /// a stop had ended: the clean cooperative outcome, `Completed` with
     /// `Cancellation::Observed` (SPEC §12's nested-shutdown rule).
     pub(super) fn restarts_a_stopped_incarnation(&self, key: ChildKey) -> bool {
-        self.children.get(key).is_some_and(|child| {
+        self.children.get(&key).is_some_and(|child| {
             dispatch_exit(
                 &Exit::completed(Cancellation::Observed),
                 child.options.restart,
@@ -266,7 +248,7 @@ impl ScopeRuntime {
         {
             return;
         }
-        let Some(child) = self.children.get(key) else {
+        let Some(child) = self.children.get(&key) else {
             return;
         };
         if child.active.is_some() {
@@ -298,7 +280,7 @@ impl ScopeRuntime {
                 child: key,
                 incarnation,
             } => {
-                let Some(child) = self.children.get_mut(key) else {
+                let Some(child) = self.children.get_mut(&key) else {
                     return;
                 };
                 let Some(active) = child.active.as_mut() else {
@@ -319,7 +301,7 @@ impl ScopeRuntime {
                     .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
                     .unwrap_or(false)
                 {
-                    self.progress_startup();
+                    self.settle_supervisor();
                 }
             }
             DeadlineKind::Restart { child } => {
@@ -328,21 +310,21 @@ impl ScopeRuntime {
                 // the level-triggered sources at execution time so a stale
                 // backoff edge never invokes user construction.
                 if self.construction_is_suppressed(child) {
-                    if let Some(child) = self.children.get_mut(child) {
+                    if let Some(child) = self.children.get_mut(&child) {
                         child.restart_deadline.take();
                     }
                 } else {
                     self.spawn_child(child);
-                    // A restart-deadline caller is outside `progress_startup`'s
+                    // A restart-deadline caller is outside `settle_supervisor`'s
                     // ordered loop. Revisit the aggregate in case this spawn's
                     // immediate-readiness effect released its last gate.
-                    self.progress_startup();
+                    self.settle_supervisor();
                 }
             }
             DeadlineKind::Stop { child, incarnation } => {
                 if self
                     .children
-                    .get(child)
+                    .get(&child)
                     .and_then(|child| child.active.as_ref())
                     .is_some_and(|active| active.incarnation == incarnation)
                 {

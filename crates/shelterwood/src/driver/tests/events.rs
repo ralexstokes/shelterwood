@@ -61,10 +61,7 @@ async fn assert_closed_lane_fails_closed(closed_control: bool) {
     assert_eq!(reason, Some(StopReason::ShutdownRequested));
     assert!(pending.is_empty());
     assert!(matches!(
-        scope
-            .completion
-            .as_ref()
-            .map(|completion| completion.reason.get()),
+        scope.completion.as_ref().map(|completion| completion.get()),
         Some(StopReason::ShutdownRequested)
     ));
     drop(scope);
@@ -136,7 +133,7 @@ async fn blocking_primary_wake_recollects_control_removal_before_arbitration() {
     };
 
     let mut pending = Vec::new();
-    super::super::retain_woken_event(event, &mut pending);
+    pending.push(super::super::Pending::from(event).classified());
     assert!(!super::super::collect_event_lanes(
         super::super::EventLanes {
             primary: &mut primary_receiver,
@@ -287,11 +284,11 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     let key = exit.child;
     exit.dispatch(&mut scope);
     assert!(
-        scope.children[key].restart_deadline.is_some(),
+        scope.children[&key].restart_deadline.is_some(),
         "a live fused admission does not suppress the restart at exit dispatch"
     );
     assert!(matches!(
-        scope.children[key].slot.member.record().stage,
+        scope.children[&key].slot.member.record().stage,
         MemberStage::Restarting
     ));
 
@@ -317,10 +314,10 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     scope.handle_deadline(deadline);
 
     assert!(
-        scope.children[key].restart_deadline.is_none(),
+        scope.children[&key].restart_deadline.is_none(),
         "the gate clears the stale backoff edge"
     );
-    assert!(scope.children[key].active.is_none());
+    assert!(scope.children[&key].active.is_none());
     for _ in 0..16 {
         crate::runtime::yield_now().await;
     }
@@ -345,7 +342,7 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     )
     .await;
     scope.handle_construction_disposed(child);
-    assert!(scope.children.get(key).is_none());
+    assert!(!scope.children.contains_key(&key));
 }
 
 #[crate::runtime::test]

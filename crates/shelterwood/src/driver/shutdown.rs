@@ -92,7 +92,7 @@ impl ScopeRuntime {
                 || self.supervisor.is_disposing(key)
                 || self
                     .children
-                    .get(key)
+                    .get(&key)
                     .is_none_or(|child| child.active.is_some())
             {
                 continue;
@@ -102,7 +102,7 @@ impl ScopeRuntime {
         keys.into_iter()
             .filter_map(|key| {
                 self.children
-                    .get(key)
+                    .get(&key)
                     .map(|child| Arc::clone(&child.slot.member))
             })
             .collect()
@@ -185,7 +185,7 @@ impl ScopeRuntime {
         self.begin_stop_child(key, None);
         if let Some(ladder) = self
             .children
-            .get_mut(key)
+            .get_mut(&key)
             .and_then(|child| child.active.as_mut())
             .and_then(|active| active.ladder.as_mut())
         {

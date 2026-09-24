@@ -494,7 +494,7 @@ async fn latched_removal_suppresses_a_queued_start_effect() {
     for _ in 0..8 {
         crate::runtime::yield_now().await;
     }
-    assert!(scope.children[key].active.is_none());
+    assert!(scope.children[&key].active.is_none());
     assert_eq!(
         scope.supervisor.membership_status(key),
         MembershipStatus::Removing
@@ -792,7 +792,7 @@ async fn removal_tolerates_synchronous_reclaim_from_the_stop_funnel() {
     scope.handle_removal(RemovalRequest { key });
 
     assert!(
-        scope.children.get(key).is_none(),
+        !scope.children.contains_key(&key),
         "the stop funnel may reclaim the member before handle_removal returns"
     );
     assert!(root.snapshot().child("worker").is_none());
@@ -1534,7 +1534,7 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
             Some(MembershipStatus::Removing)
         ));
 
-        let active = scope.children[key]
+        let active = scope.children[&key]
             .active
             .as_ref()
             .expect("the removal begins the live stop ladder");
@@ -1542,7 +1542,7 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
         let stop_deadline = active.stop_deadline;
         let deadline_count = scope.deadlines.len();
         scope.handle_removal(duplicate);
-        let active = scope.children[key]
+        let active = scope.children[&key]
             .active
             .as_ref()
             .expect("the duplicate leaves the incarnation active");
@@ -1577,7 +1577,7 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
     assert_eq!(child, key);
     scope.handle_construction_disposed(child);
 
-    assert!(scope.children.get(key).is_none());
+    assert!(!scope.children.contains_key(&key));
     assert!(root.snapshot().child("worker").is_none());
     assert!(
         !control
@@ -1717,7 +1717,7 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     );
 
     exit.dispatch(&mut scope);
-    assert!(scope.children[key].restart_deadline.is_none());
+    assert!(scope.children[&key].restart_deadline.is_none());
     assert_eq!(
         root.snapshot().total_restarts,
         crate::TotalRestarts::ZERO,
@@ -1752,5 +1752,5 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     )
     .await;
     scope.handle_construction_disposed(child);
-    assert!(scope.children.get(key).is_none());
+    assert!(!scope.children.contains_key(&key));
 }

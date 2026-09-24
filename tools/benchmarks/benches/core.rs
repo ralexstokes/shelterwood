@@ -75,10 +75,7 @@ fn start_all(state: &mut SupervisorState, children: &[ChildKey], effects: &mut V
         supervisor::step(state, Event::Spawned { child }, effects);
         supervisor::step(
             state,
-            Event::Ready {
-                child,
-                removal_latched: false,
-            },
+            Event::Ready { child },
             effects,
         );
         settle(state, effects);

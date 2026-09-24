@@ -154,14 +154,7 @@ fn alphabet(keys: &[ChildKey]) -> Vec<Event> {
     for &child in keys {
         events.extend([
             Event::Spawned { child },
-            Event::Ready {
-                child,
-                removal_latched: false,
-            },
-            Event::Ready {
-                child,
-                removal_latched: true,
-            },
+            Event::Ready { child },
             Event::IncarnationComplete { child },
             Event::RestartPending { child },
             Event::StopStarted { child },
@@ -451,15 +444,14 @@ fn check_r5_settlement_reaches_a_fixed_point(transition: &Transition<'_>) {
     );
 }
 
-/// R3 — removal is sampled at the publication transition. A true sample marks
-/// the membership `Removing` first, and readiness is then rejected, so the
-/// removal path can never manufacture the readiness edge it raced.
+/// R3 — removal is sampled at the publication transition. The shell reduces a
+/// fired latch as `RemovalSampled` before `Ready`; the sample marks the
+/// membership `Removing`, and readiness is then rejected, so the removal path
+/// can never manufacture the readiness edge it raced.
 fn check_r3_removal_is_sampled_at_publication(transition: &Transition<'_>) {
     // The rule is stated over the membership, not over the event that latched
     // it: a record that reached `Removing` through any route rejects readiness
-    // from then on. Checking only the latched `Ready` variant would leave the
-    // `RemovalSampled`-then-`Ready { removal_latched: false }` pair — which the
-    // alphabet offers in every such state — asserted about by nothing.
+    // from then on.
     for &child in transition.keys {
         if transition.before.contains(child)
             && transition.before.membership_status(child) == MembershipStatus::Removing
@@ -472,11 +464,7 @@ fn check_r3_removal_is_sampled_at_publication(transition: &Transition<'_>) {
         }
     }
 
-    let Event::Ready {
-        child,
-        removal_latched: true,
-    } = transition.event
-    else {
+    let Event::RemovalSampled { child } = transition.event else {
         return;
     };
     if !transition.after.contains(*child) {
@@ -485,11 +473,7 @@ fn check_r3_removal_is_sampled_at_publication(transition: &Transition<'_>) {
     assert_eq!(
         transition.after.membership_status(*child),
         MembershipStatus::Removing,
-        "a true latch sample marks the membership before readiness is considered"
-    );
-    assert!(
-        !transition.after.initial_ready(*child) || transition.before.initial_ready(*child),
-        "a latched readiness edge cannot join the startup aggregate"
+        "a latch sample marks the membership before readiness is considered"
     );
 }
 

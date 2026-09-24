@@ -146,10 +146,11 @@ pub enum Event {
     Spawned {
         child: ChildKey,
     },
+    /// A readiness edge from the live incarnation. A fired removal latch is
+    /// sampled first, through [`Event::RemovalSampled`], so a removing
+    /// membership rejects the edge.
     Ready {
         child: ChildKey,
-        /// Sample of the synchronous removal latch at step entry.
-        removal_latched: bool,
     },
     IncarnationComplete {
         child: ChildKey,
@@ -536,13 +537,7 @@ impl SupervisorState {
                     record.state = record.state.with_incarnation(IncarnationState::Active);
                 }
             }
-            Event::Ready {
-                child,
-                removal_latched,
-            } => {
-                if removal_latched {
-                    self.sample_removal(child);
-                }
+            Event::Ready { child } => {
                 let Some(record) = self.children.get_mut(&child) else {
                     return;
                 };
@@ -971,14 +966,7 @@ mod tests {
             );
             effects.clear();
             step(&mut state, Event::Spawned { child: expected }, &mut effects);
-            step(
-                &mut state,
-                Event::Ready {
-                    child: expected,
-                    removal_latched: false,
-                },
-                &mut effects,
-            );
+            step(&mut state, Event::Ready { child: expected }, &mut effects);
             assert!(effects.is_empty());
         }
 
@@ -1012,14 +1000,7 @@ mod tests {
         );
         assert!(!state.initial_ready(child));
 
-        step(
-            &mut state,
-            Event::Ready {
-                child,
-                removal_latched: false,
-            },
-            &mut Vec::new(),
-        );
+        step(&mut state, Event::Ready { child }, &mut Vec::new());
 
         assert!(state.initial_ready(child));
         state.check_invariants();
@@ -1082,14 +1063,7 @@ mod tests {
             step(&mut state, Event::Settle, &mut effects);
             effects.clear();
             step(&mut state, Event::Spawned { child }, &mut effects);
-            step(
-                &mut state,
-                Event::Ready {
-                    child,
-                    removal_latched: false,
-                },
-                &mut effects,
-            );
+            step(&mut state, Event::Ready { child }, &mut effects);
         }
         effects.clear();
 
@@ -1303,10 +1277,7 @@ mod tests {
         let terminal = state.child_state(child);
         for event in [
             Event::Spawned { child },
-            Event::Ready {
-                child,
-                removal_latched: false,
-            },
+            Event::Ready { child },
             Event::IncarnationComplete { child },
             Event::RestartPending { child },
             Event::StopStarted { child },
@@ -1333,10 +1304,7 @@ mod tests {
         let child = admit(&mut state, membership, false);
 
         for event in [
-            Event::Ready {
-                child,
-                removal_latched: false,
-            },
+            Event::Ready { child },
             Event::IncarnationComplete { child },
             Event::RestartPending { child },
             Event::StopStarted { child },

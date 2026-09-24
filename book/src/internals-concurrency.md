@@ -104,7 +104,8 @@ drop timing.
 External primitives — the timer wheel, senders, any executor — must never
 hold a raw caller waker, because its `clone`/`wake`/`drop` run
 caller-owned code on the primitive's thread. `WakerProxy`
-(`crates/shelterwood-core/src/waker_proxy.rs`) registers a stable
+(`crates/shelterwood-core/src/waker_proxy.rs`, private to that module)
+registers a stable
 framework-owned waker with the primitive and keeps the caller's real
 waker in a slot behind the leaf mutex; every removal queues the resulting
 user-code effect for after unlock.
@@ -124,7 +125,10 @@ poll.
 first poll with a noop waker (preserving the already-ready fast path with
 no allocation), install and register only if pending, and on the ready
 edge retire the stored caller waker synchronously with any panic
-contained and discarded. `ProxiedSleep` applies the same boundary to
+contained and discarded. It is the proxy's only owner and the only
+waker-proxy item core exports; its one `retire` takes the disposition
+(inline drop or the adapter's disposal function) and flushes it after
+unlock. `ProxiedSleep` applies the same boundary to
 runtime timers, retiring slot-first then cancelling the wheel entry, with
 the poll path retiring inline and drop glue handing the waker to the
 disposal lane.

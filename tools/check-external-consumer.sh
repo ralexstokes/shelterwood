@@ -73,7 +73,6 @@ for seam in \
     ScopeCell \
     WakerAction \
     WakerEffects \
-    WakerProxy \
     WakerSlot \
     actor_ref_from_parts
 do

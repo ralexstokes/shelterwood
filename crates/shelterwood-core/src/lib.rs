@@ -25,8 +25,7 @@ pub mod supervisor;
 pub mod test_support;
 #[doc(hidden)]
 pub mod waker;
-#[doc(hidden)]
-pub mod waker_proxy;
+mod waker_proxy;
 
 pub use deadline::*;
 pub use engine::{MembershipStatus, ScopeState};
@@ -36,4 +35,4 @@ pub use policy::*;
 #[doc(hidden)]
 pub use proxied_sleep::{BoxedSleep, ProxiedSleep};
 #[doc(hidden)]
-pub use waker_proxy::{ProxiedPoll, WakerProxy};
+pub use waker_proxy::ProxiedPoll;

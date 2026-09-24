@@ -6,10 +6,7 @@
 
 use std::task::{Context, Poll};
 
-use shelterwood_core::{
-    ProxiedPoll,
-    waker::{WakerAction, WakerEffects},
-};
+use shelterwood_core::{ProxiedPoll, waker::WakerAction};
 
 use crate::runtime::{OneShotClose, OneShotReceiver, PanicAccumulator, dispose_detached};
 
@@ -88,8 +85,8 @@ impl<T, R: OneShotReceive<T>> DisposingReceiver<T, R> {
         crate::runtime::discard_panic(panics.take());
     }
 
-    /// Takes the caller waker out of the proxy and queues its destructor into
-    /// an effects sink, so it runs with no proxy mutex held.
+    /// Takes the caller waker out of the proxy and runs its destructor from
+    /// the proxy's post-unlock flush, so it runs with no proxy mutex held.
     ///
     /// The delivery seams then *discard* whatever that destructor raises. Two
     /// costs ride on that, both accepted by #398 ruling 3:
@@ -106,10 +103,7 @@ impl<T, R: OneShotReceive<T>> DisposingReceiver<T, R> {
     ///   `call` and `recv`, and a lane submission there is real cost on every
     ///   reply, where a contained drop of a benign waker is nearly free.
     fn retire_reply_waker(&mut self, panics: &mut PanicAccumulator) {
-        let mut effects = WakerEffects::default();
-        self.reply_poll
-            .retire(WakerAction::DropInline, &mut effects);
-        effects.flush(panics);
+        self.reply_poll.retire(WakerAction::DropInline, panics);
     }
 }
 

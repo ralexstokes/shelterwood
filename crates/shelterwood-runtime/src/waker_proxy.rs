@@ -1,6 +1,6 @@
 use std::task::Context;
 
-use shelterwood_core::ProxiedPoll as CoreProxiedPoll;
+use shelterwood_core::{ProxiedPoll as CoreProxiedPoll, waker::WakerAction};
 
 use crate::{PanicAccumulator, discard_panic, dispose_waker};
 
@@ -45,7 +45,7 @@ impl ProxiedPoll {
 
     /// Transfers the stored caller waker to the blocking disposal lane.
     pub(crate) fn retire_detached(&mut self, panics: &mut PanicAccumulator) {
-        self.0.retire_with(dispose_waker, panics);
+        self.0.retire(WakerAction::Run(dispose_waker), panics);
     }
 }
 

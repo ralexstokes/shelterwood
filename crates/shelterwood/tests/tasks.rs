@@ -138,7 +138,7 @@ async fn dynamic_add_resolves_at_admission_and_removal_is_exact() {
         .add_task("worker", definition)
         .await
         .expect("admission succeeds before readiness");
-    let removal = scope.remove_task(&first);
+    let removal = scope.remove_exact(&first);
     drop(removal);
     let first_exit = tokio::time::timeout(Duration::from_secs(1), first.wait())
         .await
@@ -164,10 +164,10 @@ async fn dynamic_add_resolves_at_admission_and_removal_is_exact() {
         .expect("same id is free after detached removal")
         .0;
     assert_eq!(
-        scope.remove_task(&first).await,
+        scope.remove_exact(&first).await,
         RemoveOutcome::AlreadyAbsent
     );
-    assert_eq!(scope.remove_task(&second).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_exact(&second).await, RemoveOutcome::Removed);
     assert_eq!(system.shutdown(SHUTDOWN_BUDGET).await, Ok(()));
 }
 

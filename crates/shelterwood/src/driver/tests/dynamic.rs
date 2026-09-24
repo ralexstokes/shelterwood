@@ -401,7 +401,7 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
             "cycle {cycle} stores exactly the live child and readiness deadline"
         );
 
-        assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+        assert_eq!(scope.remove_exact(&task).await, RemoveOutcome::Removed);
         assert_eq!(
             cell.runtime_storage(),
             RuntimeStorage {

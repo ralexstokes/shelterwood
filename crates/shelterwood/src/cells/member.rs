@@ -204,6 +204,21 @@ enum MemberMailbox {
     },
 }
 
+/// Queues the committed record edge after mailbox discharge, including when
+/// preparation unwinds. The transaction still owns the post-unlock wake.
+struct TerminalRecordPulse<'a, 'gate> {
+    txn: &'a mut ObservationTxn<'gate>,
+    record: Option<&'a runtime::WatchSender<MemberRecord>>,
+}
+
+impl Drop for TerminalRecordPulse<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(record) = self.record {
+            self.txn.pulse(record);
+        }
+    }
+}
+
 impl fmt::Debug for MemberMailbox {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -742,6 +757,13 @@ impl MemberCell {
             record.refresh_retained_exits(&mut surrendered);
         });
         txn.surrender(surrendered);
+        // First terminalizer wins: only a newly stored terminal record owes
+        // a pulse. Own that obligation before fallible mailbox preparation.
+        let notification = TerminalRecordPulse {
+            txn,
+            record: published.then_some(&self.record),
+        };
+        let txn = &mut *notification.txn;
         // SPEC §3.2: store the terminal record, then terminalize the mailbox.
         // The phase flip inside `prepare_termination` is what makes a new
         // send fail `Terminated`, so a sender holding that verdict reads the
@@ -755,12 +777,6 @@ impl MemberCell {
             txn.defer(move || {
                 runtime::dispose_detached(teardown.finish());
             });
-        }
-        // First terminalizer wins. A losing edge neither reclassifies startup
-        // nor publishes a second record edge; a future caller that needs
-        // different semantics must make that race explicit at its boundary.
-        if published {
-            txn.pulse(&self.record);
         }
         terminal_exit
     }
@@ -1032,8 +1048,8 @@ mod tests {
     /// never read a nonterminal record. Holding the record's value guard
     /// stalls the terminalizer at exactly its record store; whatever the
     /// sender surface reports during that stall was published before the
-    /// store. The pass is independent of timing; the bounded window only
-    /// gives a reversed order time to surface.
+    /// store. Wait for the terminalizer's mailbox-state transition before
+    /// checking the verdict; a scheduling timeout fails instead of passing.
     #[test]
     fn a_terminated_send_verdict_is_never_observed_before_the_terminal_record() {
         let mut identity = ScopeIdentity::new();
@@ -1045,25 +1061,34 @@ mod tests {
 
         // Only plain evidence leaves the guarded section; every verdict is
         // judged below, after the watch guard has been released.
-        let (verdict, stage_under_guard, terminalizer) = member.record.read_with(|record| {
-            let terminalizer = {
-                let member = Arc::clone(&member);
-                std::thread::spawn(move || {
-                    member.terminalize(Exit::never_started(), StartupDisposition::Unchanged);
-                })
-            };
-            let deadline = Instant::now() + Duration::from_millis(250);
-            let verdict = loop {
-                let kind = actor.try_send(1).map_err(|error| error.kind);
-                if kind == Err(SendErrorKind::Terminated) || Instant::now() >= deadline {
-                    break kind;
-                }
-                std::thread::yield_now();
-            };
-            (verdict, record.stage.clone(), terminalizer)
-        });
+        let (transitioned, verdict, stage_under_guard, terminalizer) =
+            member.record.read_with(|record| {
+                let terminalizer = {
+                    let member = Arc::clone(&member);
+                    std::thread::spawn(move || {
+                        member.terminalize(Exit::never_started(), StartupDisposition::Unchanged);
+                    })
+                };
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let transitioned = loop {
+                    let terminal = matches!(
+                        *member.mailbox.lock().expect("member mailbox mutex healthy"),
+                        MemberMailbox::Terminal { .. }
+                    );
+                    if terminal || Instant::now() >= deadline {
+                        break terminal;
+                    }
+                    std::thread::yield_now();
+                };
+                let verdict = actor.try_send(1).map_err(|error| error.kind);
+                (transitioned, verdict, record.stage.clone(), terminalizer)
+            });
         terminalizer.join().expect("terminalizer thread succeeds");
 
+        assert!(
+            transitioned,
+            "terminalizer must reach the held record guard"
+        );
         assert_eq!(stage_under_guard, MemberStage::Reserved);
         assert_eq!(
             verdict,

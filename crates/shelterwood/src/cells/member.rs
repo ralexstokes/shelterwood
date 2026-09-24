@@ -307,7 +307,7 @@ impl MemberCell {
     /// `Acquire` pairs with the `Release` store in
     /// [`Self::set_terminal_disposal_pending`]. Two separate edges make a
     /// zero-budget straggler sample (the driver's `collect_stragglers`)
-    /// correct. [`ScopeCell::resident_projections`] now serializes the
+    /// correct. [`ScopeCell::resident_projections`] serializes the
     /// residency clone with `publish_drain` through the observation gate, but
     /// releases that gate before the caller samples this marker and the member
     /// record. Those following reads therefore still rest on the explicit
@@ -836,10 +836,8 @@ mod tests {
         );
     }
 
-    /// Pins the invariant the direct teardown drain has to keep, not the
-    /// rewrite itself: the losing `terminalize_locked` it replaced published
-    /// no record edge either, so no test can separate the two shapes. The
-    /// teardown half is pinned by
+    /// Attaching to a terminal member drains the mailbox without a record
+    /// edge. The teardown half is pinned by
     /// `attach_to_a_terminal_member_finishes_record_before_mailbox_wake`.
     #[test]
     fn attaching_to_a_terminal_member_does_not_republish_its_record() {

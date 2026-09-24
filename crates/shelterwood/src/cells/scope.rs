@@ -767,8 +767,8 @@ impl ScopeCell {
             !matches!(state, ScopeState::Stopped { .. }),
             "terminal scope state is published through publish_stopped_locked"
         );
-        // The marker slice is part of the state-writer signature so the #270
-        // regression guard cannot be reordered at a caller. Every marker is
+        // The marker slice is part of the state-writer signature so a caller
+        // cannot reorder the markers after the record write. Every marker is
         // stored before the `Draining` record write whose release edge makes
         // it visible to zero-budget shutdown samplers on other workers.
         for member in terminal_disposals {
@@ -1678,7 +1678,7 @@ impl ScopeCell {
         // teardown may complete after this transaction returns -- and that a
         // resident's own destructor can never reach an `ObservationTxn`, so
         // SPEC §15.5 requires this removal site to emit the edge explicitly
-        // below instead (#389).
+        // below instead.
         wakes.defer(move || runtime::dispose_detached(residents));
         for removal in removals {
             self.emit_locked(wakes, removal);
@@ -2794,7 +2794,7 @@ mod tests {
 
     /// Coverage for the surviving live-route assertion.
     ///
-    /// `admit_observation_gate` no longer needs one: its legality probe
+    /// `admit_observation_gate` needs none: its legality probe
     /// refuses every stage a started driver can present, so a re-homed live
     /// route is unconstructible there. The reservation-time adoption path has
     /// no such probe, and this is its regression.

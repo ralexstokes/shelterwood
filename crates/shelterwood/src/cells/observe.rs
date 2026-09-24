@@ -707,8 +707,8 @@ impl SnapshotHub {
     ///
     /// The retained watch state is the hub's only record of closure, so an
     /// unsubscribed hub is materialized here rather than left empty: a later
-    /// subscriber must be able to learn that the scope is terminal, and there
-    /// is no longer a separate closed flag for it to read.
+    /// subscriber must be able to learn from this hub alone that the scope is
+    /// terminal.
     pub(crate) fn close(
         &self,
         txn: &mut ObservationTxn<'_>,

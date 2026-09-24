@@ -160,11 +160,9 @@ impl<H> Future for Admission<H> {
         let this = self.as_mut().get_mut();
         loop {
             match &mut this.state {
-                AdmissionState::Immediate(_) => {
-                    let previous = std::mem::replace(&mut this.state, AdmissionState::Done);
-                    let AdmissionState::Immediate(error) = previous else {
-                        unreachable!("the matched admission state was replaced in place")
-                    };
+                AdmissionState::Immediate(error) => {
+                    let error = std::mem::replace(error, ReserveError::NoRuntime);
+                    this.state = AdmissionState::Done;
                     return Poll::Ready(Err(error));
                 }
                 AdmissionState::Unpolled(pending) => {

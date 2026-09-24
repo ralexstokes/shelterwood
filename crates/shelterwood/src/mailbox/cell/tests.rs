@@ -1348,3 +1348,49 @@ fn a_panicking_close_flush_isolates_the_unread_payload() {
         "an unwinding close flush must not destroy unread user messages on the caller's thread"
     );
 }
+
+#[test]
+fn a_panicking_receive_flush_isolates_the_received_message() {
+    let (mailbox, actor) = actor_for::<ThreadRecordingMessage>();
+    let token = configure(
+        &mailbox,
+        ResolvedMailbox::Queue(std::num::NonZeroUsize::new(1).expect("non-zero queue capacity")),
+    );
+    let incarnation = mint_actor_incarnation();
+    bind(&mailbox, token, incarnation);
+    let (dropped, observed) = mpsc::channel();
+    assert!(matches!(
+        actor.try_send(ThreadRecordingMessage(Some(dropped))),
+        Ok(bound) if bound == incarnation
+    ));
+    // Receiving promotes this sender, whose wake panics in the flush.
+    let mut parked = Box::pin(actor.send(ThreadRecordingMessage(None)));
+    let panicking = Waker::from(Arc::new(PanicWake));
+    assert!(
+        parked
+            .as_mut()
+            .poll(&mut Context::from_waker(&panicking))
+            .is_pending()
+    );
+    let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+
+    let panic = catch_unwind(AssertUnwindSafe(|| receiver.try_recv().is_some()))
+        .expect_err("the promoted sender's wake panic reaches the receiver");
+    assert_eq!(
+        panic.downcast_ref::<&'static str>().copied(),
+        Some("injected waker panic")
+    );
+    assert_ne!(
+        observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the received message reaches detached disposal"),
+        std::thread::current().id(),
+        "the unwind does not destroy the received message on the receiver's stack"
+    );
+    assert!(matches!(
+        parked
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(bound)) if bound == incarnation
+    ));
+}

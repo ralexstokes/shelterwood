@@ -74,8 +74,9 @@ watcher); the pulse is what makes its pending `changed()` future ready.
 ## The receive loop
 
 The loop every actor runs — raw or callback — lives in
-`RawContext::recv` (`crates/shelterwood/src/raw/context.rs`). Its wait is
-a nested two-way select over four sources: the shutdown latch, the
+`RawContext::recv` (`crates/shelterwood/src/raw/context.rs`); its wait
+and the ready selector described below live in
+`crates/shelterwood/src/raw/context/select.rs`. The wait is a nested two-way select over four sources: the shutdown latch, the
 local-stop latch, the mailbox/offload change signals, and the earliest
 keyed-timer deadline (kept outside the nested select and applied as a
 timeout around it).

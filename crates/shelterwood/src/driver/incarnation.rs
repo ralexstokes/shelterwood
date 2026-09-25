@@ -77,6 +77,75 @@ pub(super) async fn run_scope(plan: ScopePlan, role: ScopeRole) -> Guarded<StopR
     Guarded::new(run_scope_incarnation(plan, role, epoch).await)
 }
 
+/// Which source ended a [`wait_scope`].
+pub(super) enum ScopeWake<T> {
+    Signal,
+    ParentShutdown,
+    Message(Option<T>),
+    ControlMessage(Option<T>),
+    Deadline,
+}
+
+/// The two command sources a [`wait_scope`] polls ahead of its event lanes.
+pub(super) struct ScopeWait<S, C> {
+    pub(super) signal: S,
+    pub(super) parent_shutdown: C,
+}
+
+/// Waits for the first of the scope's wake sources.
+///
+/// Ties resolve in the fixed order signal, parent shutdown, primary message,
+/// control message, deadline. The event sources nest in two left-biased
+/// `select_two`s, commands on the left and lanes on the right, so one poll
+/// visits them in exactly that order.
+pub(super) async fn wait_scope<S, C, T>(
+    wait: ScopeWait<S, C>,
+    receiver: &mut runtime::UnboundedMpscReceiver<T>,
+    control_receiver: Option<&mut runtime::UnboundedMpscReceiver<T>>,
+    deadline: Option<Instant>,
+) -> ScopeWake<T>
+where
+    S: Future<Output = ()> + Send,
+    C: Future<Output = ()> + Send,
+    T: Send,
+{
+    let ScopeWait {
+        signal,
+        parent_shutdown,
+    } = wait;
+    let control_message = async move {
+        if let Some(receiver) = control_receiver {
+            receiver.recv().await
+        } else {
+            std::future::pending().await
+        }
+    };
+    let commands = runtime::select_two(signal, parent_shutdown);
+    let messages = runtime::select_two(receiver.recv(), control_message);
+    let event = async move {
+        match runtime::select_two(commands, messages).await {
+            runtime::Either::Left(runtime::Either::Left(())) => ScopeWake::Signal,
+            runtime::Either::Left(runtime::Either::Right(())) => ScopeWake::ParentShutdown,
+            runtime::Either::Right(runtime::Either::Left(message)) => ScopeWake::Message(message),
+            runtime::Either::Right(runtime::Either::Right(message)) => {
+                ScopeWake::ControlMessage(message)
+            }
+        }
+    };
+    // The deadline stays outside the whole event selection so every event
+    // winner retires the timer through `timeout_at`'s synchronous poll-path
+    // boundary. Burying the sleep in a select arm would run its drop-glue
+    // disposal venue every time another arm won -- one blocking-lane
+    // submission per driver wakeup while any deadline is armed.
+    match deadline {
+        Some(deadline) => match runtime::timeout_at(deadline, event).await {
+            runtime::Timeout::Completed(wake) => wake,
+            runtime::Timeout::Elapsed => ScopeWake::Deadline,
+        },
+        None => event.await,
+    }
+}
+
 /// Blocks the driver loop until one lane wakes it, returning `Some` only when
 /// the wake staged a scope completion the loop must return.
 #[must_use = "a staged fail-closed completion must end the driver loop"]
@@ -114,8 +183,8 @@ pub(super) async fn wait_for_scope_wake(
         };
         let _ = runtime::select_two(shutdown, abort).await;
     };
-    match runtime::wait_scope(
-        runtime::ScopeWait {
+    match wait_scope(
+        ScopeWait {
             signal: signal.changed(),
             parent_shutdown: ancestor_command,
         },
@@ -125,8 +194,8 @@ pub(super) async fn wait_for_scope_wake(
     )
     .await
     {
-        runtime::ScopeWake::Signal | runtime::ScopeWake::ParentShutdown => {}
-        runtime::ScopeWake::Message(None) | runtime::ScopeWake::ControlMessage(None) => {
+        ScopeWake::Signal | ScopeWake::ParentShutdown => {}
+        ScopeWake::Message(None) | ScopeWake::ControlMessage(None) => {
             // Every lane sender is retained by the scope runtime or one of its
             // registered children until the driver loop exits. A closed
             // receiver would otherwise make this select arm permanently ready
@@ -138,7 +207,7 @@ pub(super) async fn wait_for_scope_wake(
             scope.completion = Some(Guarded::new(reason.clone()));
             return Some(reason);
         }
-        runtime::ScopeWake::Deadline => {
+        ScopeWake::Deadline => {
             // What SPEC §7/§13 guarantee is that a readiness latch already
             // fired when its deadline is handled wins the tie:
             // `handle_deadline` feeds the retained latch into the engine.
@@ -150,8 +219,7 @@ pub(super) async fn wait_for_scope_wake(
             // driver handles its deadline, so the deadline can still win.
             runtime::yield_now().await;
         }
-        runtime::ScopeWake::Message(Some(event))
-        | runtime::ScopeWake::ControlMessage(Some(event)) => {
+        ScopeWake::Message(Some(event)) | ScopeWake::ControlMessage(Some(event)) => {
             // Retain the head that ended the wait and return to the single
             // collection site, so it is arbitrated with every input that
             // became eligible before the wake was observed. It keeps its own

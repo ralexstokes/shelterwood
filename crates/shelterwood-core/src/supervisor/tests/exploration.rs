@@ -8,11 +8,14 @@
 //! to be reachable at all.
 //!
 //! What the walk checks is the reducer-expressible subset of SPEC's invariant
-//! list: R1–R6, E4, and S3–S5 (§15.3). The rest of the list —
+//! list: R1–R6, E4, S3–S5, and T5's removal lifecycle (§15.3). Most are stated
+//! per transition; the cardinality and ordering ones — an effect issued at
+//! most once along a path, or only after another — are stated over a per-path
+//! [`History`] the walk explores alongside the state. The rest of the list —
 //! the stop ladder (S1/S2), the sampled latches (S6), driver death (S7), the
-//! exit funnel (E1–E3/E5/E6), and tree lowering (T1–T7) — is not stated over
-//! `SupervisorState`, so it is not claimable here and is left to the engine
-//! and integration suites that already own it.
+//! exit funnel (E1–E3/E5/E6), tree lowering (T1–T4, T6, T7) and T5's handle
+//! matching — is not stated over `SupervisorState`, so it is not claimable
+//! here and is left to the engine and integration suites that already own it.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -238,6 +241,144 @@ struct Transition<'a> {
     after: &'a SupervisorState,
     effects: &'a [Effect],
     keys: &'a [ChildKey],
+    /// What the path reaching `before` has already issued.
+    history: &'a History,
+    /// `history` extended by this transition.
+    history_after: &'a History,
+}
+
+/// Where a [`Effect::StopChild`] comes from. The reducer has two stop sources
+/// with separate cardinality rules: a removal commit stops its child once per
+/// key, and a drain stops each child once per scope (S3). Force is a third
+/// command, but it speaks [`Effect::ForceChild`], not a stop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopSource {
+    Removal,
+    Drain,
+}
+
+impl StopSource {
+    fn of(event: &Input) -> Self {
+        match event {
+            Input::Step(Event::RemovalLatched { .. }) => Self::Removal,
+            _ => Self::Drain,
+        }
+    }
+}
+
+/// The per-path facts the cardinality and ordering invariants are stated over,
+/// as one bit per roster slot (or per scope).
+///
+/// Cardinality ("at most once along a path") is a property of paths, and the
+/// walk visits states. Rather than trust the reducer's own bookkeeping to record
+/// that an effect was issued — which is the very thing a duplicate-emission bug
+/// gets wrong — the walk runs this monitor beside the reducer and explores the
+/// product: [`explore`] keys its visited set on the pair of the state's
+/// fingerprint and this history. Every check below is a function of
+/// `(before, history, transition)`, and every reachable pair is expanded
+/// against the whole alphabet, so checking every product transition is
+/// checking every path. The monitor is bits, never counts: a second issue is a
+/// failure at the transition that issues it, so no value above one is ever
+/// stored and the product stays finite.
+///
+/// Every field is learned from what the walk observes — effects emitted and
+/// state edges taken — never read from a reducer field, so a mutation that
+/// forgets its own issue flag cannot also blind the monitor.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+struct History {
+    /// Slots whose incarnation has taken an accepted spawn edge.
+    spawned: u8,
+    /// Slots a drain has issued a stop for.
+    drain_stopped: u8,
+    /// Slots whose removal command has committed and issued its effect.
+    committed: u8,
+    /// Slots whose removal has been finalized.
+    finalized: u8,
+    finished: bool,
+}
+
+// One bit per slot in each `u8` field.
+const _: () = assert!(MAX_WIDTH <= u8::BITS as usize);
+
+fn bit(keys: &[ChildKey], child: ChildKey) -> u8 {
+    1 << keys
+        .iter()
+        .position(|candidate| *candidate == child)
+        .expect("the walk only ever names roster keys")
+}
+
+impl History {
+    /// Records one emitted effect. Folded in emission order, so a duplicate
+    /// within one step is as visible to the checks as one across steps.
+    fn issue(&mut self, effect: &Effect, event: &Input, keys: &[ChildKey]) {
+        match effect {
+            Effect::StopChild { child } => match StopSource::of(event) {
+                StopSource::Removal => self.committed |= bit(keys, *child),
+                StopSource::Drain => self.drain_stopped |= bit(keys, *child),
+            },
+            Effect::FinalizeRemoval { child } => {
+                // A commit that finds its child already joined finalizes in
+                // place: the finalize is the commit's effect.
+                if matches!(event, Input::Step(Event::RemovalLatched { .. })) {
+                    self.committed |= bit(keys, *child);
+                }
+                self.finalized |= bit(keys, *child);
+            }
+            Effect::Finished { .. } => self.finished = true,
+            Effect::StartChild { .. }
+            | Effect::ForceChild { .. }
+            | Effect::StartupCompleted { .. } => {}
+        }
+    }
+
+    /// The history of the path extended by one transition.
+    fn after(
+        mut self,
+        before: &SupervisorState,
+        event: &Input,
+        after: &SupervisorState,
+        effects: &[Effect],
+        keys: &[ChildKey],
+    ) -> Self {
+        for &child in keys {
+            // E4 admits exactly one edge into `Active`: the spawn.
+            if incarnation(before, child) != Some(IncarnationState::Active)
+                && incarnation(after, child) == Some(IncarnationState::Active)
+            {
+                self.spawned |= bit(keys, child);
+            }
+        }
+        for effect in effects {
+            self.issue(effect, event, keys);
+        }
+        // A reclaimed key never returns (E4) and no effect can name it (R5),
+        // so its history can no longer fail a check. Forgetting it keeps two
+        // paths that differ only in a retired key's past from being explored
+        // twice.
+        for &child in keys {
+            if !after.contains(child) {
+                self.forget(bit(keys, child));
+            }
+        }
+        self
+    }
+
+    fn forget(&mut self, slot: u8) {
+        let Self {
+            spawned,
+            drain_stopped,
+            committed,
+            finalized,
+            finished: _,
+        } = self;
+        for field in [spawned, drain_stopped, committed, finalized] {
+            *field &= !slot;
+        }
+    }
+
+    fn has(field: u8, keys: &[ChildKey], child: ChildKey) -> bool {
+        field & bit(keys, child) != 0
+    }
 }
 
 struct Exploration {
@@ -263,33 +404,39 @@ fn explore(
     let alphabet = alphabet(&keys);
     let minted = root.keys.current();
 
+    // The visited set is over the product of reducer state and path history;
+    // see [`History`] for why that makes path properties checkable.
     let mut seen = HashSet::new();
-    seen.insert(fingerprint(&root, &keys));
+    let history = History::default();
+    seen.insert((fingerprint(&root, &keys), history));
     let mut frontier = VecDeque::new();
-    frontier.push_back(root);
+    frontier.push_back((root, history));
     let mut transitions = 0;
     let mut effects = Vec::new();
-    while let Some(before) = frontier.pop_front() {
+    while let Some((before, history)) = frontier.pop_front() {
         for event in &alphabet {
             let mut after = before.clone();
             effects.clear();
             event.apply(&mut after, &mut effects);
             transitions += 1;
             after.check_invariants();
+            let history_after = history.after(&before, event, &after, &effects, &keys);
             check(&Transition {
                 before: &before,
                 event,
                 after: &after,
                 effects: &effects,
                 keys: &keys,
+                history: &history,
+                history_after: &history_after,
             });
             // The key counter is left out of the fingerprint on the grounds
             // that only admission advances it, and admission is not in the
             // alphabet. That is the whole argument, so check it rather than
             // trust it.
             assert_eq!(after.keys.current(), minted, "the walk never admits");
-            if seen.insert(fingerprint(&after, &keys)) {
-                frontier.push_back(after);
+            if seen.insert((fingerprint(&after, &keys), history_after)) {
+                frontier.push_back((after, history_after));
             }
         }
     }
@@ -783,6 +930,208 @@ fn check_t9_removal_effects_are_issued_once(transition: &Transition<'_>) {
     }
 }
 
+/// R4 along a path — the reducer asks for one accepted start per unspawned
+/// initial member, and ordered startup reaches them in declaration order.
+///
+/// Start effects are level-triggered, so repeating one before its spawn is
+/// expected (R5's fixed point reproduces it); what R4 forbids is a request
+/// after the edge it asks for has been taken. Restarts are not the reducer's
+/// to request: an incarnation that has spawned once is respawned by the
+/// shell's restart path, so a start for it would be a second, unaccepted edge.
+///
+/// For ordered scopes R4 is stated over the cursor: "the settlement step emits
+/// a start effect only for the current initial cursor, and advances the cursor
+/// only past a spawned-and-ready member or a reclaimed slot, reaching every
+/// initial member in declaration order" (§11: "readiness-gated startup in
+/// declaration order"). Declaration order along the path follows from the
+/// cursor only ever moving forward, so the ordering is checked per transition
+/// and needs no history — which matters, because "was ready when the cursor
+/// passed" is not recoverable from a later state once a restart re-arms the
+/// bit, and carrying it as history cost the walk half again its states.
+fn check_r4_start_effects_along_a_path(transition: &Transition<'_>) {
+    let keys = transition.keys;
+    for effect in transition.effects {
+        let Effect::StartChild { child } = effect else {
+            continue;
+        };
+        assert!(
+            transition.before.is_initial(*child),
+            "the reducer starts initial members only; runtime admissions are started by the \
+             shell, got a start for {child:?}"
+        );
+        assert!(
+            !History::has(transition.history.spawned, keys, *child),
+            "a start was requested for {child:?} after its spawn edge was accepted: one \
+             accepted start per member (R4)"
+        );
+        if transition.before.flavor() == ScopeFlavor::Ordered {
+            assert_eq!(
+                transition.after.next_ordered_start(),
+                Some(*child),
+                "ordered startup starts only the member under its cursor (R4)"
+            );
+        }
+    }
+
+    let (from, to) = (
+        transition.before.next_ordered_start(),
+        transition.after.next_ordered_start(),
+    );
+    if from == to {
+        return;
+    }
+    let from = from.expect("the ordered start cursor never rewinds from exhaustion (R4)");
+    assert!(
+        to.is_none_or(|to| to > from),
+        "the ordered start cursor moved {from:?} -> {to:?}, which is not forward (R4)"
+    );
+    for &passed in keys
+        .iter()
+        .filter(|&&key| key >= from && to.is_none_or(|to| key < to))
+    {
+        // A reclaimed slot is passed freely; `is_initial` is false for it.
+        if !transition.before.is_initial(passed) {
+            continue;
+        }
+        assert!(
+            History::has(transition.history.spawned, keys, passed)
+                && transition.before.initial_ready(passed),
+            "the ordered start cursor passed {passed:?} before it had spawned and published \
+             readiness (R4), via {:?}",
+            transition.event
+        );
+    }
+}
+
+/// S3 along a path — a drain stops each child once, and an ordered drain
+/// stops them in reverse declaration order, one at a time.
+///
+/// Dynamic drain entry "emits one stop per incomplete child"; ordered
+/// settlement "exposes at most one incomplete child and does not advance
+/// until it joins" (S3), which §11 states as "reverse declaration order, one
+/// at a time … the cursor child is aborted *and joined* … before the ladder
+/// advances to the next sibling". The per-transition S3 check sees one pass;
+/// this one sees the sequence. Removal stops are a separate source with their
+/// own once-per-key rule (see [`check_t5_removal_effects_along_a_path`]).
+///
+/// A reclaimed key's stop is forgotten with the key (see [`History::after`]).
+/// It had joined to be reclaimed, so it has already met the one-at-a-time
+/// rule; only the order comparison against it is given up.
+fn check_s3_drain_stops_along_a_path(transition: &Transition<'_>) {
+    if StopSource::of(transition.event) != StopSource::Drain {
+        return;
+    }
+    let keys = transition.keys;
+    let mut history = *transition.history;
+    for effect in transition.effects {
+        if let Effect::StopChild { child } = effect {
+            assert!(
+                !History::has(history.drain_stopped, keys, *child),
+                "a drain stopped {child:?} twice along one path (S3), via {:?}",
+                transition.event
+            );
+            if transition.before.flavor() == ScopeFlavor::Ordered {
+                for &stopped in keys {
+                    if !History::has(history.drain_stopped, keys, stopped) {
+                        continue;
+                    }
+                    assert!(
+                        stopped > *child,
+                        "ordered teardown stopped {child:?} after {stopped:?}, which is not \
+                         reverse declaration order (S3, §11)"
+                    );
+                    assert!(
+                        !transition.before.is_incomplete(stopped),
+                        "ordered teardown stopped {child:?} before the previously stopped \
+                         {stopped:?} had joined (S3, §11)"
+                    );
+                }
+            }
+        }
+        history.issue(effect, transition.event, keys);
+    }
+}
+
+/// T5 along a path — each key's removal commits once, is finalized once, is
+/// finalized only after it commits, and is finalized as soon as a committed
+/// key has joined.
+///
+/// This restates [`check_t9_removal_effects_are_issued_once`] without its
+/// premise: that check derives cardinality from `Removing(Joined)` being
+/// absorbing, so it is only as good as the reducer's state encoding. This one
+/// counts the effects themselves. The pairing is the contract on
+/// [`Effect::FinalizeRemoval`] — "whichever of the commit and the terminal join
+/// comes second emits it" — and SPEC T5's "once sampled, the state stays
+/// `Removing` through stop, terminalization, finalization, and reclaim"; R3
+/// puts reclaim after the `Removed` publication that finalization drives, so a
+/// committed key must never join without its finalize.
+fn check_t5_removal_effects_along_a_path(transition: &Transition<'_>) {
+    let keys = transition.keys;
+    let committing = matches!(transition.event, Input::Step(Event::RemovalLatched { .. }));
+    let mut history = *transition.history;
+    for effect in transition.effects {
+        // A commit's effect is its stop, or its finalize when the child has
+        // already joined; either way it is the key's one commit.
+        if committing
+            && let Effect::StopChild { child } | Effect::FinalizeRemoval { child } = effect
+        {
+            assert!(
+                !History::has(history.committed, keys, *child),
+                "a removal of {child:?} committed twice along one path"
+            );
+        }
+        if let Effect::FinalizeRemoval { child } = effect {
+            assert!(
+                !History::has(history.finalized, keys, *child),
+                "a removal of {child:?} was finalized twice along one path, via {:?}",
+                transition.event
+            );
+            assert!(
+                committing || History::has(history.committed, keys, *child),
+                "a removal of {child:?} was finalized before its command committed, via {:?}",
+                transition.event
+            );
+        }
+        history.issue(effect, transition.event, keys);
+    }
+    for &child in keys {
+        if History::has(transition.history_after.committed, keys, child)
+            && transition.after.joined(child)
+        {
+            assert!(
+                History::has(transition.history_after.finalized, keys, child),
+                "a committed removal of {child:?} joined without being finalized, via {:?}",
+                transition.event
+            );
+        }
+    }
+}
+
+/// S5 along a path — the finish effect is issued at most once.
+///
+/// S5: "the finish effect is emitted once". The per-transition S5 check reads
+/// `finish_emitted` to say so, which is only as good as that flag: a
+/// transition that cleared it would clear the evidence with it. This bounds the
+/// edge per path from the effects themselves.
+///
+/// R6's "emitted at most once" needs no counterpart here: the per-transition
+/// R6 check already confines completion to a settle of a `Starting` scope and
+/// forbids a completed startup from rewinding, so a second completion along
+/// any path fails one of those first.
+fn check_s5_finish_issues_once(transition: &Transition<'_>) {
+    let mut history = *transition.history;
+    for effect in transition.effects {
+        if let Effect::Finished { .. } = effect {
+            assert!(
+                !history.finished,
+                "the scope finished twice along one path (S5), via {:?}",
+                transition.event
+            );
+        }
+        history.issue(effect, transition.event, transition.keys);
+    }
+}
+
 /// S5 — completion is derived and level-triggered: `all_children_joined`
 /// agrees with the per-child fold at every reachable state, and `Finished` is
 /// emitted once, only against that derived value.
@@ -861,4 +1210,8 @@ fn check_every_invariant(transition: &Transition<'_>) {
     check_s3_s4_stop_sequencing_and_drain_lattice(transition);
     check_s5_derived_level_triggered_completion(transition);
     check_t9_removal_effects_are_issued_once(transition);
+    check_r4_start_effects_along_a_path(transition);
+    check_s3_drain_stops_along_a_path(transition);
+    check_t5_removal_effects_along_a_path(transition);
+    check_s5_finish_issues_once(transition);
 }

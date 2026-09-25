@@ -66,8 +66,8 @@ thiserror = "2.0.19"
 # shelterwood-runtime/src/disposal.rs
 #   - `embedder_runtime_teardown_isolates_a_task_held_value`: the blocking
 #     pool shuts down before live tasks are dropped.
-# shelterwood/tests/{reply,result}_delivery_waker_proxy.rs, timer_waker_proxy.rs
-# shelterwood/tests/admission_removal_waker_proxy.rs
+# shelterwood/tests/regressions/{reply,result}_delivery_waker_proxy.rs
+# shelterwood/tests/regressions/{timer,admission_removal}_waker_proxy.rs
 #   - Regressions for the proxies above; the timer one relies on
 #     `Handle::clear_entry` dropping a waker under the time-driver mutex.
 # shelterwood/tests/common/timing.rs

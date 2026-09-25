@@ -35,8 +35,9 @@ impl Actor for IdleActor {
 /// The ordinal `Deadlined::poll` hands the timer proxy's stored caller waker.
 /// The operation registers its own clone first, so the timer's is second; the
 /// timer itself only ever sees the stable framework-owned proxy and mints no
-/// further clone through this vtable.
-const TIMER_CALLER_WAKER_ORDINAL: usize = 2;
+/// further clone through this vtable. `mailbox_future_drop_containment` pins
+/// the same seam.
+pub(super) const TIMER_CALLER_WAKER_ORDINAL: usize = 2;
 
 /// A caller waker whose timer-proxy clone blocks when the framework retires
 /// it. Naming the ordinal rather than blocking on whichever clone retires

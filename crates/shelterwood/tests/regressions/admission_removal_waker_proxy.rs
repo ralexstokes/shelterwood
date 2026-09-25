@@ -7,14 +7,14 @@
 //! `shelterwood-runtime`'s `sync` unit tests instead.
 //! Listed for re-audit beside the Tokio pin in the workspace `Cargo.toml`.
 
-mod common;
-
 use std::{
     future::Future,
     task::{Context, Poll},
 };
 
-use common::{SHUTDOWN_BUDGET, assert_eventually, hostile_waker, waiting::task as waiting_task};
+use crate::common::{
+    SHUTDOWN_BUDGET, assert_eventually, hostile_waker, waiting::task as waiting_task,
+};
 use shelterwood::{ChildState, DynamicTree, RemoveOutcome};
 
 /// Admission does not enqueue its driver request until first poll. A

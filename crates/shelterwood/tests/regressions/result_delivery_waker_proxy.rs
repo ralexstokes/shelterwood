@@ -1,12 +1,12 @@
-mod common;
-
 use std::{
     future::Future,
     sync::mpsc,
     task::{Context as TaskContext, Poll},
 };
 
-use common::{DestructorGate, POLL_TIMEOUT, SHUTDOWN_BUDGET, hostile_waker, poll_until_ready};
+use crate::common::{
+    DestructorGate, POLL_TIMEOUT, SHUTDOWN_BUDGET, hostile_waker, poll_until_ready,
+};
 use shelterwood::{Actor, ActorOnceDef, Blocking, Context, ExitError, ExitResult, Tree};
 
 struct DeliveredValue {

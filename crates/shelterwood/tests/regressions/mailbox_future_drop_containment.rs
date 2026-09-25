@@ -10,8 +10,6 @@
 //! runner (`cargo test`) an abort would instead take the whole binary down --
 //! still a loud failure, but an unattributed one.
 
-mod common;
-
 use std::{
     future::Future,
     mem::ManuallyDrop,
@@ -25,7 +23,8 @@ use std::{
     time::Duration,
 };
 
-use common::{SHUTDOWN_BUDGET, ordinal_drop_waker, probe_waker_with_wake};
+use super::timer_waker_proxy::TIMER_CALLER_WAKER_ORDINAL;
+use crate::common::{SHUTDOWN_BUDGET, ordinal_drop_waker, probe_waker_with_wake};
 use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Reply, Tree};
 
 const OUTER_PANIC: &str = "injected outer panic";
@@ -125,8 +124,6 @@ async fn recv_drop_contains_receiver_waker_during_unwind() {
     let (_reply, receiver) = actor.reply_channel::<u8>();
     assert_pending_then_unwind(Box::pin(receiver.recv(Duration::MAX)));
 }
-
-const TIMER_CALLER_WAKER_ORDINAL: usize = 2;
 
 /// Stands in for a user reply whose destructor is hostile. Only the abort
 /// half of the regression destroys one; the success path forgets it.

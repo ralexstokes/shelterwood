@@ -705,32 +705,15 @@ mod tests {
         // Then each retirement seam in turn, because every one of them is
         // reachable from drop glue, where a panicking acquisition during an
         // unwind is an abort rather than a failure. First the mailbox seam:
-        // `retire` into an effects sink (`DisposingReceiver::drop`).
+        // `retire` into an effects sink (`DisposingReceiver::drop`). The
+        // adapter's `Run` disposition takes this same acquisition; its
+        // after-unlock forwarding is `run_retirement_invokes_its_disposer_after_unlock`.
         let retired = Waker::from(Arc::new(ReentrantDrop(Arc::downgrade(&proxy.state))));
         proxy.register(&retired);
         drop(retired);
         let mut effects = WakerEffects::default();
         proxy.retire(WakerAction::DropInline, &mut effects);
         drop(effects);
-
-        // Then the adapter's disposer seam `shelterwood-runtime`'s
-        // `ProxiedPoll::drop` reaches: a `Run` retirement that both takes the
-        // caller and runs the chosen function from the flush.
-        let wakes = Arc::new(AtomicUsize::new(0));
-        proxy.register(&Waker::from(Arc::new(ReentrantWake {
-            proxy: Arc::downgrade(&proxy.state),
-            wakes: Arc::clone(&wakes),
-        })));
-        let mut effects = WakerEffects::default();
-        proxy.retire(WakerAction::Run(forward_wake), &mut effects);
-        let mut panics = PanicAccumulator::default();
-        effects.flush(&mut panics);
-        assert!(panics.take().is_none());
-        assert_eq!(
-            wakes.load(Ordering::SeqCst),
-            1,
-            "a Run retirement still takes the caller and forwards it after unlock"
-        );
 
         // Finally the fallback: leave a caller installed so drop glue both
         // acquires the poisoned leaf and drains a real user waker. Its

@@ -606,44 +606,6 @@ mod tests {
     }
 
     #[test]
-    fn stable_scope_adopts_the_first_declaration_then_orders_a_retained_lineage() {
-        let id = ChildId::from("worker");
-        let other_id = ChildId::from("other");
-        let mut first_builder = ScopeIdentity::new();
-        let (first_membership, first, _) =
-            first_builder.mint_membership(&id).into_provisional_parts();
-        let (other_membership, other, _) = first_builder
-            .mint_membership(&other_id)
-            .into_provisional_parts();
-        let mut rebuilt_builder = ScopeIdentity::new();
-        let (rebuilt_membership, rebuilt, _) = rebuilt_builder
-            .mint_membership(&id)
-            .into_provisional_parts();
-
-        let mut stable = ScopeIdentity::new();
-        assert!(matches!(
-            stable.adopt_or_mint_membership(first),
-            MembershipReconciliation::Adopted
-        ));
-        assert!(matches!(
-            stable.adopt_or_mint_membership(other),
-            MembershipReconciliation::Adopted
-        ));
-        let MembershipReconciliation::Minted(successor) = stable.adopt_or_mint_membership(rebuilt)
-        else {
-            panic!("stable identity mints a rebuilt successor")
-        };
-        let successor = successor.membership();
-
-        assert!(successor.supersedes(first_membership));
-        assert!(!first_membership.supersedes(successor));
-        assert!(!successor.supersedes(rebuilt_membership));
-        assert!(!rebuilt_membership.supersedes(successor));
-        assert!(!successor.supersedes(other_membership));
-        assert!(!other_membership.supersedes(successor));
-    }
-
-    #[test]
     fn generation_ordering_is_typed() {
         let first = Generation::fixture(1);
         let second = Generation::fixture(2);

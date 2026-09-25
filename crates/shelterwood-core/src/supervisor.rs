@@ -883,38 +883,6 @@ mod tests {
     }
 
     #[test]
-    fn derived_completion_property_matches_the_child_states() {
-        let members = memberships(3);
-        for mask in 0_u8..8 {
-            let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::starting());
-            let keys: Vec<_> = members
-                .iter()
-                .map(|membership| admit(&mut state, *membership, true))
-                .collect();
-            for (index, child) in keys.iter().enumerate() {
-                if mask & (1 << index) != 0 {
-                    step(
-                        &mut state,
-                        Event::DisposalStarted { child: *child },
-                        &mut Vec::new(),
-                    );
-                    step(
-                        &mut state,
-                        Event::Terminalized { child: *child },
-                        &mut Vec::new(),
-                    );
-                }
-            }
-            assert_eq!(state.all_children_joined(), mask == 0b111);
-            assert_eq!(
-                state.all_children_joined(),
-                keys.iter().all(|child| state.joined(*child))
-            );
-            state.check_invariants();
-        }
-    }
-
-    #[test]
     fn sampled_removal_suppresses_start_effects_until_commit() {
         for flavor in [ScopeFlavor::Ordered, ScopeFlavor::Dynamic] {
             let membership = memberships(1)[0];

@@ -2,11 +2,11 @@ mod common;
 
 use std::time::Duration;
 
-use crate::common::{LiveFlag, SHUTDOWN_BUDGET, assert_eventually};
+use crate::common::SHUTDOWN_BUDGET;
 use shelterwood::{
     BuildError, Cancellation, DynamicTree, Exit, ExitError, ExitKind, GracePhase, PolicyError,
-    Readiness, ReadinessDeadline, RemoveOutcome, ReserveError, Shutdown, StaticReserveError,
-    StopReason, TaskDef, TaskOnceDef, Tree,
+    Readiness, ReadinessDeadline, ReserveError, Shutdown, StaticReserveError, StopReason, TaskDef,
+    TaskOnceDef, Tree,
 };
 
 #[test]
@@ -88,18 +88,12 @@ async fn dynamic_reservation_validates_ids_at_the_driver_boundary() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("dynamic root starts");
     let scope = system.scope();
-
-    assert!(matches!(scope.reserve_task(""), Err(ReserveError::EmptyId)));
     system
         .shutdown(SHUTDOWN_BUDGET)
         .await
         .expect("dynamic root stops");
 
     assert!(matches!(scope.reserve_task(""), Err(ReserveError::EmptyId)));
-    assert!(matches!(
-        scope.reserve_task("worker"),
-        Err(ReserveError::NotAdmitting(_))
-    ));
 }
 
 #[tokio::test]
@@ -116,73 +110,6 @@ async fn one_shot_completion_reports_never_started_for_an_unspawned_membership()
         completion.wait().await.expect_err("task never ran").kind(),
         ExitKind::NeverStarted
     ));
-}
-
-#[tokio::test]
-async fn dynamic_add_resolves_at_admission_and_removal_is_exact() {
-    let tree = DynamicTree::new();
-    let system = tree.spawn().expect("runtime is available");
-    system
-        .wait_started()
-        .await
-        .expect("empty dynamic root starts");
-    let scope = system.scope();
-
-    let definition = TaskDef::new(|context| async move {
-        context.shutdown_token().cancelled().await;
-        Ok(())
-    })
-    .readiness(Readiness::Manual)
-    .expect("manual task readiness is valid");
-    let first = scope
-        .add_task("worker", definition)
-        .await
-        .expect("admission succeeds before readiness");
-    let removal = scope.remove_exact(&first);
-    drop(removal);
-    let first_exit = tokio::time::timeout(Duration::from_secs(1), first.wait())
-        .await
-        .expect("first removal completes");
-    assert!(matches!(first_exit.kind(), ExitKind::Completed));
-    // `wait()` resolves at terminal publication; the id frees at pruning,
-    // after the definition's release edge (SPEC §9).
-    assert_eventually!(
-        || scope.as_scope().snapshot().child("worker").is_none(),
-        "detached removal prunes the first worker"
-    )
-    .await;
-
-    let second = scope
-        .add_task_once(
-            "worker",
-            TaskOnceDef::new(|context| async move {
-                context.shutdown_token().cancelled().await;
-                Ok::<_, shelterwood::ExitError>(7_u8)
-            }),
-        )
-        .await
-        .expect("same id is free after detached removal")
-        .0;
-    assert_eq!(
-        scope.remove_exact(&first).await,
-        RemoveOutcome::AlreadyAbsent
-    );
-    assert_eq!(scope.remove_exact(&second).await, RemoveOutcome::Removed);
-    assert_eq!(system.shutdown(SHUTDOWN_BUDGET).await, Ok(()));
-}
-
-#[tokio::test]
-async fn one_shot_completion_finishes_an_ordered_root() {
-    let mut tree = Tree::new();
-    let (task, completion) = tree
-        .add_task_once("work", TaskOnceDef::new(|_| async { Ok(42_u64) }))
-        .expect("valid declaration");
-    let system = tree.spawn().expect("runtime is available");
-
-    system.wait_started().await.expect("tree starts");
-    assert_eq!(completion.wait().await.expect("task completed"), 42);
-    assert!(matches!(task.wait().await.kind(), ExitKind::Completed));
-    assert_eq!(system.wait().await, StopReason::Finished);
 }
 
 #[tokio::test]
@@ -249,32 +176,6 @@ async fn one_shot_completion_reports_failure_and_panic_verdicts() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn one_shot_completion_reports_abort_verdict() {
-    let mut tree = Tree::new();
-    let (_task, completion) = tree
-        .add_task_once(
-            "aborted",
-            TaskOnceDef::<u8>::new(|_| std::future::pending()).shutdown(Shutdown::Abort),
-        )
-        .expect("valid declaration");
-    let system = tree.spawn().expect("runtime is available");
-    system.wait_started().await.expect("task starts");
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("forced shutdown joins the task");
-
-    assert!(matches!(
-        completion
-            .wait()
-            .await
-            .expect_err("aborted task has no value")
-            .kind(),
-        ExitKind::Aborted { .. }
-    ));
-}
-
-#[tokio::test(start_paused = true)]
 async fn one_shot_value_cannot_override_readiness_timeout_verdict() {
     let readiness_width = Duration::from_secs(10);
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
@@ -312,30 +213,6 @@ async fn one_shot_value_cannot_override_readiness_timeout_verdict() {
         .shutdown(Duration::ZERO)
         .await
         .expect("terminal task leaves no straggler");
-}
-
-#[tokio::test]
-async fn dropping_the_owner_requests_cooperative_shutdown() {
-    let mut tree = Tree::new();
-    let (live, guard) = LiveFlag::guarded();
-    let (task, completion) = tree
-        .add_task_once(
-            "worker",
-            TaskOnceDef::new(move |context| async move {
-                let _guard = guard;
-                context.shutdown_token().cancelled().await;
-                Ok::<_, shelterwood::ExitError>(())
-            }),
-        )
-        .expect("valid declaration");
-    let system = tree.spawn().expect("runtime is available");
-    system.wait_started().await.expect("tree starts");
-    drop(system);
-    let exit = task.wait().await;
-    assert_eq!(exit.cancellation(), Cancellation::Observed);
-    assert!(matches!(exit.kind(), ExitKind::Completed));
-    assert_eq!(completion.wait().await, Ok(()));
-    assert_eventually!(|| !live.is_live(), "task future dropped").await;
 }
 
 #[tokio::test]

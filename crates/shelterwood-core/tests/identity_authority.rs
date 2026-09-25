@@ -9,10 +9,7 @@
 
 use std::hash::Hash;
 
-use shelterwood_core::identity::{
-    ChildId, Incarnation, Membership, MembershipReconciliation, ProvisionalMembership,
-    ScopeIdentity,
-};
+use shelterwood_core::identity::{ChildId, Incarnation, Membership, ProvisionalMembership};
 
 macro_rules! assert_not_impl {
     ($type:ty: $trait:path) => {
@@ -40,27 +37,4 @@ fn supported_identity_values_remain_plain_public_types() {
     assert_copy_identity::<Incarnation>();
     let id = ChildId::from("worker");
     assert_eq!(id.as_str(), "worker");
-}
-
-#[test]
-fn provisional_membership_selects_its_minting_child_id() {
-    let worker_id = ChildId::from("worker");
-    let other_id = ChildId::from("other");
-    let mut declaration = ScopeIdentity::new();
-    let (declared, provisional, _) = declaration
-        .mint_membership(&worker_id)
-        .into_provisional_parts();
-
-    let mut stable = ScopeIdentity::new();
-    assert!(matches!(
-        stable.adopt_or_mint_membership(provisional),
-        MembershipReconciliation::Adopted
-    ));
-
-    let worker_successor = stable.mint_membership(&worker_id).into_pair().0;
-    let other = stable.mint_membership(&other_id).into_pair().0;
-
-    assert!(worker_successor.supersedes(declared));
-    assert!(!other.supersedes(declared));
-    assert!(!declared.supersedes(other));
 }

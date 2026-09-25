@@ -1,4 +1,4 @@
-//! Multithreaded observation-gate handoff stress (review gap T-1c).
+//! Multithreaded observation-gate handoff stress.
 //!
 //! Adoption re-homes a whole subtree onto its new parent's gate while other
 //! threads admit into that subtree, write member records through the gate

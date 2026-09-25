@@ -54,9 +54,9 @@ pub(crate) mod test_support {
     }
 
     /// The one isolated-scope construction path. `configure` runs on the root
-    /// member before the scope cell wraps it; the cells tests resolve options
-    /// there, while the driver fixtures pass a no-op.
-    pub(crate) fn isolated_scope_with(
+    /// member before the scope cell wraps it: [`isolated_scope`] resolves
+    /// options there, while [`unresolved_isolated_scope`] passes a no-op.
+    fn isolated_scope_with(
         id: &str,
         flavor: ScopeFlavor,
         configure: impl FnOnce(&MemberCell),
@@ -70,6 +70,12 @@ pub(crate) mod test_support {
 
     pub(super) fn isolated_scope(id: &str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
         isolated_scope_with(id, flavor, resolve_options)
+    }
+
+    /// An isolated scope whose root member options stay unresolved, the shape
+    /// the driver fixtures and the scope cell's observation tests build on.
+    pub(crate) fn unresolved_isolated_scope(id: &str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
+        isolated_scope_with(id, flavor, |_| {})
     }
 
     pub(super) fn child_member(parent: &ScopeCell, id: &str) -> Arc<MemberCell> {

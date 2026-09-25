@@ -16,10 +16,9 @@ pub(super) use crate::{
     ActorRef, Backoff, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
     GracePhase, Incarnation, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError,
     Mailbox, MembershipStatus, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome,
-    ReserveError, RestartCondition, RestartCount, RestartPolicy, Retention, ScopeRef, ScopeState,
-    SendErrorKind, StartupError, StartupFailure, StartupFailureCause, StopReason, SubtreeDef,
-    SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
-    cells::LIFECYCLE_EVENT_CAPACITY,
+    ReserveError, RestartCondition, RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind,
+    StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef,
+    TaskOnceDef, Tree,
     engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
     exit::RecordedOutcome,
     identity::{IncarnationCounter, ScopeIdentity},
@@ -445,9 +444,7 @@ pub(super) const CAPTURE_PROBE_WAIT: Duration = Duration::from_secs(10);
 /// catch.
 pub(super) const DRIVER_PROGRESS_WAIT: Duration = Duration::from_secs(10);
 
-pub(super) fn isolated_scope(id: &'static str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
-    crate::cells::test_support::isolated_scope_with(id, flavor, |_| {})
-}
+pub(super) use crate::cells::test_support::unresolved_isolated_scope as isolated_scope;
 
 pub(super) fn running_dynamic_fixture() -> (
     ScopeRuntime,
@@ -526,88 +523,6 @@ pub(super) fn finished_tree() -> Tree {
     )
     .expect("finished child is valid");
     tree
-}
-
-/// A user error payload that records whether its destructor ran on the
-/// retiring thread while the observation gate was held.
-///
-/// The lock rule's probe for `Exit`: an `ExitKind::Failed` carries a
-/// type-erased application error, so wherever the cell layer destroys an exit
-/// it is running caller code. The retiring thread identity plus
-/// `ObservationGate::is_held` answers from inside that destructor without the
-/// reentrant acquisition that would deadlock.
-pub(super) struct GateProbeError {
-    gate: crate::cells::ObservationGate,
-    retiring_thread: std::thread::ThreadId,
-    held_at_drop: Arc<Mutex<Option<bool>>>,
-}
-
-/// Builds a failed exit whose payload reports where it was destroyed.
-pub(super) fn gate_probe_exit(scope: &Arc<ScopeCell>) -> (Exit, Arc<Mutex<Option<bool>>>) {
-    let held_at_drop = Arc::new(Mutex::new(None));
-    let exit = Exit::failed(
-        ExitError::from(GateProbeError {
-            gate: scope.observation_gate(),
-            retiring_thread: std::thread::current().id(),
-            held_at_drop: Arc::clone(&held_at_drop),
-        }),
-        Cancellation::NotObserved,
-    );
-    (exit, held_at_drop)
-}
-
-/// A dynamic root with one admitted, started child, plus the child's
-/// incarnation counter — the shape a restart schedule needs.
-pub(super) fn restarting_member_fixture() -> (Arc<ScopeCell>, Arc<MemberCell>, IncarnationCounter) {
-    let root = isolated_scope("root", ScopeFlavor::Dynamic);
-    let child_id = ChildId::from("worker");
-    let member = MemberCell::new(root.mint_membership(&child_id));
-    resolve_fixture_options(&member);
-    let mut incarnations = member.take_incarnation_counter();
-    assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
-    let first = incarnations.mint();
-    assert!(member.transition(MemberTransition::Starting { incarnation: first }));
-    (root, member, incarnations)
-}
-
-pub(super) fn gate_probe_verdict(held_at_drop: &Arc<Mutex<Option<bool>>>) -> Option<bool> {
-    *held_at_drop.lock().expect("gate probe mutex poisoned")
-}
-
-pub(super) fn wait_for_gate_probe(held_at_drop: &Arc<Mutex<Option<bool>>>) -> bool {
-    let deadline = std::time::Instant::now() + CAPTURE_PROBE_WAIT;
-    loop {
-        if let Some(verdict) = gate_probe_verdict(held_at_drop) {
-            return verdict;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for retained exit disposal"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
-impl std::fmt::Debug for GateProbeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("GateProbeError")
-    }
-}
-
-impl std::fmt::Display for GateProbeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("gate probe")
-    }
-}
-
-impl std::error::Error for GateProbeError {}
-
-impl Drop for GateProbeError {
-    fn drop(&mut self) {
-        let ran_inline_under_gate =
-            std::thread::current().id() == self.retiring_thread && self.gate.is_held();
-        *self.held_at_drop.lock().expect("gate probe mutex poisoned") = Some(ran_inline_under_gate);
-    }
 }
 
 /// Builds an application error paired with the receiver of its drop thread.

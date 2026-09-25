@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::spawn::{BlockingPoolJob, blocking_pool_accepted};
+use crate::blocking::{BlockingPoolJob, blocking_pool_accepted};
 
 /// Deadlock escape hatch for hostile test destructors.
 pub(crate) const DESTRUCTOR_ESCAPE: Duration = Duration::from_secs(5);
@@ -22,6 +22,15 @@ pub(crate) struct RecordingDrop(pub(crate) mpsc::Sender<ThreadDescription>);
 impl Drop for RecordingDrop {
     fn drop(&mut self) {
         let _ = self.0.send(describe_current_thread());
+    }
+}
+
+pub(crate) struct PanickingDrop(pub(crate) mpsc::Sender<()>);
+
+impl Drop for PanickingDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+        panic!("hostile blocking outcome destructor");
     }
 }
 

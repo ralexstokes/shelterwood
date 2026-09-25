@@ -7,7 +7,7 @@ use std::{
 };
 
 use super::{Latch, catch_panic, contain_panic_payload, discard_panic};
-use crate::spawn::{BlockingPoolJob, submit_blocking_job};
+use crate::blocking::{BlockingPoolJob, submit_blocking_job};
 
 /// Ownership wrapper for user values retained by framework state.
 ///
@@ -468,7 +468,7 @@ mod tests {
         dispose_detached, queue_fallback_disposal_with, run_fallback_disposals,
     };
     use crate::{
-        spawn::BlockingPoolJob,
+        blocking::BlockingPoolJob,
         test_support::{
             BlockingDrop, DESTRUCTOR_ESCAPE, DISPOSAL_THREAD as FALLBACK_THREAD, RecordingDrop,
             assert_blocking_pool_outcomes, drop_gate, release,

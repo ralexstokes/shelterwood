@@ -30,8 +30,9 @@ direction, plus one checking tool:
   the workspace that names Tokio as a normal dependency, and it pins the
   exact release, because blocking-pool rejection ownership is verified
   against that release. It provides spawning and joining (`spawn.rs`),
-  synchronization primitives (`sync.rs`), timers (`timer.rs`), and the
-  isolated-disposal lanes (`disposal.rs`).
+  the blocking pool (`blocking.rs`), synchronization primitives
+  (`latch.rs`, `oneshot.rs`, `watch.rs`, `channel.rs`, `select.rs`), timers
+  (`timer.rs`), and the isolated-disposal lanes (`disposal.rs`).
 - **`shelterwood`** — the public façade, and the only crate with a public
   API. All sixteen of its modules are private; the API is a flat set of
   `pub use` lists on the crate root. Tokio appears only in its

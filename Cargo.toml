@@ -38,17 +38,18 @@ thiserror = "2.0.19"
 # new Tokio source and re-run its regressions; each site's own comment has
 # the full argument.
 #
-# shelterwood-runtime/src/spawn.rs
+# shelterwood-runtime/src/blocking.rs
 #   - `blocking_pool_accepted`: a rejected `spawn_blocking` closure is dropped
 #     synchronously during pool shutdown, so sole ownership means rejection.
+#   - `submit_blocking_job`: `spawn_blocking` panics on native-thread
+#     exhaustion, so the panic hook can run under a lock (SPEC §15.4's one
+#     accepted exception). If the new Tokio can refuse without panicking, use it.
+# shelterwood-runtime/src/spawn.rs
 #   - `join_user_polled`: the join trailer keeps the caller's raw waker past
 #     completion until the `JoinHandle` drops, hence the parked proxy.
 #   - `is_available`: no non-panicking probe for an enabled time driver. If
 #     the new Tokio has one, detect a timer-less runtime as `NoRuntime` (#525).
-#   - `submit_blocking_job`: `spawn_blocking` panics on native-thread
-#     exhaustion, so the panic hook can run under a lock (SPEC §15.4's one
-#     accepted exception). If the new Tokio can refuse without panicking, use it.
-# shelterwood-runtime/src/sync.rs
+# shelterwood-runtime/src/oneshot.rs
 #   - `OneShotReceiver::completed`: `poll`/`try_recv` clear `Inner` on a
 #     terminal edge and a later `poll` panics; `close` alone does not.
 #   - `DisposingReceiver::poll_receive`: `Receiver::poll` takes the result

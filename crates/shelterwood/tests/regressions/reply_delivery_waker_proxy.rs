@@ -1,12 +1,10 @@
-mod common;
-
 use std::{
     future::Future,
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
 
-use common::{POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, hostile_waker};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, SHUTDOWN_BUDGET, hostile_waker};
 use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Reply, Tree};
 
 enum Message {

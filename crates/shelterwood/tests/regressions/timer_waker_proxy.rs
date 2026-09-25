@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     future::Future,
     mem::ManuallyDrop,
@@ -10,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::{
+use crate::common::{
     DestructorGate, LiveWakerCounter, OrdinalWakerState, POLL_TIMEOUT, counting_waker,
     ordinal_drop_waker as action_ordinal_drop_waker, ordinal_waker as action_ordinal_waker,
 };

@@ -1,5 +1,3 @@
-mod common;
-
 use std::{error::Error, fmt, sync::mpsc, thread::ThreadId, time::Duration};
 
 use crate::common::{SHUTDOWN_BUDGET, next_exit_of};

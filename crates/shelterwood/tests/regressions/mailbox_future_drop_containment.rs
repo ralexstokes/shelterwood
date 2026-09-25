@@ -10,8 +10,6 @@
 //! runner (`cargo test`) an abort would instead take the whole binary down --
 //! still a loud failure, but an unattributed one.
 
-mod common;
-
 use std::{
     future::Future,
     mem::ManuallyDrop,
@@ -25,7 +23,7 @@ use std::{
     time::Duration,
 };
 
-use common::{SHUTDOWN_BUDGET, ordinal_drop_waker, probe_waker_with_wake};
+use crate::common::{SHUTDOWN_BUDGET, ordinal_drop_waker, probe_waker_with_wake};
 use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Reply, Tree};
 
 const OUTER_PANIC: &str = "injected outer panic";

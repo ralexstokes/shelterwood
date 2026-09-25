@@ -1,11 +1,8 @@
-mod common;
-
 use std::time::Duration;
 
-use crate::common::SHUTDOWN_BUDGET;
 use shelterwood::{
-    BuildError, Cancellation, DynamicTree, Exit, ExitError, ExitKind, GracePhase, PolicyError,
-    Readiness, ReadinessDeadline, ReserveError, Shutdown, StaticReserveError, StopReason, TaskDef,
+    BuildError, Cancellation, Exit, ExitError, ExitKind, GracePhase, PolicyError, Readiness,
+    ReadinessDeadline, ReserveError, Shutdown, StaticReserveError, StopReason, TaskDef,
     TaskOnceDef, Tree,
 };
 
@@ -81,19 +78,6 @@ fn declaration_errors_are_eager_and_root_lowering_is_the_only_other_build_error(
         ));
         assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
     });
-}
-
-#[tokio::test]
-async fn dynamic_reservation_validates_ids_at_the_driver_boundary() {
-    let system = DynamicTree::new().spawn().expect("runtime is available");
-    system.wait_started().await.expect("dynamic root starts");
-    let scope = system.scope();
-    system
-        .shutdown(SHUTDOWN_BUDGET)
-        .await
-        .expect("dynamic root stops");
-
-    assert!(matches!(scope.reserve_task(""), Err(ReserveError::EmptyId)));
 }
 
 #[tokio::test]

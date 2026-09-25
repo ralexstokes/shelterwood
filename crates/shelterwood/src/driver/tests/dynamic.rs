@@ -648,6 +648,24 @@ fn reserve_dynamic_rejects_an_empty_id_at_the_driver_boundary() {
     ));
 }
 
+#[crate::runtime::test]
+async fn reserve_dynamic_rejects_an_empty_id_before_a_terminal_scope_refuses_admission() {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    root.terminalize_never_started();
+    // The runtime is available, so a valid id reaches the terminal check.
+    assert!(matches!(
+        super::super::reserve_dynamic(&root, ChildId::from("worker"), None),
+        Err(crate::ReserveError::NotAdmitting(
+            crate::NotAdmittingCause::Terminal
+        ))
+    ));
+
+    assert!(matches!(
+        super::super::reserve_dynamic(&root, ChildId::from(""), None),
+        Err(crate::ReserveError::EmptyId)
+    ));
+}
+
 #[test]
 fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);

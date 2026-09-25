@@ -40,7 +40,7 @@ terminalizes every never-started member rather than leaking them.
    the `ScopeCell`, publishing `Added` lifecycle edges.
 3. Settlement runs the reducer, which emits `StartChild` for the first
    ordered child — or for every child of a dynamic scope at once.
-4. `spawn_child` (`driver/child.rs`) mints an `Incarnation`, builds the
+4. `spawn_child` (`driver/spawn.rs`) mints an `Incarnation`, builds the
    body for the child's kind (raw actor, task, or nested scope), binds
    the mailbox — which promotes anything parked during the rebind window
    — publishes `Started`, and spawns up to four tasks: the body (wrapped

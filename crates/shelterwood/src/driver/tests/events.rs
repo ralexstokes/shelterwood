@@ -96,8 +96,8 @@ async fn blocking_primary_wake_recollects_control_removal_before_arbitration() {
     let (control, mut control_receiver) = crate::runtime::unbounded_mpsc();
     let (_disposal, mut disposal_receiver) = crate::runtime::unbounded_mpsc();
 
-    let wait = crate::runtime::wait_scope(
-        crate::runtime::ScopeWait {
+    let wait = super::super::incarnation::wait_scope(
+        super::super::incarnation::ScopeWait {
             signal: future::pending::<()>(),
             parent_shutdown: future::pending::<()>(),
         },
@@ -128,7 +128,7 @@ async fn blocking_primary_wake_recollects_control_removal_before_arbitration() {
         crate::runtime::join(publisher).await,
         crate::runtime::JoinOutcome::Ok { value: () }
     ));
-    let crate::runtime::ScopeWake::Message(Some(event)) = wake else {
+    let super::super::incarnation::ScopeWake::Message(Some(event)) = wake else {
         panic!("the biased blocking wait returns the later primary head");
     };
 

@@ -1,4 +1,5 @@
-//! Dynamic membership control-plane transport and bookkeeping.
+//! Dynamic membership control-plane transport and bookkeeping, and the
+//! driver's admission install.
 
 use std::{
     any::Any,
@@ -12,12 +13,15 @@ use crate::{
         DynamicRoute, MemberStage, NotAdmittingCause, ObservationTxn, RemoveOutcome, ReserveError,
         ScopeCell,
     },
-    plan::{ChildConstruction, SlotCell, checked_id, mint_reserved_slot},
+    plan::{ChildConstruction, ChildPlan, SlotCell, checked_id, mint_reserved_slot},
     policy::ScopeFlavor,
     runtime::{self, Latch},
 };
 
-use super::{ChildKey, DriverEvent, Obligation, RemovalRequest};
+use super::{
+    ChildKey, ChildRuntime, DriverEvent, Obligation, RemovalRequest, ResidentProjection,
+    ScopeRuntime, resident_projection,
+};
 
 pub(crate) type RemovalResponse = runtime::OneShotReceiver<RemoveOutcome>;
 
@@ -615,6 +619,250 @@ fn dispose_definition_then(
         // response releases ownership back to the caller.
         completion();
     });
+}
+
+/// Owns one dynamic admission's runtime resources until the install commits
+/// or rejects.
+///
+/// The ledger is created before either the observation gate or dynamic-state
+/// mutex is acquired, and it holds the request, the exact resident
+/// projection, the converted child runtime until arena insertion, and a
+/// reservation the rejection path removes from dynamic state. If any fallible
+/// step unwinds, its destructor consequently runs after both control-plane
+/// guards have gone: it retires the projection through detached disposal and
+/// completes the caller's response fail-closed.
+///
+/// The ledger is the *primary* owner of the lost-response contract, not the
+/// only one: `request` stays a plain `Option<AdmissionRequest>` so its own
+/// `Obligation` still discharges the caller's promise on any path this
+/// destructor fails to cover, as SPEC §15.5 requires of every cross-task
+/// promise. Field order below is the Drop body's order, so even the bare
+/// fallback keeps terminality ahead of the removal completion and both ahead
+/// of the response.
+pub(super) struct AdmissionInstall {
+    projection: Option<ResidentProjection>,
+    child: Option<Box<ChildRuntime>>,
+    entry: Option<DynamicEntry>,
+    request: Option<AdmissionRequest>,
+}
+
+impl AdmissionInstall {
+    pub(super) fn new(root: &ScopeCell, request: AdmissionRequest, child: ChildRuntime) -> Self {
+        debug_assert!(
+            root.shares_observation_gate_with(&request.slot.member),
+            "a reserved admission slot stays on its live root's observation gate"
+        );
+        Self {
+            projection: Some(resident_projection(&request.slot)),
+            request: Some(request),
+            child: Some(Box::new(child)),
+            entry: None,
+        }
+    }
+
+    fn projection(&self) -> ResidentProjection {
+        self.projection
+            .as_ref()
+            .expect("the install owns its projection until commit")
+            .clone()
+    }
+
+    fn take_child(&mut self) -> Box<ChildRuntime> {
+        self.child
+            .take()
+            .expect("an admission install inserts its child once")
+    }
+
+    /// Releases a committed install: its child is in the arena and its
+    /// reservation is promoted in place.
+    fn commit(mut self) -> AdmissionRequest {
+        // Residency and the still-owned request slot both retain this exact
+        // projection, so surrendering the ledger copy is refcount traffic.
+        drop(self.projection.take());
+        self.request
+            .take()
+            .expect("a committed admission releases its request once")
+    }
+
+    /// Releases a rejected install, before arena insertion.
+    fn into_rejection(mut self) -> (AdmissionRequest, Box<ChildRuntime>, Option<DynamicEntry>) {
+        // The rejected child and the request slot both retain the member
+        // graph, so this pre-residency projection copy can retire as
+        // refcount traffic.
+        drop(self.projection.take());
+        let request = self
+            .request
+            .take()
+            .expect("a rejected admission releases its request once");
+        (request, self.take_child(), self.entry.take())
+    }
+}
+
+impl Drop for AdmissionInstall {
+    fn drop(&mut self) {
+        let mut panics = runtime::PanicAccumulator::default();
+        if let Some(projection) = self.projection.take() {
+            panics.run(move || runtime::dispose_detached(projection));
+        }
+        // A child not yet inserted owns its never-started terminality
+        // fallback. Run it before dropping the claimed dynamic entry, whose
+        // removal completion must remain ordered after terminality.
+        if let Some(child) = self.child.take() {
+            panics.run(move || drop(child));
+        }
+        if let Some(entry) = self.entry.take() {
+            panics.run(move || drop(entry));
+        }
+        if let Some(mut request) = self.request.take() {
+            panics.run(|| request.complete_lost());
+            panics.run(move || drop(request));
+        }
+    }
+}
+
+impl ScopeRuntime {
+    fn reject_reserved_admission(
+        &self,
+        request: AdmissionRequest,
+        control: &DynamicControl,
+        cause: NotAdmittingCause,
+    ) {
+        let (definition, removed) = self.root.with_observation_gate(|txn| {
+            cancel_dynamic_reservation_parts(&self.root, control, &request.slot, txn)
+        });
+        reject_admission_after_disposal(
+            request,
+            definition,
+            removed,
+            ReserveError::NotAdmitting(cause),
+        );
+    }
+
+    pub(super) fn handle_admission(&mut self, mut request: AdmissionRequest) {
+        // A request travels only on the lane of the `DynamicControl` that
+        // started it, and only the incarnation owning that control holds the
+        // lane's receiver, so the request's control is this driver's own.
+        let control = Arc::clone(
+            self.dynamic
+                .as_ref()
+                .expect("admission requests arrive only on a dynamic scope's control lane"),
+        );
+        let lifecycle = self.supervisor.lifecycle();
+        let not_admitting = if lifecycle.is_draining() {
+            Some(NotAdmittingCause::Draining)
+        } else if lifecycle.startup_failed() {
+            Some(NotAdmittingCause::StartupFailed)
+        } else if request.fused_cancel.as_ref().is_some_and(Latch::is_fired) {
+            Some(NotAdmittingCause::ReservationEnded)
+        } else {
+            None
+        };
+        if let Some(cause) = not_admitting {
+            self.reject_reserved_admission(request, &control, cause);
+            return;
+        }
+
+        let (definition, resolved) = match request.slot.resolve_and_take_defined(&self.defaults) {
+            Some(claimed) => claimed,
+            None => {
+                // An admission request follows definition. A lost claim leaves
+                // the slot Lowered, so cancellation cannot recover a new definition.
+                self.reject_reserved_admission(
+                    request,
+                    &control,
+                    NotAdmittingCause::ReservationEnded,
+                );
+                return;
+            }
+        };
+        let plan = ChildPlan::with_options(Arc::clone(&request.slot), definition, resolved);
+        // Conversion can unwind while acquiring child identity or configuring
+        // the mailbox. Keep that fallible work outside the control-plane lock
+        // so driver teardown can still close reservations and removals.
+        let child = ChildRuntime::from_plan(plan, &self.root);
+        // Read everything the locked section needs before either guard, so no
+        // structural unwrap runs under a lock. Only the child stays in the
+        // ledger across the gate: it must be owned there on unwind.
+        let slot = Arc::clone(&request.slot);
+        let membership = slot.member.membership();
+        let mut fused_cancel = request.fused_cancel.take();
+        // Construct the ledger before either control-plane guard. On every
+        // unwind its destructor therefore runs only after the dynamic-state
+        // mutex and `ObservationTxn` have both released their locks, and so
+        // do the locals above.
+        let mut install = AdmissionInstall::new(&self.root, request, child);
+        let projection = install.projection();
+        let root = Arc::clone(&self.root);
+        let installed = root.with_observation_gate(|txn| {
+            // The dynamic-state mutex rides inside the root gate here. This
+            // driver's control is the request's own, so its reservation was
+            // minted against this very root and adopted onto this same gate
+            // before publication, and a root with a live dynamic route cannot
+            // be re-homed. Thus `admit_child_locked`'s handoff check below
+            // short-circuits on gate identity: it never acquires a second
+            // gate under `state`. This is the install half of the admission
+            // exemption in AGENTS.md.
+            let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
+            let reserved = state.entry_mut(slot.member.id()).filter(|entry| {
+                entry.slot.member.membership() == membership && entry.is_reserved()
+            });
+            let ended = fused_cancel.as_ref().is_some_and(Latch::is_fired);
+            match reserved {
+                Some(entry) if !ended => {
+                    // The control-plane lock makes arena insertion and
+                    // promotion one state transition: an exact remover sees
+                    // either the reservation or a resident carrying its live
+                    // arena key, never an unindexed admitted intermediate.
+                    // The ledger's one structural unwrap under a lock: the
+                    // child must stay ledger-owned until it enters the arena.
+                    let key = self.insert_child(*install.take_child(), false);
+                    entry.promote(key, fused_cancel.take(), txn);
+                    let admitted = root.admit_child_locked(projection.clone(), txn);
+                    Some((key, admitted))
+                }
+                reserved => {
+                    // The ledger claims the reservation before locked
+                    // terminalization, so an unwind there retires it, and
+                    // wakes its remover, only after both guards are gone.
+                    if reserved.is_some() {
+                        install.entry = state.remove(slot.member.id(), txn);
+                    }
+                    drop(state);
+                    slot.terminalize_never_started_locked(&root, txn);
+                    None
+                }
+            }
+        });
+        let Some((key, admitted)) = installed else {
+            let (request, mut child, removed) = install.into_rejection();
+            // The entry's drop completes its removal response; preserve the
+            // same terminality-before-completion ordering as every other
+            // reservation-cancellation path. Definition disposal is also
+            // complete before either waiter regains ownership.
+            child.complete_terminality();
+            let ChildRuntime { construction, .. } = *child;
+            reject_admission_after_disposal(
+                request,
+                Some(construction),
+                removed,
+                ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
+            );
+            return;
+        };
+        // The slot was minted `Reserved` by this reservation and nothing can
+        // have started it, so the projection reducer accepts. A refusal would
+        // leave the entry promoted with no residency behind it, so it fails
+        // closed here, after both guards have released.
+        assert!(
+            admitted,
+            "a promoted reservation is admitted from `Reserved` exactly once"
+        );
+        let mut request = install.commit();
+        #[cfg(test)]
+        self.record_storage();
+        request.complete(Ok(()));
+        self.spawn_child(key);
+    }
 }
 
 #[cfg(test)]

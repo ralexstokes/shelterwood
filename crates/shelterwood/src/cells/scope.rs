@@ -90,6 +90,8 @@ pub(crate) struct RuntimeStorage {
 }
 
 mod control;
+#[cfg(test)]
+mod observation_tests;
 mod projection;
 mod publication;
 mod residency;

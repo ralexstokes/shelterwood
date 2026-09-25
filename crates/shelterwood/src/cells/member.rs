@@ -1051,4 +1051,60 @@ mod tests {
             MemberStage::Terminal(Exit::never_started())
         );
     }
+
+    #[test]
+    fn member_transitions_own_their_complete_record_projection() {
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let membership = identity.mint_membership(&id);
+        let member = MemberCell::new(membership);
+        let mut incarnations = member.take_incarnation_counter();
+        let incarnation = incarnations.mint();
+
+        assert!(member.transition(MemberTransition::Admitted));
+        assert_eq!(member.record().stage, MemberStage::Admitted);
+
+        assert!(member.transition(MemberTransition::Starting { incarnation }));
+        let record = member.record();
+        assert_eq!(record.stage, MemberStage::Starting);
+        assert_eq!(record.incarnation, Some(incarnation));
+        assert_eq!(record.last_incarnation, Some(incarnation));
+        assert_eq!(record.restart_at, None);
+
+        assert!(member.transition(MemberTransition::Running));
+        assert_eq!(member.record().stage, MemberStage::Running);
+        assert!(member.transition(MemberTransition::Stopping));
+        assert_eq!(member.record().stage, MemberStage::Stopping);
+
+        let exit = Exit::completed(Cancellation::NotObserved);
+        let restart_count = RestartCount::ZERO.bump();
+        let restart_at = crate::runtime::now();
+        assert!(member.transition(MemberTransition::RestartScheduled {
+            exit: exit.clone(),
+            restart_count,
+            restart_at: Some(restart_at),
+        }));
+        let record = member.record();
+        assert_eq!(record.stage, MemberStage::Restarting);
+        assert_eq!(record.incarnation, None);
+        assert_eq!(record.last_incarnation, Some(incarnation));
+        assert_eq!(record.last_exit, Some(exit));
+        assert_eq!(record.restart_count, restart_count);
+        assert_eq!(record.restart_at, Some(restart_at));
+
+        let second = incarnations.mint();
+        assert!(member.transition(MemberTransition::Starting {
+            incarnation: second,
+        }));
+        let record = member.record();
+        assert_eq!(record.stage, MemberStage::Starting);
+        assert_eq!(record.incarnation, Some(second));
+        assert_eq!(record.last_incarnation, Some(second));
+        assert_eq!(record.restart_at, None);
+        assert_eq!(
+            record.last_exit,
+            Some(Exit::completed(Cancellation::NotObserved))
+        );
+        assert_eq!(record.restart_count, restart_count);
+    }
 }

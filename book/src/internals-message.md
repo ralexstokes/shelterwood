@@ -25,7 +25,8 @@ deadline around `send`), and `call` (send plus reply under one budget).
 ## Submission
 
 `SendFuture` is lazy — nothing happens until first poll. That poll calls
-`MailboxCell::submit` (`mailbox/cell.rs`), which opens a `MailboxTxn`:
+`MailboxCell::submit` (`mailbox/cell.rs`), which opens a `MailboxTxn`
+(`mailbox/cell/effects.rs`):
 the guard over the cell's state mutex paired with a `MailboxEffects`
 sink. Every wake, displaced payload, and disposal request the transition
 produces is queued into the sink and flushed only after the guard drops.

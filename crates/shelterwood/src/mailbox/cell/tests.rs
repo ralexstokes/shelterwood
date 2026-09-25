@@ -1173,7 +1173,7 @@ async fn expired_timeout_can_race_detached_terminal_teardown() {
     assert_eq!(retry.incarnation_observed, None);
 }
 
-fn registration(operation: &super::SendOperation<u8>) -> super::WaiterId {
+fn registration(operation: &super::SendOperation<u8>) -> super::state::WaiterId {
     operation
         .state
         .lock()

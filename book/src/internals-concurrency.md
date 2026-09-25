@@ -42,7 +42,7 @@ specific effects past specific unlocks.
 - **`ObservationTxn`** (`cells/gate.rs`) — the gate guard plus a deferred
   effect list; commit drops the guard then flushes under a panic
   accumulator, and `Drop` runs the same path during an unwind.
-- **`MailboxTxn`** (`mailbox/cell.rs`) — the mailbox state guard beside a
+- **`MailboxTxn`** (`mailbox/cell/effects.rs`) — the mailbox state guard beside a
   `MailboxEffects` sink collecting pulses, waker actions, displaced
   payloads, and disposal requests. Its `Drop` empties the guard field
   before Rust drops the sink, so field order alone guarantees the flush

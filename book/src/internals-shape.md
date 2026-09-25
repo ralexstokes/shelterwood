@@ -100,7 +100,9 @@ shell:
   destruction paths.
 - **`mailbox/`** — the mailbox kinds, the send flavors, and request/reply
   (L2's delivery half). `mailbox/cell.rs` is the restart-stable
-  `MailboxCell<M>`; `mailbox/futures.rs` is the public send surface
+  `MailboxCell<M>`, with its guarded state, send operations, and
+  transaction and effects carriers in `mailbox/cell/state.rs`,
+  `operation.rs`, and `effects.rs`; `mailbox/futures.rs` is the public send surface
   (`ActorRef<M>` and its futures); the module root declares the
   crate-private control traits a `MemberCell` uses to drive a mailbox it
   cannot name generically (`MailboxControl`, `MailboxTermination`,

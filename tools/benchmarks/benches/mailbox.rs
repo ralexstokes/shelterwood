@@ -215,9 +215,9 @@ fn bench_payload<const N: usize>(c: &mut Criterion, runtime_name: &str, runtime:
 
     // `try_send` never returns `Full` here, and the headroom is exactly one
     // slot. The chain: occupancy is the queue length checked at accept time
-    // (`shelterwood::mailbox::cell::accept_locked`), a slot is freed when the
+    // (`shelterwood::mailbox::cell::state::accept_locked`), a slot is freed when the
     // driver *dequeues* rather than when the handler finishes
-    // (`promote_waiter_queue` recomputes from the queue length), and
+    // (`promote_waiters` recomputes from the queue length), and
     // `timed_batches`' barrier guarantees an empty queue at the start of
     // every iteration. Peak occupancy is therefore `BATCH`, one below
     // `try_capacity`. A restructure that stops draining between iterations

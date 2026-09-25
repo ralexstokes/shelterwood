@@ -91,7 +91,7 @@ shell:
   `incarnation.rs` (the scope epoch guard and the driver loop), `nested.rs`
   (nested-scope latches and entry points), `spawn.rs` (constructing and
   launching one child incarnation), `report.rs` (the child task's outcome
-  report), `stop.rs` (the per-child stop ladder), `child.rs` (exit dispatch,
+  report), `stop.rs` (stopping one child), `child.rs` (exit dispatch,
   terminal publication and disposal), `events.rs` (event lanes and
   arbitration), `startup.rs`, `shutdown.rs`, `removal.rs`,
   `admission_control.rs` (dynamic membership and admission install), and

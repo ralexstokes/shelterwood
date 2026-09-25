@@ -1,3 +1,6 @@
+//! Nested-scope incarnations: their latches, start obligation and entry
+//! points, including the pre-driver lowering failure path.
+
 use super::*;
 
 pub(super) struct AncestorCommandLatches {
@@ -131,8 +134,7 @@ pub(super) async fn run_nested_tree_with_epoch(
             }
             // Both drain effects are deliberately discarded: this path
             // publishes no `Draining` edge because nothing was ever started to
-            // drain, matching the pre-lattice behaviour of the `StartupFailed`
-            // verdict it generalizes.
+            // drain.
             epoch.lifecycle.begin_drain({
                 let reason = StopReason::StartupFailed(failure);
                 reason.retain_guards(&mut epoch.retained_exits);

@@ -1,3 +1,6 @@
+//! Stopping one child: arming and advancing its stop ladder, local self-stop,
+//! and terminalizing a membership with no live incarnation.
+
 use super::*;
 
 impl ScopeRuntime {

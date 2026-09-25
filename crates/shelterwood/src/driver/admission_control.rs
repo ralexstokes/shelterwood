@@ -1,4 +1,5 @@
-//! Dynamic membership control-plane transport and bookkeeping.
+//! Dynamic membership control-plane transport and bookkeeping, and the
+//! driver's admission install.
 
 use std::{
     any::Any,
@@ -850,8 +851,8 @@ impl ScopeRuntime {
         };
         // The slot was minted `Reserved` by this reservation and nothing can
         // have started it, so the projection reducer accepts. A refusal would
-        // leave the entry promoted with no residency behind it (issue #392),
-        // so it fails closed here, after both guards have released.
+        // leave the entry promoted with no residency behind it, so it fails
+        // closed here, after both guards have released.
         assert!(
             admitted,
             "a promoted reservation is admitted from `Reserved` exactly once"

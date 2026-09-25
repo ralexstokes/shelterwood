@@ -1,3 +1,5 @@
+//! One scope incarnation: its epoch guard, entry point and driver loop.
+
 use super::*;
 
 /// Owns a scope epoch and its matching initial lifecycle until a
@@ -281,9 +283,8 @@ pub(super) async fn run_scope_incarnation(
     // ordering surface: when a wake finds more than a full batch of primary
     // events, the deferred suffix (an intensity-tripping exit, say) is
     // processed one wake after control-lane admissions enqueued earlier.
-    // `arbitrate` promises order only within a batch, and cross-pass
-    // wall-clock inversion was already reachable through the forwarder, so
-    // no promised order is violated.
+    // `arbitrate` promises order only within a batch, so no promised order
+    // is violated.
     let event_batch_limit = plan
         .children
         .len()

@@ -1,3 +1,6 @@
+//! A child's runtime resources, exit dispatch, terminal publication and
+//! release edge.
+
 use super::*;
 
 pub(super) struct ActiveChild {
@@ -343,8 +346,7 @@ impl ScopeRuntime {
                 // `schedule_restart` above has already charged this attempt
                 // against the child and the intensity window, so a refusal
                 // would restart the child with neither `Exited` nor
-                // `RestartScheduled` published — see the partial-effect note
-                // on issue #392.
+                // `RestartScheduled` published.
                 let raw_exit = exit.get().clone();
                 let published = self.root.publish_child_restart(
                     &child.slot.member,

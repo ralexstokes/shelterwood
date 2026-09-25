@@ -1,3 +1,5 @@
+//! The child task's outcome report and its join-coupled claim.
+
 use super::*;
 
 pub(super) struct RecordedReport {

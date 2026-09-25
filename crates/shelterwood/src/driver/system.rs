@@ -1,3 +1,6 @@
+//! The root driver: spawning it, joining it, and the monitor that publishes
+//! root terminality.
+
 use super::*;
 
 pub(crate) struct SystemRun {

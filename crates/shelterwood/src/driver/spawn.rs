@@ -1,3 +1,5 @@
+//! Constructing one child incarnation and launching its tasks.
+
 use super::*;
 
 enum SpawnBody {
@@ -466,8 +468,7 @@ impl ScopeRuntime {
         // A spawn reaches here only from `Admitted` (first incarnation) or
         // `Restarting` (a scheduled restart), both accepted sources. The body
         // and the mailbox bind above are already committed, so a refusal would
-        // run the incarnation with no `Started` edge — see the partial-effect
-        // note on issue #392.
+        // run the incarnation with no `Started` edge.
         if nested.is_none() {
             let started = self.root.transition_child_stage(
                 &child.slot.member,

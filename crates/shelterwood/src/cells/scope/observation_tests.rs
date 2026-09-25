@@ -7,12 +7,13 @@
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Barrier,
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
 use shelterwood_core::{
     exit::{
-        Cancellation, Exit, ExitError, GracePhase, StartupError, StartupFailure,
+        Cancellation, Exit, ExitError, ExitKind, GracePhase, StartupError, StartupFailure,
         StartupFailureCause, StopReason,
     },
     identity::IncarnationCounter,
@@ -23,7 +24,7 @@ use super::*;
 use crate::cells::{
     LIFECYCLE_EVENT_CAPACITY, LifecycleTryRecvError, MemberStage, MemberTransition,
     StartupDisposition,
-    observe::LifecycleEventKind,
+    observe::{ChildState, LifecycleEventKind, LifecycleItem},
     test_support::{TEST_WAIT, resolve_options, unresolved_isolated_scope},
 };
 
@@ -684,4 +685,336 @@ fn residency_can_release_the_last_member_arc_with_a_failed_exit() {
         !wait_for_gate_probe(&held_at_drop),
         "retiring the member record must not run its payload under the observation gate"
     );
+}
+
+#[test]
+fn admitted_subtrees_share_their_parent_observation_gate() {
+    let root = unresolved_isolated_scope("root", ScopeFlavor::Ordered);
+    let nested = unresolved_isolated_scope("nested", ScopeFlavor::Dynamic);
+    let slot = ResidentProjection::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+
+    assert!(root.set_admitted_children(vec![slot.clone()]));
+
+    assert!(
+        root.observation_gate()
+            .same_gate(&nested.observation_gate())
+    );
+}
+
+#[test]
+fn admitted_subtree_rehomes_existing_descendants_to_one_gate() {
+    let root = unresolved_isolated_scope("root", ScopeFlavor::Ordered);
+    let nested = unresolved_isolated_scope("nested", ScopeFlavor::Dynamic);
+    let leaf = unresolved_isolated_scope("leaf", ScopeFlavor::Ordered);
+    let raw_leaf_id = ChildId::from("raw-leaf");
+    let raw_leaf = MemberCell::new(nested.mint_membership(&raw_leaf_id));
+    let leaf_slot = ResidentProjection::new(Arc::clone(&leaf.member), Some(Arc::clone(&leaf)));
+    let raw_leaf_slot = ResidentProjection::new(Arc::clone(&raw_leaf), None);
+    assert!(nested.set_admitted_children(vec![leaf_slot.clone(), raw_leaf_slot.clone(),]));
+    assert!(
+        nested
+            .observation_gate()
+            .same_gate(&leaf.observation_gate())
+    );
+    assert!(
+        nested
+            .observation_gate()
+            .same_gate(&raw_leaf.observation_gate())
+    );
+
+    let nested_slot =
+        ResidentProjection::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+    assert!(root.set_admitted_children(vec![nested_slot.clone()]));
+
+    let root_gate = root.observation_gate();
+    assert!(root_gate.same_gate(&nested.observation_gate()));
+    assert!(root_gate.same_gate(&leaf.observation_gate()));
+    assert!(root_gate.same_gate(&raw_leaf.observation_gate()));
+}
+
+#[test]
+fn snapshot_watch_batch_admission_is_one_committed_cut() {
+    let root = unresolved_isolated_scope("root", ScopeFlavor::Ordered);
+    let first = unresolved_isolated_scope("first", ScopeFlavor::Dynamic);
+    let second = unresolved_isolated_scope("second", ScopeFlavor::Dynamic);
+    resolve_options(&first.member);
+    resolve_options(&second.member);
+    let first_slot = ResidentProjection::new(Arc::clone(&first.member), Some(first));
+    let second_slot = ResidentProjection::new(Arc::clone(&second.member), Some(second));
+    let snapshots = root.subscribe_snapshots();
+
+    root.with_observation_gate(|txn| {
+        root.clear_residents_locked(txn);
+        assert!(root.admit_child_locked(first_slot.clone(), txn));
+        assert!(
+            snapshots.borrow_latest().children.is_empty(),
+            "the first admission must remain staged until the batch commits"
+        );
+        assert!(root.admit_child_locked(second_slot.clone(), txn));
+        assert!(
+            snapshots.borrow_latest().children.is_empty(),
+            "the complete batch must remain staged until its transaction commits"
+        );
+    });
+
+    let committed = snapshots.borrow_latest();
+    assert_eq!(committed.children.len(), 2);
+    assert!(committed.child("first").is_some());
+    assert!(committed.child("second").is_some());
+}
+
+#[test]
+fn snapshot_watch_batch_admission_mints_one_generation_per_hub() {
+    let root = unresolved_isolated_scope("root", ScopeFlavor::Ordered);
+    let branch = unresolved_isolated_scope("branch", ScopeFlavor::Dynamic);
+    resolve_options(&branch.member);
+    let branch_slot =
+        ResidentProjection::new(Arc::clone(&branch.member), Some(Arc::clone(&branch)));
+    root.with_observation_gate(|txn| {
+        assert!(root.admit_child_locked(branch_slot.clone(), txn));
+    });
+
+    let first = unresolved_isolated_scope("first", ScopeFlavor::Dynamic);
+    let second = unresolved_isolated_scope("second", ScopeFlavor::Dynamic);
+    resolve_options(&first.member);
+    resolve_options(&second.member);
+    let first_slot = ResidentProjection::new(Arc::clone(&first.member), Some(first));
+    let second_slot = ResidentProjection::new(Arc::clone(&second.member), Some(second));
+
+    // Two hubs, because a batch publishes each admission to the admitting
+    // scope and to every ancestor: coalescing must group publications by hub,
+    // neither leaving one hub with several edges nor folding a descendant's
+    // cut into its ancestor's.
+    let root_snapshots = root.subscribe_snapshots();
+    let mut branch_snapshots = branch.subscribe_snapshots();
+    let root_generation = root_snapshots.current_generation();
+    let branch_generation = branch_snapshots.current_generation();
+
+    branch.with_observation_gate(|txn| {
+        assert!(branch.admit_child_locked(first_slot.clone(), txn));
+        assert!(branch.admit_child_locked(second_slot.clone(), txn));
+    });
+
+    assert_eq!(
+        branch_snapshots.current_generation(),
+        branch_generation + 1,
+        "a batch admission mints exactly one generation edge on its own hub"
+    );
+    assert_eq!(
+        root_snapshots.current_generation(),
+        root_generation + 1,
+        "and exactly one on the ancestor it propagates to"
+    );
+
+    let mut changed = Box::pin(branch_snapshots.changed());
+    let Poll::Ready(Ok(committed)) = changed
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("the committed batch resolves the pending change");
+    };
+    drop(changed);
+    assert_eq!(
+        committed.children.len(),
+        2,
+        "the one delivered value carries the whole batch"
+    );
+    let mut changed = Box::pin(branch_snapshots.changed());
+    assert!(
+        matches!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ),
+        "the batch owes no second delivery"
+    );
+}
+
+#[test]
+fn plain_resident_state_is_released_before_recursive_removed_publication() {
+    let root = unresolved_isolated_scope("root", ScopeFlavor::Ordered);
+    let first = unresolved_isolated_scope("first", ScopeFlavor::Dynamic);
+    let second = unresolved_isolated_scope("second", ScopeFlavor::Dynamic);
+    resolve_options(&first.member);
+    resolve_options(&second.member);
+    let first_slot = ResidentProjection::new(Arc::clone(&first.member), Some(first));
+    let second_slot = ResidentProjection::new(Arc::clone(&second.member), Some(second));
+    let mut events = root.subscribe_lifecycle();
+    let snapshots = root.subscribe_snapshots();
+
+    assert!(root.set_admitted_children(vec![first_slot.clone(), second_slot.clone(),]));
+    root.clear_residents();
+
+    assert!(root.resident_projections().is_empty());
+    assert!(snapshots.borrow_latest().children.is_empty());
+    let mut added = 0;
+    let mut removed = 0;
+    while let Ok(LifecycleItem::Event(event)) = events.try_recv() {
+        match event.kind {
+            LifecycleEventKind::Added { .. } => added += 1,
+            LifecycleEventKind::Removed { .. } => removed += 1,
+            _ => {}
+        }
+    }
+    assert_eq!((added, removed), (2, 2));
+}
+
+#[test]
+fn plain_parent_state_preserves_nested_snapshot_propagation() {
+    let root = unresolved_isolated_scope("root", ScopeFlavor::Ordered);
+    let nested = unresolved_isolated_scope("nested", ScopeFlavor::Dynamic);
+    let mut incarnations = IncarnationCounter::fixture(nested.member.membership());
+    resolve_options(&nested.member);
+    let nested_slot =
+        ResidentProjection::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+    assert!(root.set_admitted_children(vec![nested_slot.clone()]));
+    // Start the nested member along the production admit-then-spawn order so
+    // the transition-source assertions in `apply_transition` hold here too.
+    assert!(nested.member.transition(MemberTransition::Starting {
+        incarnation: incarnations.mint(),
+    }));
+    let snapshots = root.subscribe_snapshots();
+    let intensity = Intensity::new(7, Duration::from_secs(11)).expect("valid intensity");
+
+    nested.set_intensity(intensity);
+
+    assert_eq!(
+        snapshots
+            .borrow_latest()
+            .child("nested")
+            .and_then(|child| child.nested.as_deref())
+            .map(|snapshot| snapshot.intensity),
+        Some(intensity)
+    );
+}
+
+#[test]
+fn ancestor_only_lifecycle_subscription_receives_forwarded_leaf_events() {
+    let root = unresolved_isolated_scope("root", ScopeFlavor::Ordered);
+    let nested = unresolved_isolated_scope("nested", ScopeFlavor::Dynamic);
+    let nested_slot =
+        ResidentProjection::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+    assert!(root.set_admitted_children(vec![nested_slot.clone()]));
+    let mut root_events = root.subscribe_lifecycle();
+
+    let _ = nested.take_ancestor_parent_reads();
+    let _ = root.take_ancestor_parent_reads();
+    nested.emit(LifecycleEventKind::ScopeState {
+        state: ScopeState::Running,
+    });
+
+    assert_eq!(
+        nested.take_ancestor_parent_reads(),
+        1,
+        "the emitting scope reads its parent link once"
+    );
+    assert_eq!(
+        root.take_ancestor_parent_reads(),
+        1,
+        "each ancestor reads its parent link once while building the chain"
+    );
+    assert!(matches!(
+        root_events.try_recv(),
+        Ok(LifecycleItem::Event(event))
+            if matches!(event.kind, LifecycleEventKind::ScopeState { state: ScopeState::Running })
+    ));
+}
+
+#[test]
+fn gate_handoff_waits_for_an_in_flight_observation_edge() {
+    let root = unresolved_isolated_scope("root", ScopeFlavor::Ordered);
+    let nested = unresolved_isolated_scope("nested", ScopeFlavor::Dynamic);
+    let captures = nested.probe_gate_captures();
+    let (entered, entered_receiver) = std::sync::mpsc::sync_channel(0);
+    let (release, release_receiver) = std::sync::mpsc::sync_channel(0);
+    let observer = Arc::clone(&nested);
+    let observation = std::thread::spawn(move || {
+        observer.with_observation_gate(|_| {
+            entered.send(()).expect("test receiver remains available");
+            release_receiver
+                .recv()
+                .expect("test sender releases the observation edge");
+        });
+    });
+    entered_receiver
+        .recv()
+        .expect("observer enters the pre-admission edge");
+    assert_eq!(
+        captures
+            .recv_timeout(TEST_WAIT)
+            .expect("the observation edge reports its capture within the bound"),
+        GateCapture::Observation
+    );
+
+    let slot = ResidentProjection::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+    let adopting_root = Arc::clone(&root);
+    let (adopted, adopted_receiver) = std::sync::mpsc::sync_channel(0);
+    let adoption = std::thread::spawn(move || {
+        assert!(adopting_root.set_admitted_children(vec![slot.clone()]));
+        adopted.send(()).expect("test receiver remains available");
+    });
+
+    // The adoption capture proves handoff committed to the prior gate and
+    // is blocked behind the complete observation edge rather than
+    // replacing it concurrently, so adoption cannot yet have completed.
+    assert_eq!(
+        captures
+            .recv_timeout(TEST_WAIT)
+            .expect("adoption reports its capture within the bound"),
+        GateCapture::Adoption
+    );
+    assert!(matches!(
+        adopted_receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+
+    release
+        .send(())
+        .expect("active observation remains available");
+    observation.join().expect("observation edge completes");
+    adopted_receiver
+        .recv()
+        .expect("adoption reports completion after the edge");
+    adoption.join().expect("gate handoff completes");
+    assert!(
+        root.observation_gate()
+            .same_gate(&nested.observation_gate())
+    );
+}
+
+#[crate::runtime::test]
+async fn never_started_nested_terminal_publishes_one_final_parent_snapshot() {
+    let parent = unresolved_isolated_scope("parent", ScopeFlavor::Ordered);
+    let nested = unresolved_isolated_scope("nested", ScopeFlavor::Ordered);
+    resolve_options(&nested.member);
+    let slot = ResidentProjection::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+    assert!(parent.set_admitted_children(vec![slot.clone()]));
+    let mut snapshots = parent.subscribe_snapshots();
+
+    assert!(parent.terminalize_child(
+        &nested.member,
+        Exit::never_started(),
+        None,
+        StartupDisposition::NotAborted,
+    ));
+    snapshots
+        .changed()
+        .await
+        .expect("no-incarnation terminal publishes the parent projection");
+
+    assert!(matches!(
+        snapshots
+            .borrow_latest()
+            .child("nested")
+            .expect("retained nested child remains resident")
+            .state,
+        ChildState::Stopped { ref exit } if matches!(exit.kind(), ExitKind::NeverStarted)
+    ));
+    assert!(matches!(
+        nested.record().state,
+        ScopeState::Stopped {
+            reason: StopReason::NeverStarted
+        }
+    ));
 }

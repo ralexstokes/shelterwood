@@ -13,12 +13,11 @@ pub(super) use std::{
 };
 
 pub(super) use crate::{
-    ActorRef, Backoff, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
-    GracePhase, Incarnation, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError,
-    Mailbox, MembershipStatus, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome,
-    ReserveError, RestartCondition, RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind,
-    StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef,
-    TaskOnceDef, Tree,
+    ActorRef, Backoff, Cancellation, ChildId, DynamicTree, Exit, ExitError, ExitKind, GracePhase,
+    Incarnation, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Mailbox,
+    MembershipStatus, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ReserveError,
+    RestartCondition, RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind, StartupError,
+    StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
     engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
     exit::RecordedOutcome,
     identity::{IncarnationCounter, ScopeIdentity},
@@ -132,9 +131,9 @@ pub(super) async fn recv_construction_disposed(
 pub(super) use super::super::{
     AdmissionRequest, AncestorCommandLatches, ChildEvent, ChildRuntime, ChildTerminality,
     DriverEvent, DynamicControl, DynamicEntry, DynamicReservation, GateCapture, MemberCell,
-    MemberStage, MemberTransition, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses,
-    ResidentProjection, Retained, RuntimeStorage, ScopeCell, ScopeControlEvent, ScopeEpochGuard,
-    ScopeFlavor, ScopeRole, ScopeRuntime, ScopeRuntimeTestWiring, StartupDisposition,
+    MemberStage, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses, ResidentProjection,
+    Retained, RuntimeStorage, ScopeCell, ScopeControlEvent, ScopeEpochGuard, ScopeFlavor,
+    ScopeRole, ScopeRuntime, ScopeRuntimeTestWiring, StartupDisposition,
     discharge_child_terminality, monitor_root_driver, nested_scope_start, report_slot,
     reserve_dynamic, resident_projection, run_nested_factory, run_scope, run_scope_incarnation,
     spawn::dispatch_child_construction_for_test, storage::Obligation, wait_for_scope_wake,

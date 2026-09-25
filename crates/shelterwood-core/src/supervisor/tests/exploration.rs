@@ -942,7 +942,7 @@ fn check_t9_removal_effects_are_issued_once(transition: &Transition<'_>) {
 /// For ordered scopes R4 is stated over the cursor: "the settlement step emits
 /// a start effect only for the current initial cursor, and advances the cursor
 /// only past a spawned-and-ready member or a reclaimed slot, reaching every
-/// initial member in declaration order" (§11: "readiness-gated startup in
+/// initial member in declaration order" (§2: "readiness-gated startup in
 /// declaration order"). Declaration order along the path follows from the
 /// cursor only ever moving forward, so the ordering is checked per transition
 /// and needs no history — which matters, because "was ready when the cursor

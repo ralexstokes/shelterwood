@@ -22,8 +22,8 @@ direction, plus one checking tool:
 - **`shelterwood-core`** — runtime-independent supervision types,
   waker proxies, and state machines. Its only dependency is `thiserror`: no
   async runtime, no adapter, nothing that can run user code behind its
-  back. This is where the pure decision machinery lives (`engine.rs`,
-  `supervisor.rs`, `exit.rs`, `policy.rs`), along with the identity types,
+  back. This is where the pure decision machinery lives (`engine.rs`
+  and `engine/`, `supervisor.rs`, `exit.rs`, `policy.rs`), along with the identity types,
   panic-capture facilities, and the doc-hidden seams the other crates
   consume (`waker.rs`, `waker_proxy.rs`, `proxied_sleep.rs`).
 - **`shelterwood-runtime`** — the Tokio adapter. It is the only crate in

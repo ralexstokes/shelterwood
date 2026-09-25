@@ -23,9 +23,11 @@ small pure machines in `shelterwood-core`, composed by the driver:
   Running → Draining → Stopped arc and the stop-reason lattice.
 - Its siblings in `engine.rs` are consumed by the driver directly:
   **`StopLadder`** (per-child stop escalation over time),
-  **`ReadinessGate`**, **`IntensityState`** with `schedule_restart`,
-  **`dispatch_exit`** (restart-vs-terminal), **`arbitrate`** (the
-  event-class ordering), and **`DeadlineQueue`**.
+  **`IntensityState`** with `schedule_restart`, **`dispatch_exit`**
+  (restart-vs-terminal) and **`arbitrate`** (the event-class ordering);
+  the `engine/` submodules hold **`ReadinessGate`** (`readiness.rs`),
+  **`DeadlineQueue`** (`deadline_queue.rs`) and the scope's
+  **`ScopeEpochs`** (`epochs.rs`).
 
 The division of labor: the supervisor decides *that* a child starts or
 stops and in what order; the ladder decides *how a stop escalates* as

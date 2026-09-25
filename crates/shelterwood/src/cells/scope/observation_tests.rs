@@ -921,10 +921,21 @@ fn ancestor_only_lifecycle_subscription_receives_forwarded_leaf_events() {
     ));
 }
 
+/// How long a handoff that must be parked behind a held observation edge is
+/// given to (wrongly) finish anyway.
+///
+/// Absence cannot be proven by waiting, so this window only has to be long
+/// enough for an *unblocked* handoff to finish: after its capture that path
+/// takes no contended lock and runs a few microseconds of bookkeeping. A
+/// correct handoff cannot finish inside the window at any length, so the
+/// window can only lengthen the test, never flake it.
+const PARKED_HANDOFF_WINDOW: Duration = Duration::from_millis(250);
+
 #[test]
 fn gate_handoff_waits_for_an_in_flight_observation_edge() {
     let root = unresolved_isolated_scope("root", ScopeFlavor::Ordered);
     let nested = unresolved_isolated_scope("nested", ScopeFlavor::Dynamic);
+    let prior_gate = nested.observation_gate();
     let captures = nested.probe_gate_captures();
     let (entered, entered_receiver) = std::sync::mpsc::sync_channel(0);
     let (release, release_receiver) = std::sync::mpsc::sync_channel(0);
@@ -949,34 +960,62 @@ fn gate_handoff_waits_for_an_in_flight_observation_edge() {
 
     let slot = ResidentProjection::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
     let adopting_root = Arc::clone(&root);
-    let (adopted, adopted_receiver) = std::sync::mpsc::sync_channel(0);
+    // Unbounded, so an adoption that finishes early reports it without
+    // parking on the rendezvous and the report is visible to the window below.
+    let (adopted, adopted_receiver) = std::sync::mpsc::channel();
     let adoption = std::thread::spawn(move || {
-        assert!(adopting_root.set_admitted_children(vec![slot.clone()]));
-        adopted.send(()).expect("test receiver remains available");
+        let admitted = adopting_root.set_admitted_children(vec![slot.clone()]);
+        adopted
+            .send(admitted)
+            .expect("test receiver remains available");
     });
 
-    // The adoption capture proves handoff committed to the prior gate and
-    // is blocked behind the complete observation edge rather than
-    // replacing it concurrently, so adoption cannot yet have completed.
+    // The capture proves the handoff committed to the prior gate, which the
+    // observation edge still holds.
     assert_eq!(
         captures
             .recv_timeout(TEST_WAIT)
             .expect("adoption reports its capture within the bound"),
         GateCapture::Adoption
     );
-    assert!(matches!(
-        adopted_receiver.try_recv(),
-        Err(std::sync::mpsc::TryRecvError::Empty)
-    ));
+    // A handoff that skips the prior gate has nothing left to wait for and
+    // completes inside the window; a correct one is parked until release.
+    let completed_early = adopted_receiver.recv_timeout(PARKED_HANDOFF_WINDOW);
+    // The parked handoff sits inside the root's transaction without having
+    // re-homed the child. Both are fixed from the capture until the edge is
+    // released, so they hold whenever the window above closes.
+    let root_held_while_parked = root.observation_gate().is_held();
+    let child_still_on_prior_gate = nested.observation_gate().same_gate(&prior_gate);
 
     release
         .send(())
         .expect("active observation remains available");
-    observation.join().expect("observation edge completes");
-    adopted_receiver
-        .recv()
-        .expect("adoption reports completion after the edge");
-    adoption.join().expect("gate handoff completes");
+    let observation_joined = observation.join();
+    let admitted = completed_early.or_else(|_| adopted_receiver.recv_timeout(TEST_WAIT));
+    let adoption_joined = adoption.join();
+
+    assert!(
+        matches!(
+            completed_early,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "the handoff must not complete while the observation edge is held"
+    );
+    assert!(
+        root_held_while_parked,
+        "the parked handoff keeps the destination gate held"
+    );
+    assert!(
+        child_still_on_prior_gate,
+        "the child is not re-homed while its prior gate's edge is in flight"
+    );
+    observation_joined.expect("observation edge completes");
+    adoption_joined.expect("gate handoff completes");
+    assert_eq!(
+        admitted,
+        Ok(true),
+        "adoption completes and admits the child once the edge is released"
+    );
     assert!(
         root.observation_gate()
             .same_gate(&nested.observation_gate())

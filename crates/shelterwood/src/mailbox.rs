@@ -12,8 +12,8 @@ use std::{
 };
 
 use crate::identity::{ChildId, Incarnation, Membership};
-pub(crate) use shelterwood_core::ProxiedSleep;
-use shelterwood_core::policy::ResolvedMailbox;
+pub(crate) use shelterwood_core::proxied_sleep::ProxiedSleep;
+use shelterwood_core::{panic::PanicAccumulator, policy::ResolvedMailbox};
 
 mod capability;
 mod cell;
@@ -124,7 +124,7 @@ impl MailboxEffectSink for MailboxEffectQueue {
 
 impl Drop for MailboxEffectQueue {
     fn drop(&mut self) {
-        let mut panics = crate::runtime::PanicAccumulator::default();
+        let mut panics = PanicAccumulator::default();
         for effect in self.0.drain(..) {
             panics.run(effect);
         }

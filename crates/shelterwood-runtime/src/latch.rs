@@ -222,8 +222,10 @@ mod tests {
         time::Duration,
     };
 
+    use shelterwood_core::exit::JoinOutcome;
+
     use crate::{
-        CompletionGatedLatch, JoinOutcome, Latch, Timeout, join, spawn,
+        CompletionGatedLatch, Latch, Timeout, join, spawn,
         test_wakers::{
             CountPanicWake, CountWake, assert_panic_message, last_drop_panics_waker,
             transition_on_clone_waker,

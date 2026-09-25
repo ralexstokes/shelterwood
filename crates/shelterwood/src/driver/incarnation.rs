@@ -1,6 +1,7 @@
 //! One scope incarnation: its epoch guard, entry point and driver loop.
 
 use super::*;
+use shelterwood_core::panic::PanicAccumulator;
 
 /// Owns a scope epoch and its matching initial lifecycle until a
 /// `ScopeRuntime` has taken over teardown.
@@ -263,7 +264,7 @@ pub(super) async fn run_scope_incarnation(
             // verdict otherwise. `begin_incarnation` already published
             // `Starting`, so the epoch finishes as a requested stop rather
             // than claiming no incarnation ever began.
-            let mut panics = runtime::PanicAccumulator::default();
+            let mut panics = PanicAccumulator::default();
             if !std::thread::panicking() {
                 panics.run(|| {
                     panic!("a root incarnation promotes its own never-admitted reservation")

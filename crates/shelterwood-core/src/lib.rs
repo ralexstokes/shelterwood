@@ -11,6 +11,10 @@
 //! the façade and adapter crates. Those items are not part of the supported
 //! `shelterwood` API, so this crate permits `unreachable_pub`; the public
 //! façade retains the workspace's `unreachable_pub` lint.
+//!
+//! Every item has one path: its defining module (`exit::Exit`,
+//! `policy::Intensity`). The root re-exports only `ProxiedPoll`, whose
+//! module is private.
 
 pub mod deadline;
 pub mod engine;
@@ -27,12 +31,5 @@ pub mod test_support;
 pub mod waker;
 mod waker_proxy;
 
-pub use deadline::*;
-pub use engine::{MembershipStatus, ScopeState};
-pub use exit::*;
-pub use identity::*;
-pub use policy::*;
-#[doc(hidden)]
-pub use proxied_sleep::{BoxedSleep, ProxiedSleep};
 #[doc(hidden)]
 pub use waker_proxy::ProxiedPoll;

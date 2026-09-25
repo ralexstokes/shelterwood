@@ -207,7 +207,7 @@ async fn window_stop_before_exit(
         key,
         first,
         failed_exit("restart the nested scope"),
-        crate::runtime::JoinOutcome::Ok { value: () },
+        JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,
     );
@@ -279,7 +279,7 @@ async fn restart_deadline_ahead_of_window_stop(
         key,
         first,
         failed_exit("open the restart window"),
-        crate::runtime::JoinOutcome::Ok { value: () },
+        JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,
     );
@@ -432,7 +432,7 @@ async fn same_batch_intensity_trip_owns_a_window_stop_terminal() {
         nested,
         nested_first,
         failed_exit("open the restart window"),
-        crate::runtime::JoinOutcome::Ok { value: () },
+        JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,
     );
@@ -461,7 +461,7 @@ async fn same_batch_intensity_trip_owns_a_window_stop_terminal() {
         child: trip,
         incarnation: trip_incarnation,
         recorded: failed_exit("trip intensity"),
-        join: crate::runtime::JoinOutcome::Ok { value: () },
+        join: JoinOutcome::Ok { value: () },
         cancellation: Cancellation::NotObserved,
         readiness_signal_seen: false,
     });
@@ -670,7 +670,7 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
             child: key,
             incarnation,
             recorded: Some(Retained::new(RecordedOutcome::returned(Ok(())))),
-            join: crate::runtime::JoinOutcome::Ok { value: () },
+            join: JoinOutcome::Ok { value: () },
             cancellation: Cancellation::NotObserved,
             readiness_signal_seen: true,
         })
@@ -1131,7 +1131,7 @@ async fn removal_before_pre_ready_exit_does_not_publish_startup_abort() {
         Some(Retained::new(RecordedOutcome::returned(Err(
             ExitError::message("pre-ready failure racing removal"),
         )))),
-        crate::runtime::JoinOutcome::Ok { value: () },
+        JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,
     );

@@ -10,6 +10,7 @@ use crate::{
     driver::DynamicReservation,
     runtime::{DisposingReceiver, Latch},
 };
+use shelterwood_core::panic::{UnwindPanics, catch_panic, resume_preferred_panic};
 
 use crate::driver::{LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR};
 
@@ -77,7 +78,7 @@ impl<H> PendingAdmission<H> {
 
     fn annul(&self) {
         let signal_panic = self.fused_cancel.as_ref().and_then(|cancel| {
-            crate::runtime::catch_panic(|| {
+            catch_panic(|| {
                 crate::driver::signal_fused_cancel(
                     &self.reservation.scope,
                     self.reservation.control.as_ref(),
@@ -87,8 +88,8 @@ impl<H> PendingAdmission<H> {
             })
             .err()
         });
-        let cleanup_panic = crate::runtime::catch_panic(|| self.reservation.cancel()).err();
-        crate::runtime::resume_preferred_panic(crate::runtime::UnwindPanics {
+        let cleanup_panic = catch_panic(|| self.reservation.cancel()).err();
+        resume_preferred_panic(UnwindPanics {
             primary: signal_panic,
             cleanup: cleanup_panic,
         });

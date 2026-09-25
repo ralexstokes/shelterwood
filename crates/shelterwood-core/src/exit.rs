@@ -140,7 +140,7 @@ pub type ExitResult = Result<(), ExitError>;
 /// # Examples
 ///
 /// ```
-/// # use shelterwood_core::ExitError;
+/// # use shelterwood_core::exit::ExitError;
 /// // From a displayable message.
 /// let error = ExitError::message("shard offline");
 /// assert_eq!(error.as_error().to_string(), "shard offline");
@@ -444,7 +444,7 @@ pub enum GracePhase {
 /// payload:
 ///
 /// ```
-/// # use shelterwood_core::{Cancellation, Exit, ExitError, ExitKind};
+/// # use shelterwood_core::exit::{Cancellation, Exit, ExitError, ExitKind};
 /// fn describe(exit: &Exit) -> String {
 ///     match exit.kind() {
 ///         ExitKind::Completed => "completed".to_owned(),

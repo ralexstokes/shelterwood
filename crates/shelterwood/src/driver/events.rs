@@ -1,4 +1,5 @@
 use super::*;
+use shelterwood_core::exit::JoinOutcome;
 
 pub(super) enum DriverEvent {
     Child(ChildEvent),
@@ -20,7 +21,7 @@ pub(super) enum ChildEvent {
         child: ChildKey,
         incarnation: Incarnation,
         recorded: Option<Retained<RecordedOutcome>>,
-        join: runtime::JoinOutcome<()>,
+        join: JoinOutcome<()>,
         cancellation: Cancellation,
         readiness_signal_seen: bool,
     },

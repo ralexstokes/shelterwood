@@ -7,7 +7,8 @@ use std::{
     task::{Context as TaskPollContext, Poll},
 };
 
-use crate::runtime::{PanicAccumulator, PanicPayload, Signal, catch_panic, discard_panic};
+use crate::runtime::Signal;
+use shelterwood_core::panic::{PanicAccumulator, PanicPayload, catch_panic, discard_panic};
 
 /// Future panic boundary that owns and destroys its inner future.
 ///

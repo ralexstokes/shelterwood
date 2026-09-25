@@ -2,11 +2,10 @@ use std::{fmt, sync::Arc};
 
 use crate::{cells::ObservationTxn, runtime};
 use shelterwood_core::{
-    Exit,
     engine::ScopeState,
     exit::{
-        Cancellation, ExitKind, ExitResult, GracePhase, JoinOutcome, RecordedOutcome, StartupError,
-        StartupFailure, StartupFailureCause, StopReason, classify_exit,
+        Cancellation, Exit, ExitKind, ExitResult, GracePhase, JoinOutcome, RecordedOutcome,
+        StartupError, StartupFailure, StartupFailureCause, StopReason, classify_exit,
         reconcile_recorded_outcomes,
     },
 };
@@ -383,7 +382,10 @@ pub(crate) fn classify_exit_retaining(
 mod tests {
     use std::{sync::mpsc, time::Duration};
 
-    use shelterwood_core::{Cancellation, ChildId, ExitError, identity::ScopeIdentity};
+    use shelterwood_core::{
+        exit::{Cancellation, ExitError},
+        identity::{ChildId, ScopeIdentity},
+    };
 
     use super::*;
     use crate::cells::{

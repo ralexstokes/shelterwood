@@ -113,7 +113,7 @@ async fn task_aborted_scope_driver_resolves_startup() {
     abort.abort();
     assert!(matches!(
         crate::runtime::join(driver).await,
-        crate::runtime::JoinOutcome::Cancelled
+        JoinOutcome::Cancelled
     ));
     let result = crate::runtime::timeout(Duration::from_secs(1), waiter).await;
     assert!(matches!(
@@ -588,7 +588,7 @@ async fn initial_added_wake_observes_the_keyed_dynamic_route() {
     abort.abort();
     assert!(matches!(
         crate::runtime::join(driver).await,
-        crate::runtime::JoinOutcome::Cancelled
+        JoinOutcome::Cancelled
     ));
 }
 

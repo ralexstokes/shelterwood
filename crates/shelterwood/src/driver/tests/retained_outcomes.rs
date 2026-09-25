@@ -43,7 +43,7 @@ fn pending_drain_suffix_contains_failed_outcome_destruction_during_unwind() {
         recorded: Some(Retained::new(RecordedOutcome::returned(Err(
             ExitError::from(PanickingDrop(dropped)),
         )))),
-        join: crate::runtime::JoinOutcome::Ok { value: () },
+        join: JoinOutcome::Ok { value: () },
         cancellation: Cancellation::NotObserved,
         readiness_signal_seen: false,
     });
@@ -112,7 +112,7 @@ async fn a_join_panic_disposes_the_recorded_application_failure_off_the_driver()
         key,
         incarnation,
         Some(Retained::new(RecordedOutcome::returned(Err(recorded)))),
-        crate::runtime::JoinOutcome::Panic {
+        JoinOutcome::Panic {
             message: Some("join panic".to_owned()),
         },
         Cancellation::NotObserved,
@@ -187,7 +187,7 @@ async fn handle_exit_retains_the_selected_failure_across_dispatch_panics() {
                 key,
                 incarnation,
                 Some(Retained::new(RecordedOutcome::returned(Err(recorded)))),
-                crate::runtime::JoinOutcome::Ok { value: () },
+                JoinOutcome::Ok { value: () },
                 Cancellation::NotObserved,
                 false,
             );
@@ -260,7 +260,7 @@ async fn a_refused_restart_publication_retains_the_selected_failure() {
             key,
             incarnation,
             Some(Retained::new(RecordedOutcome::returned(Err(recorded)))),
-            crate::runtime::JoinOutcome::Ok { value: () },
+            JoinOutcome::Ok { value: () },
             Cancellation::NotObserved,
             false,
         );

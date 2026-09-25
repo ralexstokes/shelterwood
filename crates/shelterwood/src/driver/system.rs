@@ -2,6 +2,10 @@
 //! root terminality.
 
 use super::*;
+use shelterwood_core::{
+    exit::JoinOutcome,
+    panic::{catch_panic, discard_panic},
+};
 
 pub(crate) struct SystemRun {
     pub(crate) root: Arc<ScopeCell>,
@@ -46,17 +50,14 @@ impl SystemRun {
 }
 
 pub(super) fn classify_retained_root_driver_join(
-    outcome: runtime::JoinOutcome<Guarded<StopReason>>,
+    outcome: JoinOutcome<Guarded<StopReason>>,
 ) -> Result<Guarded<StopReason>, Exit> {
     let (join, cancellation) = match outcome {
-        runtime::JoinOutcome::Ok { value } => return Ok(value),
-        runtime::JoinOutcome::Panic { message } => (
-            runtime::JoinOutcome::Panic { message },
-            Cancellation::NotObserved,
-        ),
-        runtime::JoinOutcome::Cancelled => {
-            (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
+        JoinOutcome::Ok { value } => return Ok(value),
+        JoinOutcome::Panic { message } => {
+            (JoinOutcome::Panic { message }, Cancellation::NotObserved)
         }
+        JoinOutcome::Cancelled => (JoinOutcome::Cancelled, Cancellation::Observed),
     };
     Err(classify_exit_retaining(None, join, None, cancellation))
 }
@@ -171,7 +172,7 @@ impl Drop for MonitorFence {
         // A cancelled join never classifies as a completed reason, so the
         // `Ok` half is unreachable; matching rather than unwrapping keeps a
         // panic out of drop glue regardless.
-        if let Err(exit) = classify_retained_root_driver_join(runtime::JoinOutcome::Cancelled) {
+        if let Err(exit) = classify_retained_root_driver_join(JoinOutcome::Cancelled) {
             finish_monitored_root(&self.root, StopReason::ShutdownRequested, exit);
         }
     }
@@ -185,7 +186,5 @@ impl Drop for MonitorFence {
 /// diagnostic; discard it rather than replacing a classified completion with
 /// a second monitor failure that could strand the root's finality fence.
 fn finish_monitored_root(root: &ScopeCell, reason: StopReason, exit: Exit) {
-    runtime::discard_panic(
-        runtime::catch_panic(|| root.finish_live_root_incarnation(reason, exit)).err(),
-    );
+    discard_panic(catch_panic(|| root.finish_live_root_incarnation(reason, exit)).err());
 }

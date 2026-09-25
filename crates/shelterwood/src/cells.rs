@@ -34,8 +34,7 @@ pub(crate) mod test_support {
     };
 
     use shelterwood_core::{
-        ChildId,
-        identity::ScopeIdentity,
+        identity::{ChildId, ScopeIdentity},
         policy::{
             ChildMode, CommonOptions, Readiness, ResolvedDefaults, ScopeFlavor, resolve_common,
         },

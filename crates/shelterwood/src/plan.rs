@@ -15,6 +15,7 @@ use crate::{
     runtime::{self, Isolated, Latch},
     task::TaskConstruction,
 };
+use shelterwood_core::panic::PanicAccumulator;
 
 #[derive(Clone, Debug, Default)]
 struct ScopeConfig {
@@ -143,7 +144,7 @@ impl SlotCell {
     fn terminalize_never_started_contained(
         &self,
         owner: &ScopeCell,
-        panics: &mut runtime::PanicAccumulator,
+        panics: &mut PanicAccumulator,
     ) {
         // Publication can resume a hostile observer. Identity eviction is a
         // distinct teardown effect and must still run before the next slot.
@@ -426,7 +427,7 @@ impl BuilderCore {
         // Slots past the failure point never left `self.root`'s map, so their
         // eviction from the override is a fence-mismatch no-op (fail closed).
         let identity_root = self.adopting_root.as_ref().unwrap_or(&self.root);
-        let mut panics = runtime::PanicAccumulator::default();
+        let mut panics = PanicAccumulator::default();
         for slot in &self.slots {
             slot.terminalize_never_started_contained(identity_root, &mut panics);
         }
@@ -461,7 +462,7 @@ impl ScopePlan {
 
 fn terminalize_plan(root: &ScopeCell, children: &[ChildPlan], terminality_owed: &mut bool) {
     if std::mem::take(terminality_owed) {
-        let mut panics = runtime::PanicAccumulator::default();
+        let mut panics = PanicAccumulator::default();
         for child in children {
             child
                 .slot

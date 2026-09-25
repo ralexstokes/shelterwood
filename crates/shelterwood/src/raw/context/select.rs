@@ -3,10 +3,8 @@
 
 use std::{collections::VecDeque, time::Instant};
 
-use crate::{
-    mailbox::AcceptedSequence,
-    runtime::{self, catch_panic},
-};
+use crate::{mailbox::AcceptedSequence, runtime};
+use shelterwood_core::panic::{catch_panic, resume_panic};
 
 use super::{RawContext, resources::QueuedEvent, timers::ArmingOrder};
 
@@ -178,7 +176,7 @@ impl<M: Send + 'static> RawContext<M> {
         // on the unwind.
         if let Some(panic) = self.resources.disposal.panic.take() {
             self.resources.disposal.dispose(message);
-            runtime::resume_panic(panic);
+            resume_panic(panic);
         }
         message
     }
@@ -214,7 +212,7 @@ impl<M: Send + 'static> RawContext<M> {
                     self.resources.batch_mut().record_mailbox_delivery();
                     self.resources.last_delivery_was_continuation = false;
                 }
-                if let Some(message) = result.unwrap_or_else(|panic| runtime::resume_panic(panic)) {
+                if let Some(message) = result.unwrap_or_else(|panic| resume_panic(panic)) {
                     return Some(message);
                 }
             }

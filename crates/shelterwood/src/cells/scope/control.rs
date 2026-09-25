@@ -8,9 +8,10 @@ use std::{
 };
 
 use shelterwood_core::{
-    Exit, Membership, TotalRestarts,
     engine::{Epoch, RequestTarget, ScopeEpochs, ScopeState},
-    exit::StopReason,
+    exit::{Exit, StopReason},
+    identity::Membership,
+    policy::TotalRestarts,
 };
 
 use crate::cells::observe::LifecycleEventKind;

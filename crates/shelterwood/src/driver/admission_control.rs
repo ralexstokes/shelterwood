@@ -17,6 +17,7 @@ use crate::{
     policy::ScopeFlavor,
     runtime::{self, Latch},
 };
+use shelterwood_core::panic::PanicAccumulator;
 
 use super::{
     ChildKey, ChildRuntime, DriverEvent, Obligation, RemovalRequest, ResidentProjection,
@@ -40,7 +41,7 @@ impl RemovalResponses {
     }
 
     fn complete(self, outcome: RemoveOutcome) {
-        let mut panics = runtime::PanicAccumulator::default();
+        let mut panics = PanicAccumulator::default();
         for sender in self.0 {
             panics.run(|| {
                 let _ = sender.send(outcome);
@@ -700,7 +701,7 @@ impl AdmissionInstall {
 
 impl Drop for AdmissionInstall {
     fn drop(&mut self) {
-        let mut panics = runtime::PanicAccumulator::default();
+        let mut panics = PanicAccumulator::default();
         if let Some(projection) = self.projection.take() {
             panics.run(move || runtime::dispose_detached(projection));
         }

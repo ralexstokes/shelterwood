@@ -38,9 +38,9 @@ pub use oneshot::*;
 pub(crate) use panic_payload::*;
 pub use select::*;
 // Unwind handling is plain `std::panic`, so it lives in the runtime-neutral
-// core. Re-exported here because the adapter's own modules and the façade
-// reach it as a runtime facility.
-pub use shelterwood_core::{exit::JoinOutcome, panic::*};
+// core. This crate-private import serves the adapter's own modules;
+// dependents name it by its core path.
+pub(crate) use shelterwood_core::panic::*;
 pub use spawn::*;
 pub use timer::*;
 #[cfg(feature = "test-util")]

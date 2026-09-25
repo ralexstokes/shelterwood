@@ -152,7 +152,7 @@ mod tests {
     };
 
     use super::ProxiedSleep;
-    use crate::BoxedSleep;
+    use crate::proxied_sleep::BoxedSleep;
 
     /// `ProxiedSleep` hands a waker to its disposer only from drop glue, and
     /// every path these tests drive retires the caller slot inline first, so

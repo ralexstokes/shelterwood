@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 
 use crate::runtime;
 use shelterwood_core::{
-    Membership,
+    identity::Membership,
     panic::{catch_panic, discard_panic},
 };
 

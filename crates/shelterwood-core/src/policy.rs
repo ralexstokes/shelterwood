@@ -2,7 +2,7 @@
 
 use std::{fmt, num::NonZeroUsize, time::Duration};
 
-use crate::Exit;
+use crate::exit::Exit;
 
 /// Whether a scope has fixed ordered membership or runtime-dynamic membership.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -274,7 +274,7 @@ impl std::hash::Hash for BackoffFactor {
 ///
 /// ```
 /// # use std::time::Duration;
-/// # use shelterwood_core::{
+/// # use shelterwood_core::policy::{
 /// #     Backoff, BackoffFactor, Jitter, JitterSample, RestartAttempt,
 /// # };
 /// let backoff = Backoff::exponential(
@@ -292,7 +292,7 @@ impl std::hash::Hash for BackoffFactor {
 /// assert_eq!(backoff.next_delay(second, sample), Duration::from_millis(20));
 /// // The doubled third delay would exceed the maximum, so it clamps.
 /// assert_eq!(backoff.next_delay(third, sample), Duration::from_millis(35));
-/// # Ok::<(), shelterwood_core::PolicyError>(())
+/// # Ok::<(), shelterwood_core::policy::PolicyError>(())
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Backoff {
@@ -569,7 +569,7 @@ fn duration_from_nanos(nanos: f64) -> Duration {
 ///
 /// ```
 /// # use std::time::Duration;
-/// # use shelterwood_core::{
+/// # use shelterwood_core::policy::{
 /// #     Backoff, BackoffFactor, Jitter, RestartCondition, RestartPolicy,
 /// #     ScopeDefaults,
 /// # };
@@ -589,7 +589,7 @@ fn duration_from_nanos(nanos: f64) -> Duration {
 ///     ..ScopeDefaults::default()
 /// };
 /// assert_eq!(defaults.child_restart, Some(policy));
-/// # Ok::<(), shelterwood_core::PolicyError>(())
+/// # Ok::<(), shelterwood_core::policy::PolicyError>(())
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RestartPolicy {
@@ -741,11 +741,11 @@ impl ReadinessDeadline {
 ///
 /// ```
 /// # use std::time::Duration;
-/// # use shelterwood_core::Intensity;
+/// # use shelterwood_core::policy::Intensity;
 /// let budget = Intensity::new(5, Duration::from_secs(30))?;
 /// assert_eq!(budget.max_restarts(), 5);
 /// assert_eq!(budget.within(), Duration::from_secs(30));
-/// # Ok::<(), shelterwood_core::PolicyError>(())
+/// # Ok::<(), shelterwood_core::policy::PolicyError>(())
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Intensity {

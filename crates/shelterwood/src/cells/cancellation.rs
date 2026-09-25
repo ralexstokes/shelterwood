@@ -68,7 +68,8 @@ impl ParentCancellationToken {
 mod tests {
     use std::time::Duration;
 
-    use crate::runtime::{self, JoinOutcome, Latch, Timeout};
+    use crate::runtime::{self, Latch, Timeout};
+    use shelterwood_core::exit::JoinOutcome;
 
     use super::ParentCancellationToken;
 

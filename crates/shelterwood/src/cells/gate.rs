@@ -5,6 +5,7 @@ use crate::{
     mailbox::MailboxEffectSink,
     runtime,
 };
+use shelterwood_core::panic::PanicAccumulator;
 
 /// Shared critical section for one resident tree's observation projection.
 ///
@@ -182,7 +183,7 @@ impl<'a> ObservationTxn<'a> {
     }
 
     fn commit(&mut self) {
-        let mut panics = runtime::PanicAccumulator::default();
+        let mut panics = PanicAccumulator::default();
         // Installation precedes the unlock, and the order is load-bearing:
         // released first, two transactions on one gate could interleave as
         // "T1 unlocks, T2 stages and installs a newer cut, T1 installs its
@@ -241,7 +242,7 @@ mod tests {
         task::{Context, Wake, Waker},
     };
 
-    use shelterwood_core::{Cancellation, Exit, ExitError};
+    use shelterwood_core::exit::{Cancellation, Exit, ExitError};
 
     use crate::{
         cells::{

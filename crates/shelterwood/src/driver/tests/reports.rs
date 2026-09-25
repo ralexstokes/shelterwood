@@ -86,7 +86,7 @@ async fn cancelled_task_report_cell_is_ready_after_join() {
     task.abort_handle().abort();
     assert!(matches!(
         crate::runtime::join(task).await,
-        crate::runtime::JoinOutcome::Cancelled
+        JoinOutcome::Cancelled
     ));
 
     let report = claim.receive();

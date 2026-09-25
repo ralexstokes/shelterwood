@@ -6,7 +6,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::runtime::{self, Latch, Signal, SignalWatcher, UnwindPanics, resume_preferred_panic};
+use crate::runtime::{Latch, Signal, SignalWatcher};
+use shelterwood_core::{
+    exit::JoinOutcome,
+    panic::{UnwindPanics, resume_preferred_panic},
+};
 
 use super::{
     super::{
@@ -335,8 +339,8 @@ impl<M> RawResources<M> {
         for offload in &mut self.offloads {
             if let Some(task) = offload.task.take() {
                 match task.join().await {
-                    runtime::JoinOutcome::Ok { value: () } | runtime::JoinOutcome::Cancelled => {}
-                    runtime::JoinOutcome::Panic { message } => {
+                    JoinOutcome::Ok { value: () } | JoinOutcome::Cancelled => {}
+                    JoinOutcome::Panic { message } => {
                         let message = message.unwrap_or_else(|| {
                             "library-owned offload task panicked without a string payload"
                                 .to_owned()

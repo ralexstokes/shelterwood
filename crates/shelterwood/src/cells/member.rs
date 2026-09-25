@@ -8,10 +8,13 @@ use std::{
 
 use crate::{mailbox::MailboxControl, runtime};
 use shelterwood_core::{
-    ChildId, Exit, Incarnation, Membership, RestartCount,
     engine::MembershipStatus,
-    identity::{IncarnationCounter, MintedMembership, ProvisionalMembership},
-    policy::ResolvedCommonOptions,
+    exit::Exit,
+    identity::{
+        ChildId, Incarnation, IncarnationCounter, Membership, MintedMembership,
+        ProvisionalMembership,
+    },
+    policy::{ResolvedCommonOptions, RestartCount},
 };
 
 use super::{Guarded, ObservationGate, ObservationTxn, RetainGuards, Retained};
@@ -748,7 +751,11 @@ mod tests {
         SendErrorKind,
         mailbox::{MailboxCell, MailboxControl, actor_ref_from_parts},
     };
-    use shelterwood_core::{Cancellation, ExitError, identity::ScopeIdentity, policy::ScopeFlavor};
+    use shelterwood_core::{
+        exit::{Cancellation, ExitError},
+        identity::ScopeIdentity,
+        policy::ScopeFlavor,
+    };
 
     use super::*;
     use crate::cells::test_support::{ThreadProbe, isolated_scope};

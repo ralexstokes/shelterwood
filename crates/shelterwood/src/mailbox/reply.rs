@@ -3,7 +3,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use shelterwood_core::DeadlineBudget;
+use shelterwood_core::deadline::DeadlineBudget;
 
 use crate::{
     mailbox::capability::{DisposingReceiver, OneShotReceive},

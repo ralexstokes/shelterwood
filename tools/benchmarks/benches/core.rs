@@ -5,8 +5,9 @@ use std::{
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use shelterwood_core::{
-    ChildId, Membership, ScopeIdentity, ScopeState, StopReason,
-    engine::{DeadlineHandle, DeadlineQueue, ScopeLifecycle},
+    engine::{DeadlineHandle, DeadlineQueue, ScopeLifecycle, ScopeState},
+    exit::StopReason,
+    identity::{ChildId, Membership, ScopeIdentity},
     policy::ScopeFlavor,
     supervisor::{self, ChildKey, Effect, Event, SupervisorState},
 };

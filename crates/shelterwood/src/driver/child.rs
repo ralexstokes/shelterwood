@@ -2,6 +2,10 @@
 //! release edge.
 
 use super::*;
+use shelterwood_core::{
+    exit::JoinOutcome,
+    panic::{catch_panic, resume_panic},
+};
 
 pub(super) struct ActiveChild {
     pub(super) incarnation: Incarnation,
@@ -36,12 +40,7 @@ pub(super) fn discharge_child_terminality(completion: ChildTerminality) {
         (Exit::never_started(), None)
     } else {
         (
-            classify_exit_retaining(
-                None,
-                runtime::JoinOutcome::Cancelled,
-                None,
-                Cancellation::Observed,
-            ),
+            classify_exit_retaining(None, JoinOutcome::Cancelled, None, Cancellation::Observed),
             record.incarnation,
         )
     };
@@ -131,7 +130,7 @@ impl ChildRuntime {
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
-        let terminalized = runtime::catch_panic(|| {
+        let terminalized = catch_panic(|| {
             root.terminalize_child(&self.slot.member, exit, exited_incarnation, startup)
         });
         if matches!(self.slot.member.record().stage, MemberStage::Terminal(_)) {
@@ -139,7 +138,7 @@ impl ChildRuntime {
         }
         match terminalized {
             Ok(changed) => changed,
-            Err(payload) => runtime::resume_panic(payload),
+            Err(payload) => resume_panic(payload),
         }
     }
 
@@ -236,7 +235,7 @@ impl ScopeRuntime {
         key: ChildKey,
         incarnation: Incarnation,
         recorded: Option<Retained<RecordedOutcome>>,
-        join: runtime::JoinOutcome<()>,
+        join: JoinOutcome<()>,
         cancellation: Cancellation,
         readiness_signal_seen: bool,
     ) {

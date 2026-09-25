@@ -1222,11 +1222,11 @@ async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
         drop(state);
         annul.join().expect("the annul contender completes");
         let scope = match crate::runtime::join(admission).await {
-            crate::runtime::JoinOutcome::Ok { value } => value,
-            crate::runtime::JoinOutcome::Panic { message } => {
+            JoinOutcome::Ok { value } => value,
+            JoinOutcome::Panic { message } => {
                 panic!("the admission contender panicked: {message:?}")
             }
-            crate::runtime::JoinOutcome::Cancelled => {
+            JoinOutcome::Cancelled => {
                 panic!("the admission contender was cancelled")
             }
         };

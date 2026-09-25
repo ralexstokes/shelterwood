@@ -15,11 +15,12 @@ pub use self::{
     readiness::{ReadinessEffect, ReadinessEvent, ReadinessGate},
 };
 use crate::{
-    Exit, ExitKind, GracePhase, Intensity, IntensityTrip, JitterSample, RestartAttempt,
-    RestartCount, RestartPolicy, Shutdown, TotalRestarts,
     deadline::Deadline,
-    exit::{StopReason, stop_reason_precedence},
-    policy::{ScopeFlavor, tidy_abort_beat},
+    exit::{Exit, ExitKind, GracePhase, IntensityTrip, StopReason, stop_reason_precedence},
+    policy::{
+        Intensity, JitterSample, RestartAttempt, RestartCount, RestartPolicy, ScopeFlavor,
+        Shutdown, TotalRestarts, tidy_abort_beat,
+    },
 };
 
 /// Current state of a scope membership or incarnation.
@@ -652,9 +653,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::{
-        Cancellation, Exit, ExitKind, GracePhase, Intensity, JitterSample, RestartAttempt,
-        RestartCondition, RestartCount, RestartPolicy, Shutdown, TotalRestarts,
-        policy::{Backoff, ScopeFlavor},
+        exit::{
+            Cancellation, Exit, ExitError, ExitKind, GracePhase, IntensityTrip, StartupFailure,
+            StartupFailureCause, StopReason,
+        },
+        identity::ChildId,
+        policy::{
+            Backoff, Intensity, Jitter, JitterSample, RestartAttempt, RestartCondition,
+            RestartCount, RestartPolicy, ScopeFlavor, Shutdown, TotalRestarts,
+        },
     };
 
     use super::{
@@ -940,7 +947,7 @@ mod tests {
     fn funnel_dispatch_covers_every_policy_exit_and_suppression_combination() {
         let cases = [
             (ExitKind::Completed, false),
-            (ExitKind::Failed(crate::ExitError::message("boom")), true),
+            (ExitKind::Failed(ExitError::message("boom")), true),
             (
                 ExitKind::Panicked {
                     message: Some("boom".to_owned()),
@@ -1034,7 +1041,7 @@ mod tests {
         assert!(trip.tripped);
         assert_eq!(trip.in_window, 2);
         assert_eq!(trip.total_restarts, TotalRestarts::ZERO.bump().bump());
-        let trip_payload = crate::IntensityTrip::new(trip);
+        let trip_payload = IntensityTrip::new(trip);
         assert_eq!(trip_payload.max_restarts, policy.max_restarts());
         assert_eq!(trip_payload.observed_restarts, trip.in_window);
         assert_eq!(trip_payload.within, policy.within());
@@ -1100,7 +1107,7 @@ mod tests {
         assert!(decision.charge.tripped);
         assert_eq!(
             decision.intensity_trip(),
-            Some(crate::IntensityTrip::new(decision.charge))
+            Some(IntensityTrip::new(decision.charge))
         );
     }
 
@@ -1110,7 +1117,7 @@ mod tests {
         let intensity_policy = Intensity::new(5, Duration::from_secs(10)).expect("valid intensity");
         let restart_policy = RestartPolicy::new(
             RestartCondition::OnFailure,
-            Backoff::fixed(Duration::MAX, crate::Jitter::None).expect("valid backoff"),
+            Backoff::fixed(Duration::MAX, Jitter::None).expect("valid backoff"),
         );
         let mut restarts = RestartState::new();
         let mut intensity = IntensityState::default();
@@ -1200,7 +1207,7 @@ mod tests {
             None
         );
         let (startup_pending, state) = lifecycle
-            .begin_drain(crate::exit::StopReason::ShutdownRequested)
+            .begin_drain(StopReason::ShutdownRequested)
             .expect("a failed startup can begin draining");
         assert!(!startup_pending);
         assert_eq!(state, ScopeState::Draining);
@@ -1212,7 +1219,7 @@ mod tests {
                     all_terminal: true,
                 },
             ),
-            Some(crate::exit::StopReason::ShutdownRequested)
+            Some(StopReason::ShutdownRequested)
         );
 
         let mut running = ScopeLifecycle::starting();
@@ -1235,12 +1242,12 @@ mod tests {
                     all_terminal: true,
                 },
             ),
-            Some(crate::exit::StopReason::Finished)
+            Some(StopReason::Finished)
         );
 
         let mut starting = ScopeLifecycle::starting();
         let (startup_pending, state) = starting
-            .begin_drain(crate::exit::StopReason::ShutdownRequested)
+            .begin_drain(StopReason::ShutdownRequested)
             .expect("starting can begin draining");
         assert!(startup_pending);
         assert_eq!(state, ScopeState::Draining);
@@ -1248,65 +1255,62 @@ mod tests {
 
     #[test]
     fn scope_lifecycle_upgrades_drain_reasons_monotonically() {
-        let trip = crate::IntensityTrip {
+        let trip = IntensityTrip {
             max_restarts: 0,
             observed_restarts: 1,
             within: Duration::from_secs(10),
         };
-        let startup_failure = crate::StartupFailure {
-            cause: crate::StartupFailureCause::Lowering {
-                undefined: vec![crate::ChildId::from("worker")],
+        let startup_failure = StartupFailure {
+            cause: StartupFailureCause::Lowering {
+                undefined: vec![ChildId::from("worker")],
             },
         };
         let mut lifecycle = ScopeLifecycle::running();
 
-        assert!(lifecycle.begin_drain(crate::StopReason::Finished).is_some());
-        assert_eq!(
-            lifecycle.draining_reason(),
-            Some(&crate::StopReason::Finished)
-        );
+        assert!(lifecycle.begin_drain(StopReason::Finished).is_some());
+        assert_eq!(lifecycle.draining_reason(), Some(&StopReason::Finished));
 
         assert!(
             lifecycle
-                .begin_drain(crate::StopReason::IntensityTripped(trip.clone()))
+                .begin_drain(StopReason::IntensityTripped(trip.clone()))
                 .is_none(),
             "an upgrade does not repeat the enter-drain effect"
         );
         assert_eq!(
             lifecycle.draining_reason(),
-            Some(&crate::StopReason::IntensityTripped(trip.clone()))
+            Some(&StopReason::IntensityTripped(trip.clone()))
         );
 
         assert!(
             lifecycle
-                .begin_drain(crate::StopReason::StartupFailed(startup_failure.clone()))
+                .begin_drain(StopReason::StartupFailed(startup_failure.clone()))
                 .is_none()
         );
         assert_eq!(
             lifecycle.draining_reason(),
-            Some(&crate::StopReason::StartupFailed(startup_failure.clone()))
+            Some(&StopReason::StartupFailed(startup_failure.clone()))
         );
 
         assert!(
             lifecycle
-                .begin_drain(crate::StopReason::ShutdownRequested)
+                .begin_drain(StopReason::ShutdownRequested)
                 .is_none()
         );
         assert_eq!(
             lifecycle.draining_reason(),
-            Some(&crate::StopReason::ShutdownRequested)
+            Some(&StopReason::ShutdownRequested)
         );
 
         let lower_reasons = [
-            crate::StopReason::Finished,
-            crate::StopReason::IntensityTripped(trip),
-            crate::StopReason::StartupFailed(startup_failure),
+            StopReason::Finished,
+            StopReason::IntensityTripped(trip),
+            StopReason::StartupFailed(startup_failure),
         ];
         for reason in lower_reasons {
             assert!(lifecycle.begin_drain(reason).is_none());
             assert_eq!(
                 lifecycle.draining_reason(),
-                Some(&crate::StopReason::ShutdownRequested),
+                Some(&StopReason::ShutdownRequested),
                 "a lower-precedence reason cannot replace shutdown"
             );
         }

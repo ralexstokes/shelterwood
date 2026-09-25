@@ -17,8 +17,9 @@
 use std::collections::{HashSet, VecDeque};
 
 use crate::{
-    MembershipStatus, ScopeFlavor, StopReason,
-    engine::ScopeLifecycle,
+    engine::{MembershipStatus, ScopeLifecycle},
+    exit::{StopReason, stop_reason_precedence},
+    policy::ScopeFlavor,
     supervisor::{
         ChildKey, ChildRecord, ChildState, Effect, Event, IncarnationState, StartupMembership,
         SupervisorState, begin_drain, fail_startup, force, step,
@@ -655,7 +656,7 @@ fn check_s3_s4_stop_sequencing_and_drain_lattice(transition: &Transition<'_>) {
         transition.after.lifecycle().draining_reason(),
     ) {
         assert!(
-            crate::stop_reason_precedence(after) >= crate::stop_reason_precedence(before),
+            stop_reason_precedence(after) >= stop_reason_precedence(before),
             "the drain lattice never downgrades"
         );
     }

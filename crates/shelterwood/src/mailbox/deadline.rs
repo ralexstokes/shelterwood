@@ -4,12 +4,10 @@ use std::{
     task::{Context, Poll},
 };
 
-use shelterwood_core::DeadlineBudget;
+use shelterwood_core::{deadline::DeadlineBudget, panic::discard_panic};
 
-use crate::{
-    mailbox::ProxiedSleep,
-    runtime::{self, PanicAccumulator},
-};
+use crate::{mailbox::ProxiedSleep, runtime};
+use shelterwood_core::panic::PanicAccumulator;
 
 /// Which of the two passes an operation is being polled in.
 ///
@@ -189,7 +187,7 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             // delivery seam.
             let mut panics = PanicAccumulator::default();
             this.retire_timer_inline(&mut panics);
-            crate::runtime::discard_panic(panics.take());
+            discard_panic(panics.take());
             return Poll::Ready(result);
         }
         if this.phase == DeadlinePhase::InitialAttempt {
@@ -209,7 +207,7 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             // this seam exists to remove.
             let mut panics = PanicAccumulator::default();
             this.retire_timer_inline(&mut panics);
-            crate::runtime::discard_panic(panics.take());
+            discard_panic(panics.take());
         }
         this.operation
             .poll_deadlined(context, budget, DeadlinePhase::TimeoutArbitration)
@@ -507,7 +505,7 @@ mod tests {
     fn a_zero_budget_short_circuits_without_polling_the_operation() {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
-            shelterwood_core::DeadlineBudget::ZERO,
+            shelterwood_core::deadline::DeadlineBudget::ZERO,
         ));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);

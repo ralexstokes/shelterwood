@@ -14,8 +14,10 @@ use crate::mailbox::{
     MailboxCell, MailboxControl, MailboxEffectQueue, MailboxReceiver, actor_ref_from_parts,
 };
 use shelterwood_core::{
-    Cancellation, Exit, ExitError, GracePhase, IntensityTrip, StartupFailure, StartupFailureCause,
-    exit::{StartupError, StopReason},
+    exit::{
+        Cancellation, Exit, ExitError, GracePhase, IntensityTrip, StartupError, StartupFailure,
+        StartupFailureCause, StopReason,
+    },
     identity::ScopeIdentity,
     policy::{ResolvedMailbox, RestartAttempt, RestartCount, ScopeFlavor},
 };

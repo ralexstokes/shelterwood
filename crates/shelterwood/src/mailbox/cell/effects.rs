@@ -8,9 +8,12 @@ use crate::{
     identity::Incarnation,
     mailbox::{MailboxBindToken, MailboxDisposal, MailboxEffectSink, MailboxTermination},
     policy::ResolvedMailbox,
-    runtime::{PanicAccumulator, PanicPayload, Signal, dispose_detached, resume_panic},
+    runtime::{Signal, dispose_detached},
 };
-use shelterwood_core::waker::WakerEffects;
+use shelterwood_core::{
+    panic::{PanicAccumulator, PanicPayload, resume_panic},
+    waker::WakerEffects,
+};
 
 use super::{
     MailboxCell,

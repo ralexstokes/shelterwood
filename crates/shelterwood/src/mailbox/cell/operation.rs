@@ -1,7 +1,10 @@
 use std::sync::{Arc, Mutex};
 
-use crate::{identity::Incarnation, runtime::PanicAccumulator};
-use shelterwood_core::waker::{WakerAction, WakerEffects, WakerSlot};
+use crate::identity::Incarnation;
+use shelterwood_core::{
+    panic::{PanicAccumulator, discard_panic},
+    waker::{WakerAction, WakerEffects, WakerSlot},
+};
 
 use super::state::WaiterId;
 
@@ -195,7 +198,7 @@ impl<M> SendOperation<M> {
             staged.take(WakerAction::DropInline, &mut effects);
             let mut panics = PanicAccumulator::default();
             effects.flush(&mut panics);
-            crate::runtime::discard_panic(panics.take());
+            discard_panic(panics.take());
         };
         drop(effects);
         match result {

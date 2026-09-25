@@ -28,13 +28,16 @@ pub(super) use crate::{
     policy::ResolvedDefaults,
     runtime::{CompletionGatedLatch, DedicatedRuntime, Latch},
 };
-pub(super) use shelterwood_core::supervisor::{ChildKey, Event as SupervisorEvent};
+pub(super) use shelterwood_core::{
+    exit::JoinOutcome,
+    supervisor::{ChildKey, Event as SupervisorEvent},
+};
 
 pub(super) struct ObservedExit {
     pub(super) child: ChildKey,
     incarnation: Incarnation,
     recorded: Option<Retained<RecordedOutcome>>,
-    join: crate::runtime::JoinOutcome<()>,
+    join: JoinOutcome<()>,
     cancellation: Cancellation,
     readiness_signal_seen: bool,
 }

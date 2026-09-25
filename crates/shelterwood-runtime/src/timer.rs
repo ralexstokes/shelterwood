@@ -2,8 +2,10 @@ use std::{future::Future, time::Duration};
 
 use tokio::time;
 
-pub use shelterwood_core::proxied_sleep::BoxedSleep;
-use shelterwood_core::{deadline::Deadline, proxied_sleep::ProxiedSleep};
+use shelterwood_core::{
+    deadline::Deadline,
+    proxied_sleep::{BoxedSleep, ProxiedSleep},
+};
 
 use crate::dispose_waker;
 

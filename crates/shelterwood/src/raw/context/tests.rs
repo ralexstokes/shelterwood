@@ -24,11 +24,10 @@ use crate::{
     mailbox::{ActorRef, MailboxCell, MailboxControl, MailboxEffectQueue, actor_ref_from_parts},
     policy::{ResolvedDefaults, ScopeFlavor},
     raw::disposal::RawDisposal,
-    runtime::{
-        CompletionGatedLatch, Latch, PanicPayload, Signal, UnwindPanics, resume_preferred_panic,
-    },
+    runtime::{CompletionGatedLatch, Latch, Signal},
     scope::ScopeRef,
 };
+use shelterwood_core::panic::{PanicPayload, UnwindPanics, resume_preferred_panic};
 
 /// Builds a live raw incarnation context whose mailbox is configured and
 /// bound, so `next_ready` can take the busy path without a driver. The

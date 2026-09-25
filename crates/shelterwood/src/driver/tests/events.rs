@@ -126,7 +126,7 @@ async fn blocking_primary_wake_recollects_control_removal_before_arbitration() {
     let wake = wait.await;
     assert!(matches!(
         crate::runtime::join(publisher).await,
-        crate::runtime::JoinOutcome::Ok { value: () }
+        JoinOutcome::Ok { value: () }
     ));
     let super::super::incarnation::ScopeWake::Message(Some(event)) = wake else {
         panic!("the biased blocking wait returns the later primary head");

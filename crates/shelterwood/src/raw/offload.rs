@@ -11,7 +11,8 @@ use std::{
     task::{Context as TaskPollContext, Poll},
 };
 
-use crate::runtime::{ActorWork, Latch, PanicPayload, catch_panic};
+use crate::runtime::{ActorWork, Latch};
+use shelterwood_core::panic::{PanicPayload, catch_panic};
 
 use super::disposal::{Contained, PanicSlot, RawDisposal};
 

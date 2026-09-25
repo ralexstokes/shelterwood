@@ -90,7 +90,7 @@ async fn successful_root_monitor_publishes_membership_terminality() {
 
     assert!(matches!(
         joined,
-        crate::runtime::JoinOutcome::Ok { ref value }
+        JoinOutcome::Ok { ref value }
             if value.get() == &StopReason::Finished
     ));
     assert!(matches!(
@@ -126,7 +126,7 @@ async fn root_monitor_contains_a_terminal_wake_panic() {
 
     assert!(matches!(
         joined,
-        crate::runtime::JoinOutcome::Ok { ref value }
+        JoinOutcome::Ok { ref value }
             if value.get() == &StopReason::Finished
     ));
     assert!(matches!(
@@ -168,7 +168,7 @@ async fn panicked_root_monitor_publishes_its_exit_despite_a_terminal_wake_panic(
 
     assert!(matches!(
         joined,
-        crate::runtime::JoinOutcome::Ok { ref value }
+        JoinOutcome::Ok { ref value }
             if value.get() == &StopReason::ShutdownRequested
     ));
     assert!(matches!(
@@ -215,7 +215,7 @@ async fn cancelled_root_monitor_publishes_membership_terminality() {
     // fence -- has been dropped, so the publication is already complete here.
     assert!(matches!(
         crate::runtime::join(monitor).await,
-        crate::runtime::JoinOutcome::Cancelled
+        JoinOutcome::Cancelled
     ));
     assert!(
         matches!(
@@ -249,7 +249,7 @@ async fn unpolled_root_monitor_publishes_membership_terminality() {
 
     assert!(matches!(
         crate::runtime::join(monitor).await,
-        crate::runtime::JoinOutcome::Cancelled
+        JoinOutcome::Cancelled
     ));
     assert!(matches!(
         scope.member.record().stage,
@@ -883,11 +883,11 @@ async fn mailbox_waker_panic_is_contained_without_wedging_system_completion() {
         match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(terminal_waiter))
             .await
         {
-            crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok { value }) => value,
-            crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Panic { message }) => {
+            crate::runtime::Timeout::Completed(JoinOutcome::Ok { value }) => value,
+            crate::runtime::Timeout::Completed(JoinOutcome::Panic { message }) => {
                 panic!("the terminal waiter panicked: {message:?}")
             }
-            crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Cancelled) => {
+            crate::runtime::Timeout::Completed(JoinOutcome::Cancelled) => {
                 panic!("the terminal waiter was cancelled")
             }
             crate::runtime::Timeout::Elapsed => {

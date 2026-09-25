@@ -30,9 +30,10 @@ use super::{
 use crate::{
     mailbox::{ActorRef, Incarnation, SendError, SendErrorKind},
     policy::ResolvedMailbox,
-    runtime::{JoinOutcome, Timeout, join, spawn, timeout, yield_now},
+    runtime::{Timeout, join, spawn, timeout, yield_now},
     test_support::mint_actor_membership,
 };
+use shelterwood_core::exit::JoinOutcome;
 
 const SENDERS: usize = 8;
 const MESSAGES_PER_SENDER: usize = 400;

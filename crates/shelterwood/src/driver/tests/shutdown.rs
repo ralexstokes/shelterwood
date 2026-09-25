@@ -33,7 +33,7 @@ async fn runtime_teardown_finishes_the_cancelled_root_driver() {
         crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(monitor)).await;
     assert!(matches!(
         monitored,
-        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok { ref value })
+        crate::runtime::Timeout::Completed(JoinOutcome::Ok { ref value })
             if value.get() == &StopReason::ShutdownRequested
     ));
     assert!(
@@ -124,11 +124,11 @@ async fn runtime_teardown_keeps_the_exit_published_ahead_of_factory_disposal() {
 
     assert!(matches!(
         teardown,
-        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok { value: () })
+        crate::runtime::Timeout::Completed(JoinOutcome::Ok { value: () })
     ));
     assert!(matches!(
         driver,
-        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Cancelled)
+        crate::runtime::Timeout::Completed(JoinOutcome::Cancelled)
     ));
     let MemberStage::Terminal(recorded) = published.stage.clone() else {
         panic!("the exit must publish before the factory's destruction completes")
@@ -241,7 +241,7 @@ async fn latched_shutdown_upgrades_an_intensity_drain() {
         Some(Retained::new(RecordedOutcome::returned(Err(
             ExitError::message("trip intensity"),
         )))),
-        crate::runtime::JoinOutcome::Ok { value: () },
+        JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,
     );
@@ -289,7 +289,7 @@ async fn force_upgrades_an_intensity_drain_to_shutdown_requested() {
         Some(Retained::new(RecordedOutcome::returned(Err(
             ExitError::message("trip intensity"),
         )))),
-        crate::runtime::JoinOutcome::Ok { value: () },
+        JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,
     );
@@ -488,7 +488,7 @@ fn epoch_guard_unwind_retires_the_epoch_despite_poisoned_control() {
 /// how its task's join resolved.
 async fn nested_join_outcome(
     events: &mut crate::runtime::UnboundedMpscReceiver<DriverEvent>,
-) -> crate::runtime::JoinOutcome<()> {
+) -> JoinOutcome<()> {
     loop {
         match recv_child_event(events, DRIVER_PROGRESS_WAIT, "the nested driver's exit").await {
             ChildEvent::Exited { join, .. } => return join,
@@ -592,13 +592,13 @@ async fn acknowledged_framework_abort_is_joined_not_task_aborted_at_the_backstop
     assert!(
         matches!(
             crate::runtime::join(probe).await,
-            crate::runtime::JoinOutcome::Ok { value: Some(()) }
+            JoinOutcome::Ok { value: Some(()) }
         ),
         "the acknowledged backstop must not issue a task abort"
     );
     let join = nested_join_outcome(&mut events).await;
     assert!(
-        matches!(join, crate::runtime::JoinOutcome::Ok { .. }),
+        matches!(join, JoinOutcome::Ok { .. }),
         "an acknowledged framework driver completes its own recursive drain; \
          the backstop must not cancel its task"
     );
@@ -634,7 +634,7 @@ async fn unacknowledged_framework_abort_is_task_aborted_at_the_backstop() {
     scope.advance_ladder(key, backstop);
     let join = nested_join_outcome(&mut events).await;
     assert!(
-        matches!(join, crate::runtime::JoinOutcome::Cancelled),
+        matches!(join, JoinOutcome::Cancelled),
         "a framework driver that misses its acknowledgement is task-aborted at the backstop"
     );
 }

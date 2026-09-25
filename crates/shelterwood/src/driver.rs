@@ -62,10 +62,14 @@ use crate::{
     runtime::{self, CompletionGatedLatch, Latch},
     task::{TaskContext, TaskContextLatches, TaskFactory},
 };
-use shelterwood_core::supervisor::{
-    ChildKey, Effect as SupervisorEffect, Event as SupervisorEvent, SupervisorState,
-    admit as supervisor_admit, begin_drain as supervisor_begin_drain,
-    fail_startup as supervisor_fail_startup, force as supervisor_force, step as supervisor_step,
+use shelterwood_core::{
+    panic::PanicAccumulator,
+    supervisor::{
+        ChildKey, Effect as SupervisorEffect, Event as SupervisorEvent, SupervisorState,
+        admit as supervisor_admit, begin_drain as supervisor_begin_drain,
+        fail_startup as supervisor_fail_startup, force as supervisor_force,
+        step as supervisor_step,
+    },
 };
 
 use admission_control::{AdmissionRequest, DynamicControl, DynamicEntry};
@@ -167,7 +171,7 @@ struct ScopeRuntimeTestWiring {
 /// one of those completions and the orderly batch epilogue that publishes it.
 impl Drop for ScopeRuntime {
     fn drop(&mut self) {
-        let mut panics = runtime::PanicAccumulator::default();
+        let mut panics = PanicAccumulator::default();
         let mut dynamic_entries = None;
         if let Some(dynamic) = &self.dynamic {
             panics.run(|| {

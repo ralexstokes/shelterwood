@@ -1,6 +1,6 @@
 //! Fail-closed completion storage used by the runtime shell.
 
-use crate::runtime;
+use shelterwood_core::panic::PanicAccumulator;
 
 /// An exactly-once synchronous completion.
 ///
@@ -52,7 +52,7 @@ impl<T> Obligation<T> {
 
 impl<T> Drop for Obligation<T> {
     fn drop(&mut self) {
-        let mut panics = runtime::PanicAccumulator::default();
+        let mut panics = PanicAccumulator::default();
         panics.run(|| self.discharge());
     }
 }

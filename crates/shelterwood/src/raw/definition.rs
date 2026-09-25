@@ -10,11 +10,11 @@ use crate::{
     definition::DefinitionSource,
     mailbox::{MailboxCell, MailboxControl, MailboxEffectQueue, actor_ref_from_parts},
     policy::CommonOptions,
-    runtime::{
-        CompletionGatedLatch, Isolated, Latch, PanicAccumulator, PanicPayload, UnwindPanics,
-        resume_preferred_panic,
-    },
+    runtime::{CompletionGatedLatch, Isolated, Latch},
     scope::ScopeRef,
+};
+use shelterwood_core::panic::{
+    PanicAccumulator, PanicPayload, UnwindPanics, resume_preferred_panic,
 };
 
 use super::{

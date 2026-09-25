@@ -7,7 +7,10 @@ use std::{
     task::{Context, Poll},
 };
 
-use shelterwood_core::deadline::DeadlineBudget;
+use shelterwood_core::{
+    deadline::DeadlineBudget,
+    panic::{catch_panic, discard_panic},
+};
 
 use crate::{
     mailbox::{ChildId, Incarnation, Membership, capability::DisposingReceiver},
@@ -562,8 +565,8 @@ fn withdraw_send_with<M: Send + 'static>(
             kind: SendErrorKind::Terminated,
         }),
     };
-    let finish_panic = crate::runtime::catch_panic(|| withdrawal.finish()).err();
-    crate::runtime::discard_panic(finish_panic);
+    let finish_panic = catch_panic(|| withdrawal.finish()).err();
+    discard_panic(finish_panic);
     result
 }
 

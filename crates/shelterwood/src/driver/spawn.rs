@@ -1,6 +1,7 @@
 //! Constructing one child incarnation and launching its tasks.
 
 use super::*;
+use shelterwood_core::panic::PanicAccumulator;
 
 enum SpawnBody {
     Raw {
@@ -142,7 +143,7 @@ impl SpawnLatches {
 }
 
 pub(super) fn fire_shutdown_edges(shutdown: &Latch, framework_shutdown: Option<&Latch>) {
-    let mut panics = runtime::PanicAccumulator::default();
+    let mut panics = PanicAccumulator::default();
     // Commit the child-facing cancellation evidence before waking the nested
     // driver. That observer may finish on another worker and have completion
     // sample this bit as soon as its wake runs. User waiters remain last so a

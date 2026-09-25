@@ -471,7 +471,7 @@ async fn aborted_nested_driver_epilogue_wakes_a_parked_shutdown_task() {
     drop(fixture.driver);
 
     match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(waiter)).await {
-        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok { value }) => {
+        crate::runtime::Timeout::Completed(JoinOutcome::Ok { value }) => {
             value.expect("the target incarnation settled");
         }
         crate::runtime::Timeout::Completed(_) => {
@@ -673,10 +673,7 @@ async fn blocked_initial_scope_factory_owns_its_stop_epilogue() {
         std::future::poll_fn(|context| Poll::Ready(waiter.as_mut().poll(context))).await;
     gate.release();
     assert_eq!(factory_state, ScopeState::Starting);
-    assert!(matches!(
-        parent_join,
-        crate::runtime::JoinOutcome::Cancelled
-    ));
+    assert!(matches!(parent_join, JoinOutcome::Cancelled));
     assert!(
         before_release.is_pending(),
         "an executing initial factory still owns the final scope epilogue"
@@ -720,7 +717,7 @@ async fn hard_aborted_incarnation_fences_shutdown_and_wait_without_arming_its_bu
     abort.abort();
     assert!(matches!(
         crate::runtime::join(driver).await,
-        crate::runtime::JoinOutcome::Cancelled
+        JoinOutcome::Cancelled
     ));
 
     // A budget far shorter than the blocked epilogue. It never arms: the
@@ -795,10 +792,7 @@ async fn blocked_restart_scope_factory_supersedes_the_stale_stopped_projection()
         ScopeState::Starting,
         "the second epoch supersedes the first incarnation's Stopped projection before its factory runs"
     );
-    assert!(matches!(
-        parent_join,
-        crate::runtime::JoinOutcome::Cancelled
-    ));
+    assert!(matches!(parent_join, JoinOutcome::Cancelled));
     assert!(
         before_release.is_pending(),
         "an executing restart factory still owns the final scope epilogue"
@@ -838,7 +832,7 @@ async fn panicking_nested_factory_releases_its_pre_driver_epoch() {
 
     assert!(matches!(
         crate::runtime::join(driver).await,
-        crate::runtime::JoinOutcome::Panic { .. }
+        JoinOutcome::Panic { .. }
     ));
     assert_eq!(
         scope.record().state,

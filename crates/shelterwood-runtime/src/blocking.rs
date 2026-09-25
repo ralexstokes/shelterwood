@@ -287,7 +287,7 @@ mod tests {
         });
         assert!(matches!(
             crate::join(panicking).await,
-            crate::JoinOutcome::Panic {
+            shelterwood_core::exit::JoinOutcome::Panic {
                 message: Some(message)
             } if message == "blocking work panic"
         ));

@@ -6,9 +6,10 @@
 
 use std::task::{Context, Poll};
 
-use shelterwood_core::{ProxiedPoll, waker::WakerAction};
+use shelterwood_core::{ProxiedPoll, panic::discard_panic, waker::WakerAction};
 
-use crate::runtime::{OneShotClose, OneShotReceiver, PanicAccumulator, dispose_detached};
+use crate::runtime::{OneShotClose, OneShotReceiver, dispose_detached};
+use shelterwood_core::panic::PanicAccumulator;
 
 /// The receive edges a [`DisposingReceiver`] drives.
 ///
@@ -82,7 +83,7 @@ impl<T, R: OneShotReceive<T>> DisposingReceiver<T, R> {
         // to remove.
         let mut panics = PanicAccumulator::default();
         self.retire_reply_waker(&mut panics);
-        crate::runtime::discard_panic(panics.take());
+        discard_panic(panics.take());
     }
 
     /// Takes the caller waker out of the proxy and runs its destructor from

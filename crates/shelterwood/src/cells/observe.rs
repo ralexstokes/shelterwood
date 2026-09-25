@@ -8,11 +8,13 @@ use std::{
 
 use crate::runtime;
 use shelterwood_core::{
-    ChildId, Exit, Incarnation, Intensity, Membership, RestartAttempt, RestartCount, RestartPolicy,
-    Retention, Strategy, TotalRestarts,
     engine::{MembershipStatus, ScopeState},
-    identity::MonotonicCounter,
-    policy::ScopeFlavor,
+    exit::Exit,
+    identity::{ChildId, Incarnation, Membership, MonotonicCounter},
+    policy::{
+        Intensity, RestartAttempt, RestartCount, RestartPolicy, Retention, ScopeFlavor, Strategy,
+        TotalRestarts,
+    },
 };
 
 use super::{Guarded, ObservationTxn, RetainGuards, Retained};
@@ -964,15 +966,16 @@ mod tests {
 
     use crate::runtime;
     use shelterwood_core::{
-        Cancellation, ChildId, Exit, ExitError, Intensity, TotalRestarts, identity::ScopeIdentity,
-        policy::ScopeFlavor,
+        exit::{Cancellation, Exit, ExitError},
+        identity::{ChildId, ScopeIdentity},
+        policy::{Intensity, ScopeFlavor, TotalRestarts},
     };
 
     use crate::cells::{
         LifecycleEvent, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, ObservationGate,
         ScopeSnapshot, test_support::TEST_WAIT,
     };
-    use shelterwood_core::{ScopeState, StopReason};
+    use shelterwood_core::{engine::ScopeState, exit::StopReason};
 
     use super::{Guarded, LifecycleHub, LifecycleSeq, ObservationTxn, SnapshotHub};
 
@@ -994,8 +997,9 @@ mod tests {
     #[test]
     fn a_guarded_snapshot_isolates_every_exit_it_projects() {
         use shelterwood_core::{
-            RestartCount, RestartPolicy, Retention, StartupFailure, StartupFailureCause,
             engine::MembershipStatus,
+            exit::{StartupFailure, StartupFailureCause},
+            policy::{RestartCount, RestartPolicy, Retention},
         };
 
         use super::{ChildSnapshot, ChildState};

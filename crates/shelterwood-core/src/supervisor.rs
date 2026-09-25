@@ -11,8 +11,10 @@ use std::{
 };
 
 use crate::{
-    Membership, MembershipStatus, MonotonicCounter, ScopeFlavor, ScopeState, StopReason,
-    engine::{ChildCompletionState, ScopeLifecycle},
+    engine::{ChildCompletionState, MembershipStatus, ScopeLifecycle, ScopeState},
+    exit::StopReason,
+    identity::{Membership, MonotonicCounter},
+    policy::ScopeFlavor,
 };
 
 /// A never-reused child registration.
@@ -754,7 +756,7 @@ pub fn force(state: &mut SupervisorState, effects: &mut Vec<Effect>) -> Option<(
 
 #[cfg(test)]
 mod tests {
-    use crate::{ChildId, ScopeIdentity};
+    use crate::identity::{ChildId, ScopeIdentity};
 
     use super::*;
 

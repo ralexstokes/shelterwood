@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use shelterwood_core::ChildId;
+use shelterwood_core::identity::ChildId;
 
 /// A pre-spawn child declaration or reservation error.
 ///

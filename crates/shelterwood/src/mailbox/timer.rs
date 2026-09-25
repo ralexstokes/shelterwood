@@ -1,4 +1,4 @@
-//! Adapter-integration coverage for `shelterwood_core::ProxiedSleep`.
+//! Adapter-integration coverage for `shelterwood_core::proxied_sleep::ProxiedSleep`.
 //!
 //! The timer's white-box pins live beside the type in
 //! `shelterwood-core/src/proxied_sleep.rs`, where its private slots are
@@ -15,7 +15,7 @@ mod tests {
         time::Duration,
     };
 
-    use shelterwood_core::{BoxedSleep, ProxiedSleep};
+    use shelterwood_core::proxied_sleep::{BoxedSleep, ProxiedSleep};
 
     use crate::test_support::probe_waker;
 

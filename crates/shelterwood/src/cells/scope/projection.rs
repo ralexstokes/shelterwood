@@ -1,8 +1,9 @@
 use std::sync::{Arc, atomic::Ordering};
 
 use shelterwood_core::{
-    Exit, Intensity, Strategy, TotalRestarts, engine::ScopeState, exit::StartupError,
-    policy::ScopeFlavor,
+    engine::ScopeState,
+    exit::{Exit, StartupError},
+    policy::{Intensity, ScopeFlavor, Strategy, TotalRestarts},
 };
 
 #[cfg(test)]
@@ -287,7 +288,11 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
-    use shelterwood_core::{ChildId, ScopeState, identity::ScopeIdentity, policy::ScopeFlavor};
+    use shelterwood_core::{
+        engine::ScopeState,
+        identity::{ChildId, ScopeIdentity},
+        policy::ScopeFlavor,
+    };
 
     use super::*;
     use crate::cells::MemberCell;

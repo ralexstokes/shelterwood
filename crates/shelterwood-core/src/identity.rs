@@ -456,7 +456,7 @@ impl Default for ScopeIdentity {
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use crate::ChildId;
+    use crate::identity::ChildId;
 
     use super::{
         AtomicMonotonicCounter, Generation, IncarnationCounter, MembershipReconciliation,

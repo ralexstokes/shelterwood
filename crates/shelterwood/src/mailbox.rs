@@ -12,8 +12,8 @@ use std::{
 };
 
 use crate::identity::{ChildId, Incarnation, Membership};
-pub(crate) use shelterwood_core::ProxiedSleep;
 use shelterwood_core::policy::ResolvedMailbox;
+pub(crate) use shelterwood_core::proxied_sleep::ProxiedSleep;
 
 mod capability;
 mod cell;

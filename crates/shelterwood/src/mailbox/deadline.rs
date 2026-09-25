@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use shelterwood_core::DeadlineBudget;
+use shelterwood_core::deadline::DeadlineBudget;
 
 use crate::{
     mailbox::ProxiedSleep,
@@ -507,7 +507,7 @@ mod tests {
     fn a_zero_budget_short_circuits_without_polling_the_operation() {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
-            shelterwood_core::DeadlineBudget::ZERO,
+            shelterwood_core::deadline::DeadlineBudget::ZERO,
         ));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);

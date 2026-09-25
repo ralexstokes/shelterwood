@@ -5,13 +5,12 @@ use std::sync::atomic::AtomicUsize;
 
 use crate::runtime;
 use shelterwood_core::{
-    ChildId, Intensity, TotalRestarts,
     engine::ScopeState,
     identity::{
-        AtomicMonotonicCounter, MembershipReconciliation, MintedMembership, ProvisionalMembership,
-        ScopeIdentity,
+        AtomicMonotonicCounter, ChildId, MembershipReconciliation, MintedMembership,
+        ProvisionalMembership, ScopeIdentity,
     },
-    policy::ScopeFlavor,
+    policy::{Intensity, ScopeFlavor, TotalRestarts},
 };
 
 use crate::cells::observe::{LifecycleHub, SnapshotHub};

@@ -5,9 +5,10 @@ use std::sync::{Arc, MutexGuard};
 
 use crate::runtime;
 use shelterwood_core::{
-    Exit, Incarnation, TotalRestarts,
     engine::{MembershipStatus, ScopeState},
-    exit::{StartupError, StopReason, stop_reason_precedence},
+    exit::{Exit, StartupError, StopReason, stop_reason_precedence},
+    identity::Incarnation,
+    policy::TotalRestarts,
 };
 
 use crate::cells::observe::LifecycleEventKind;

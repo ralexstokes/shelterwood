@@ -241,7 +241,7 @@ mod tests {
         task::{Context, Wake, Waker},
     };
 
-    use shelterwood_core::{Cancellation, Exit, ExitError};
+    use shelterwood_core::exit::{Cancellation, Exit, ExitError};
 
     use crate::{
         cells::{

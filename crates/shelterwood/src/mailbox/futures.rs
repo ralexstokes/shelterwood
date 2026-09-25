@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use shelterwood_core::DeadlineBudget;
+use shelterwood_core::deadline::DeadlineBudget;
 
 use crate::{
     mailbox::{ChildId, Incarnation, Membership, capability::DisposingReceiver},
@@ -822,7 +822,7 @@ mod tests {
         time::Duration,
     };
 
-    use shelterwood_core::DeadlineBudget;
+    use shelterwood_core::deadline::DeadlineBudget;
 
     use crate::{
         mailbox::{

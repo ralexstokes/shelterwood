@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::Readiness;
+use crate::policy::Readiness;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadinessState {
@@ -111,12 +111,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{ReadinessEffect, ReadinessEvent, ReadinessGate};
+    use crate::policy::Readiness;
 
     #[test]
     fn readiness_configuration_and_signal_deadline_race_are_engine_owned() {
         let deadline = Instant::now();
-        let (mut ready, configured) =
-            ReadinessGate::configure(crate::Readiness::Manual, Some(deadline));
+        let (mut ready, configured) = ReadinessGate::configure(Readiness::Manual, Some(deadline));
         assert_eq!(configured, Some(ReadinessEffect::ArmDeadline { deadline }));
         assert!(ready.needs_signal_watch());
         assert_eq!(
@@ -135,21 +135,21 @@ mod tests {
             None
         );
 
-        let (mut exited, configured) = ReadinessGate::configure(crate::Readiness::Manual, None);
+        let (mut exited, configured) = ReadinessGate::configure(Readiness::Manual, None);
         assert_eq!(configured, None);
         assert_eq!(
             exited.step(ReadinessEvent::Exit { signal_seen: true }),
             Some(ReadinessEffect::BecameReady)
         );
 
-        let (mut unsignaled_exit, _) = ReadinessGate::configure(crate::Readiness::Manual, None);
+        let (mut unsignaled_exit, _) = ReadinessGate::configure(Readiness::Manual, None);
         assert_eq!(
             unsignaled_exit.step(ReadinessEvent::Exit { signal_seen: false }),
             Some(ReadinessEffect::Disarmed)
         );
         assert!(!unsignaled_exit.needs_signal_watch());
 
-        let (mut unbounded, _) = ReadinessGate::configure(crate::Readiness::Manual, None);
+        let (mut unbounded, _) = ReadinessGate::configure(Readiness::Manual, None);
         assert_eq!(
             unbounded.step(ReadinessEvent::Deadline {
                 now: deadline,
@@ -161,7 +161,7 @@ mod tests {
         assert!(unbounded.needs_signal_watch());
 
         let (mut timed_out, configured) =
-            ReadinessGate::configure(crate::Readiness::AfterInit, Some(deadline));
+            ReadinessGate::configure(Readiness::AfterInit, Some(deadline));
         assert_eq!(configured, Some(ReadinessEffect::ArmDeadline { deadline }));
         assert_eq!(
             timed_out.step(ReadinessEvent::Deadline {
@@ -174,7 +174,7 @@ mod tests {
 
         let configured_deadline = deadline + Duration::from_secs(2);
         let (mut premature, configured) =
-            ReadinessGate::configure(crate::Readiness::Manual, Some(configured_deadline));
+            ReadinessGate::configure(Readiness::Manual, Some(configured_deadline));
         assert_eq!(
             configured,
             Some(ReadinessEffect::ArmDeadline {
@@ -201,11 +201,11 @@ mod tests {
             "the original deadline remains armed after a premature event"
         );
 
-        let (immediate, configured) = ReadinessGate::configure(crate::Readiness::Immediate, None);
+        let (immediate, configured) = ReadinessGate::configure(Readiness::Immediate, None);
         assert_eq!(configured, Some(ReadinessEffect::BecameReady));
         assert!(!immediate.needs_signal_watch());
 
-        let (mut shutdown, configured) = ReadinessGate::configure(crate::Readiness::Manual, None);
+        let (mut shutdown, configured) = ReadinessGate::configure(Readiness::Manual, None);
         assert_eq!(configured, None);
         assert_eq!(
             shutdown.step(ReadinessEvent::Shutdown),

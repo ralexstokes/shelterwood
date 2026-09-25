@@ -9,7 +9,7 @@
 
 use std::hash::Hash;
 
-use shelterwood_core::{
+use shelterwood_core::identity::{
     ChildId, Incarnation, Membership, MembershipReconciliation, ProvisionalMembership,
     ScopeIdentity,
 };

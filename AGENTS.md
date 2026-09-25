@@ -227,8 +227,8 @@ Classify a defensive check by what makes its state impossible.
   read under the same lock): delete the check. No `debug_assert!` stands in.
   If a structural `Option` must still be unwrapped, `.expect()` it outside
   any framework lock. The one exception is `AdmissionInstall::take_child`
-  in `driver.rs`: the child must stay ledger-owned until it enters the
-  arena, so that unwrap runs under the gate.
+  in `driver/admission_control.rs`: the child must stay ledger-owned until
+  it enters the arena, so that unwrap runs under the gate.
 - **Protocol or lock order only**: `debug_assert!` plus the cheapest release
   behaviour that is safe on its own (return, no-op, treat as terminal). A
   debug assertion is never load-bearing, and the release path never panics

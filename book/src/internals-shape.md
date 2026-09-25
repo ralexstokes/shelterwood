@@ -87,9 +87,14 @@ shell:
   deliberately no type named `Driver`: the shell is `run_scope` and its
   helpers around `ScopeRuntime`, feeding sampled events into core's pure
   reducers and executing the effects they return. Submodules split the
-  shell by concern: `child.rs` (one incarnation's spawn/join/disposal),
-  `events.rs` (event lanes and arbitration), `startup.rs`, `shutdown.rs`,
-  `removal.rs`, `admission_control.rs` (dynamic membership), and
+  shell by concern: `system.rs` (the root driver's spawn, join and monitor),
+  `incarnation.rs` (the scope epoch guard and the driver loop), `nested.rs`
+  (nested-scope latches and entry points), `spawn.rs` (constructing and
+  launching one child incarnation), `report.rs` (the child task's outcome
+  report), `stop.rs` (the per-child stop ladder), `child.rs` (exit dispatch,
+  terminal publication and disposal), `events.rs` (event lanes and
+  arbitration), `startup.rs`, `shutdown.rs`, `removal.rs`,
+  `admission_control.rs` (dynamic membership and admission install), and
   `storage.rs` (fail-closed completion obligations).
 - **`cells/`** — restart-stable state, structurally *below* the driver.
   `MemberCell` is the per-membership cell that survives restarts;

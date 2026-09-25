@@ -133,9 +133,9 @@ pub(super) use super::super::{
     MemberStage, MemberTransition, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses,
     ResidentProjection, Retained, RuntimeStorage, ScopeCell, ScopeControlEvent, ScopeEpochGuard,
     ScopeFlavor, ScopeRole, ScopeRuntime, ScopeRuntimeTestWiring, StartupDisposition,
-    child::dispatch_child_construction_for_test, discharge_child_terminality, monitor_root_driver,
-    nested_scope_start, report_slot, reserve_dynamic, resident_projection, run_nested_factory,
-    run_scope, run_scope_incarnation, storage::Obligation, wait_for_scope_wake,
+    discharge_child_terminality, monitor_root_driver, nested_scope_start, report_slot,
+    reserve_dynamic, resident_projection, run_nested_factory, run_scope, run_scope_incarnation,
+    spawn::dispatch_child_construction_for_test, storage::Obligation, wait_for_scope_wake,
 };
 
 pub(super) async fn begin_admission(

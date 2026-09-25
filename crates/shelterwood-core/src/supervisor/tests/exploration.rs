@@ -950,6 +950,42 @@ fn check_t9_removal_effects_are_issued_once(transition: &Transition<'_>) {
 /// bit, and carrying it as history cost the walk half again its states.
 fn check_r4_start_effects_along_a_path(transition: &Transition<'_>) {
     let keys = transition.keys;
+    if matches!(transition.event, Input::Step(Event::Settle))
+        && transition.before.lifecycle().is_starting()
+    {
+        // Derive the eligible frontier from the input state, not from the
+        // emitted effects or the cursor left by settlement. An empty effect
+        // list must not make a stalled startup look like a fixed point.
+        let ordered_frontier = transition.before.next_ordered_start().and_then(|cursor| {
+            keys.iter().copied().find(|&child| {
+                child >= cursor
+                    && transition.before.contains(child)
+                    && (transition.before.membership_status(child) == MembershipStatus::Removing
+                        || !History::has(transition.history.spawned, keys, child)
+                        || !transition.before.initial_ready(child))
+            })
+        });
+        for &child in keys {
+            let eligible = transition.before.is_initial(child)
+                && !History::has(transition.history.spawned, keys, child)
+                && transition.before.child_state(child)
+                    == Some(ChildState::Resident(IncarnationState::Unstarted))
+                && (transition.before.flavor() == ScopeFlavor::Dynamic
+                    || ordered_frontier == Some(child));
+            let starts = transition
+                .effects
+                .iter()
+                .filter(
+                    |effect| matches!(effect, Effect::StartChild { child: key } if *key == child),
+                )
+                .count();
+            assert_eq!(
+                starts,
+                usize::from(eligible),
+                "settlement must request exactly one start for each eligible initial member (R4): {child:?}"
+            );
+        }
+    }
     for effect in transition.effects {
         let Effect::StartChild { child } = effect else {
             continue;
@@ -1067,6 +1103,33 @@ fn check_s3_drain_stops_along_a_path(transition: &Transition<'_>) {
 /// committed key must never join without its finalize.
 fn check_t5_removal_effects_along_a_path(transition: &Transition<'_>) {
     let keys = transition.keys;
+    // Observe acceptance independently of the effect under test. In
+    // particular, committing an already joined child must finalize it even
+    // if no earlier stop taught the history that a removal was pending.
+    for &child in keys {
+        if matches!(
+            transition.before.child_state(child),
+            Some(ChildState::Resident(_) | ChildState::RemovalSampled(_))
+        ) && matches!(
+            transition.after.child_state(child),
+            Some(ChildState::Removing(_))
+        ) {
+            let expected = if transition.after.joined(child) {
+                Effect::FinalizeRemoval { child }
+            } else {
+                Effect::StopChild { child }
+            };
+            assert_eq!(
+                transition
+                    .effects
+                    .iter()
+                    .filter(|effect| **effect == expected)
+                    .count(),
+                1,
+                "an accepted removal commit must issue its effect: {expected:?}"
+            );
+        }
+    }
     let committing = matches!(transition.event, Input::Step(Event::RemovalLatched { .. }));
     let mut history = *transition.history;
     for effect in transition.effects {
